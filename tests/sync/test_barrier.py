@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Tri Dao.
-"""Tests for quack.sync.barrier.Semaphore.
+"""Tests for DLKernel.sync.barrier.Semaphore.
 
 Contract under test: the acquire/release edges and the group-sync pairing, not
 just flag values. The turnstile test folds a NON-commutative update
@@ -19,8 +19,8 @@ import cutlass.pipeline as pipeline
 from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack
 
-import quack.utils as utils
-from quack.sync import Semaphore
+import DLKernel.utils as utils
+from DLKernel.sync import Semaphore
 
 THREADS = 128
 

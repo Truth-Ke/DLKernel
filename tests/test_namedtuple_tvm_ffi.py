@@ -12,13 +12,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import const_expr
 
-import quack.cache
+import DLKernel.cache
 
 # Ensure the Constexpr converter patch is loaded.
-import quack.cute_dsl_utils  # noqa: F401
-from quack.compile_utils import make_fake_tensor as fake_tensor
-from quack.cute_dsl_utils import mlir_namedtuple
-from quack.varlen_utils import VarlenArguments
+import DLKernel.cute_dsl_utils  # noqa: F401
+from DLKernel.compile_utils import make_fake_tensor as fake_tensor
+from DLKernel.cute_dsl_utils import mlir_namedtuple
+from DLKernel.varlen_utils import VarlenArguments
 
 
 @cute.kernel

@@ -4,7 +4,7 @@ Context: https://github.com/Dao-AILab/quack/issues/63 reported that the cp.async
 + 2-CTA MMA path (`gather_A and use_2cta_instrs and not use_tma_gather`) relayed the
 "AB buffer full" signal from the non-leader CTA to the leader with a plain
 `mbarrier.arrive` (default `.release.cta`), which cannot form a cluster-scope
-release-acquire relation with the leader's wait. The fix (quack/pipeline.py:
+release-acquire relation with the leader's wait. The fix (DLKernel/pipeline.py:
 `mbarrier_arrive_release_cluster`, `mbarrier_acquire_cluster`; used in
 `gemm_sm100.py::mma`) uses the issue's cheaper variant 2:
 
@@ -113,7 +113,7 @@ path; the Causality axiom forbids `R_mma` from reading anything older than `W_da
    proxy-fence hazard demonstrably belongs to `st.shared`-written data feeding TMA/UMMA.
 2. The tcgen05 chapter's canonical consumer pattern is
    `mbarrier.try_wait.relaxed.cluster` -> **`tcgen05.fence::after_thread_sync`** ->
-   `tcgen05.mma`. Neither the stock DSL TMA pipelines, nor quack, nor the issue's
+   `tcgen05.mma`. Neither the stock DSL TMA pipelines, nor the DLKernel mainloop, nor the issue's
    proposed consumer emits that fence in the mainloop. Whatever makes the omission safe
    (in practice: UTCHMMA issue is program-ordered behind the wait's predicate branch)
    applies identically before and after this fix.
@@ -223,7 +223,7 @@ one documented helper and SASS-verified, so the trade goes to reuse.
 - PTX: `CUTE_DSL_KEEP=ptx CUTE_DSL_DUMP_DIR=<dir> python ...` then grep for
   `fence.release.sync_restrict`, `arrive.relaxed.cluster`,
   `test_wait.parity.acquire.cluster`.
-- SASS: carve the cubin from the newest quack_cache `.o` (payload after the second
+- SASS: carve the cubin from the newest dlkernel_cache `.o` (payload after the second
   `\x7fELF` magic), `nvdisasm -c`. Relay =
   `MEMBAR.ALL.CTA ; FENCE.VIEW.ASYNC.S ; @P0 SYNCS.ARRIVE.TRANS64.RED` on the mapa'd
   remote barrier; leader = unconditional `SYNCS.PHASECHK.TRANS64` + branch between its

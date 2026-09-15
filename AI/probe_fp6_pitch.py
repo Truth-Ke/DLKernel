@@ -6,8 +6,8 @@
 # exact pitch for any 32B-aligned value).
 import torch
 
-from quack.gemm_interface import gemm, gemm_blockscaled_ref
-from quack.blockscaled.operand import BlockScaledOperand
+from DLKernel.gemm_interface import gemm, gemm_blockscaled_ref
+from DLKernel.blockscaled.operand import BlockScaledOperand
 
 torch.manual_seed(0)
 m = n = 128

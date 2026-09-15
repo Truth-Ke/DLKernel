@@ -2,8 +2,8 @@
 """Regression tests for the async compile pool (``--async-compile``).
 
 Each test encodes a specific failure mode discovered while building the
-feature — see quack/cache/async_compile.py and the defer-and-retry loop in
-quack/testing/pytest_plugin.py.
+feature — see DLKernel/cache/async_compile.py and the defer-and-retry loop in
+DLKernel/testing/pytest_plugin.py.
 """
 
 import os
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from quack.cache.async_compile import CompilePending, CompilePool, _flock_held_exclusively
+from DLKernel.cache.async_compile import CompilePending, CompilePool, _flock_held_exclusively
 
 
 # ---------------------------------------------------------------------------
@@ -40,9 +40,9 @@ def test_compile_pending_is_base_exception():
         except Exception:  # must NOT catch it
             pytest.fail("except Exception swallowed CompilePending")
 
-    exc = CompilePending("ab" * 32, "quack.foo._compile_bar")
+    exc = CompilePending("ab" * 32, "DLKernel.foo._compile_bar")
     assert exc.sha == "ab" * 32
-    assert "quack.foo._compile_bar" in str(exc)
+    assert "DLKernel.foo._compile_bar" in str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +120,7 @@ def test_pool_poll_external_lifecycle(tmp_path):
 _INNER_TEST_SRC = textwrap.dedent(
     """
     import torch
-    from quack.rmsnorm import rmsnorm_fwd
+    from DLKernel.rmsnorm import rmsnorm_fwd
 
     def _run(N):
         x = torch.randn(32, N, device="cuda", dtype=torch.bfloat16)
@@ -155,10 +155,10 @@ def test_defer_and_retry_cold_session(tmp_path):
     # Unusual N values so the keys are cold in the throwaway cache dir.
     (suite / "test_defer_mod_a.py").write_text(_INNER_TEST_SRC.format(N_A=704, N_B=1216))
     (suite / "test_defer_mod_b.py").write_text(_INNER_TEST_SRC.format(N_A=1728, N_B=2240))
-    (suite / "conftest.py").write_text('pytest_plugins = ["quack.testing.pytest_plugin"]\n')
+    (suite / "conftest.py").write_text('pytest_plugins = ["DLKernel.testing.pytest_plugin"]\n')
 
     env = dict(os.environ)
-    env["QUACK_CACHE_DIR"] = str(tmp_path / "cache")
+    env["DLKERNEL_CACHE_DIR"] = str(tmp_path / "cache")
     env.pop("PYTEST_XDIST_WORKER", None)  # inner session is single-proc
     result = subprocess.run(
         [
@@ -198,10 +198,10 @@ def test_warm_session_with_flag_submits_nothing(tmp_path):
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "test_warm.py").write_text(_INNER_TEST_SRC.format(N_A=704, N_B=1216))
-    (suite / "conftest.py").write_text('pytest_plugins = ["quack.testing.pytest_plugin"]\n')
+    (suite / "conftest.py").write_text('pytest_plugins = ["DLKernel.testing.pytest_plugin"]\n')
 
     env = dict(os.environ)
-    env["QUACK_CACHE_DIR"] = str(tmp_path / "cache")
+    env["DLKERNEL_CACHE_DIR"] = str(tmp_path / "cache")
     env.pop("PYTEST_XDIST_WORKER", None)
     cmd = [
         sys.executable,
@@ -225,7 +225,7 @@ def test_warm_session_with_flag_submits_nothing(tmp_path):
 
 _WEDGED_POOL_CONFTEST_SRC = textwrap.dedent(
     """
-    pytest_plugins = ["quack.testing.pytest_plugin"]
+    pytest_plugins = ["DLKernel.testing.pytest_plugin"]
 
 
     def pytest_configure(config):
@@ -233,8 +233,8 @@ _WEDGED_POOL_CONFTEST_SRC = textwrap.dedent(
         # — exactly what a hung pool worker (still holding the per-key flock)
         # looks like to every waiter. Shrink the drain wedge deadline so the
         # escape path runs quickly.
-        from quack.cache import async_compile as ac
-        from quack.testing import pytest_plugin as tp
+        from DLKernel.cache import async_compile as ac
+        from DLKernel.testing import pytest_plugin as tp
 
         tp._XdistWorkerDefer._WEDGE_TIMEOUT_S = 2.0
         ac.CompilePool.poll = lambda self, sha: ("pending", None)
@@ -263,7 +263,7 @@ def test_xdist_drain_escapes_wedged_pool(tmp_path):
     (suite / "conftest.py").write_text(_WEDGED_POOL_CONFTEST_SRC)
 
     env = dict(os.environ)
-    env["QUACK_CACHE_DIR"] = str(tmp_path / "cache")
+    env["DLKERNEL_CACHE_DIR"] = str(tmp_path / "cache")
     env.pop("PYTEST_XDIST_WORKER", None)  # the inner master must not be a worker
     result = subprocess.run(
         [
@@ -318,7 +318,7 @@ def test_oom_retry_compile_pending_defers_not_warns(tmp_path):
         textwrap.dedent(
             """
             import torch
-            from quack.cache.async_compile import CompilePending
+            from DLKernel.cache.async_compile import CompilePending
 
             CALLS = {"n": 0}
 
@@ -336,7 +336,7 @@ def test_oom_retry_compile_pending_defers_not_warns(tmp_path):
     )
 
     env = dict(os.environ)
-    env["QUACK_CACHE_DIR"] = str(tmp_path / "cache")
+    env["DLKERNEL_CACHE_DIR"] = str(tmp_path / "cache")
     env.pop("PYTEST_XDIST_WORKER", None)
     result = subprocess.run(
         [
@@ -374,7 +374,7 @@ def test_gpu_blind_device_attr_shim():
 
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         os.environ["CUTE_DSL_ARCH"] = "sm_90a"
-        from quack.cache.async_compile import _install_gpu_blind_device_attrs
+        from DLKernel.cache.async_compile import _install_gpu_blind_device_attrs
 
         _install_gpu_blind_device_attrs()
         from cutlass.base_dsl.runtime import cuda as cuda_helpers
@@ -398,8 +398,8 @@ def test_pool_arch_pin_survives_early_dsl_construction():
     BEFORE the pool's env pinning ran.
 
     Regression (cutlass-dsl 4.6.2 CI image): importing
-    ``quack.cache._pool_preload`` executes the parent packages first, and
-    ``quack/__init__`` pulls in cutlass — constructing the DSL env manager
+    ``DLKernel.cache._pool_preload`` executes the parent packages first, and
+    ``DLKernel/__init__`` pulls in cutlass — constructing the DSL env manager
     before ``CUTE_DSL_ARCH`` is set. 4.6.2 snapshots the env var at
     construction (4.6.0 read it lazily), so env pinning alone left the
     singleton unlatched; a GPU-blind worker's first ``.arch`` read then fell
@@ -418,10 +418,10 @@ def test_pool_arch_pin_survives_early_dsl_construction():
         os.environ.pop("CUTE_DSL_ARCH", None)
         # Simulate the parent-package import chain: cutlass (and the DSL
         # env-manager singleton) come up with no CUTE_DSL_ARCH in sight.
-        import quack.cache  # noqa: F401
+        import DLKernel.cache  # noqa: F401
 
         # The pool's env pinning + re-latch, as _pool_initializer runs them.
-        from quack.cache.async_compile import _pool_initializer
+        from DLKernel.cache.async_compile import _pool_initializer
 
         _pool_initializer("90", "sm_90a")
 

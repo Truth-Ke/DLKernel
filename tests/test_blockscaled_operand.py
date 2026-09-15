@@ -12,7 +12,7 @@ import io
 import pytest
 import torch
 
-from quack.blockscaled.operand import (
+from DLKernel.blockscaled.operand import (
     BLOCKSCALED_FORMAT_REGISTRY,
     MXFP4,
     MXFP4_BYTE,
@@ -49,7 +49,7 @@ def _quantize(fmt, m=256, k=256, batched=False, seed=0):
 
 
 def test_format_registry_and_legacy_names():
-    import quack.blockscaled as blockscaled
+    import DLKernel.blockscaled as blockscaled
 
     assert BlockScaledFormat.from_name("mxfp8") is MXFP8_E4M3  # legacy short name
     assert BlockScaledFormat.from_name("nvfp4") is NVFP4
@@ -202,7 +202,7 @@ def test_pack_uint6_bit_layout():
     little-endian byte stream, so 4 codes (c0..c3) pack into 3 bytes as
     b0 = c0 | c1<<6; b1 = c1>>2 | c2<<4; b2 = c2>>4 | c3<<2 - the CUTLASS
     SubbyteReference bit order (verified bit-exact against the DSL fp6 fill)."""
-    from quack.blockscaled.quantize import pack_uint6, unpack_uint6
+    from DLKernel.blockscaled.quantize import pack_uint6, unpack_uint6
 
     codes = torch.tensor([[0x21, 0x33, 0x2A, 0x3F]], dtype=torch.uint8, device="cuda")
     packed = pack_uint6(codes)
@@ -218,7 +218,7 @@ def test_pack_uint6_bit_layout():
 
 
 def test_unversioned_fp6_quantizer_keeps_byte_container_contract():
-    from quack.blockscaled.quantize import (
+    from DLKernel.blockscaled.quantize import (
         to_mxfp6_e2m3,
         to_mxfp6_e2m3_packed,
         unpack_uint6,
@@ -243,7 +243,7 @@ def test_packed_fp6_quantize_roundtrip(fmt_name, max_tol, norm_tol):
     under kind::mxf8f6f4). Round-trip quality on randn: e2m3 ~3.7% rel, e3m2
     ~8% rel - both the eager and compiled quantizers must produce the same
     packed layout."""
-    from quack.blockscaled.quantize import QUANTIZERS
+    from DLKernel.blockscaled.quantize import QUANTIZERS
 
     m, k = 256, 512
     torch.manual_seed(0)
@@ -275,7 +275,7 @@ def test_packed_fp6_quantize_roundtrip(fmt_name, max_tol, norm_tol):
 )
 def test_byte_container_compatibility_roundtrip_and_gemm_rejection(fmt, max_tol):
     """Deprecated byte formats remain host-side lossless compatibility paths."""
-    from quack.blockscaled.operand import mma_kind_for_pair
+    from DLKernel.blockscaled.operand import mma_kind_for_pair
 
     m, k = 7, 96
     torch.manual_seed(0)
@@ -360,7 +360,7 @@ def test_e5m2_from_parts_and_quantizer():
     assert rel_max < 0.13, f"e5m2 round-trip rel_max={rel_max}"
     assert rel_norm < 0.06, f"e5m2 round-trip rel_norm={rel_norm}"
     # eager and compiled encoders agree bit-exactly
-    from quack.blockscaled.quantize import QUANTIZERS
+    from DLKernel.blockscaled.quantize import QUANTIZERS
 
     eager_fn, compiled_fn = QUANTIZERS["mxfp8_e5m2"]
     q_e, s_e = eager_fn(x, 32)
@@ -462,7 +462,7 @@ def test_origin_main_byte_fp6_pickle_migrates_without_reinterpretation():
     """
     import torch.utils._pytree as pytree
 
-    from quack.blockscaled.operand import _unflatten, mma_kind_for_pair
+    from DLKernel.blockscaled.operand import _unflatten, mma_kind_for_pair
 
     x = torch.randn(5, 96, device="cuda", dtype=torch.bfloat16)
     byte_op = BlockScaledOperand.quantize(x, MXFP6_E2M3)
@@ -517,7 +517,7 @@ def test_origin_main_byte_fp6_pickle_migrates_without_reinterpretation():
     assert old_tree_rt.format.storage_layout is None and old_tree_rt.shape == (5, 96)
     with pytest.raises(ValueError, match="byte-per-element.*host-side compatibility"):
         mma_kind_for_pair(loaded.format, MXFP8_E4M3)
-    from quack.gemm_interface import gemm
+    from DLKernel.gemm_interface import gemm
 
     with pytest.raises(ValueError, match="byte-per-element.*host-side compatibility"):
         gemm(loaded, loaded.mT, tuned=False)
@@ -632,7 +632,7 @@ def test_pytree_treespec_json_roundtrip_preserves_custom_and_legacy_formats():
 
 
 def test_mma_kind_for_pair():
-    from quack.blockscaled.operand import mma_kind_for_pair
+    from DLKernel.blockscaled.operand import mma_kind_for_pair
 
     # equal pairs: both-fp4 is ONE mxf4nvf4 atom, scale config from the format
     # (mxfp4: vec 32 e8m0 - PTX spells that instantiation kind::mxf4)
@@ -712,7 +712,7 @@ def test_format_without_dsl_element_type():
     kind selection (no silent mxf8f6f4 fall-through), and a registered
     DSL-typeless format must not break registry-wide dtype lookup for the
     formats that do have DSL types. See AI/blockscaled_api.md section 9."""
-    from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
+    from DLKernel.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
 
     weird = BlockScaledFormat("e3m4_test", torch.uint8, None, 8, 1, torch.float8_e8m0fnu, 32)
     with pytest.raises(ValueError, match="no CuTe-DSL element type"):
@@ -739,7 +739,7 @@ def test_future_recipe_examples():
     as pure data, pinned to fail at the KIND layer with the right reason until
     their consumer kernels land. The scale-recipe axis mirrors cuBLASLt's
     cublasLtMatmulMatrixScale_t and torch._C._ScalingType."""
-    from quack.blockscaled.operand import mma_kind_for_pair
+    from DLKernel.blockscaled.operand import mma_kind_for_pair
 
     # DeepSeek-style 1x128 fp32-scale fp8: hardware elements, software recipe.
     ds1d = BlockScaledFormat(

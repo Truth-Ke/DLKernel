@@ -6,21 +6,21 @@ from triton.testing import do_bench
 
 import cutlass
 
-from quack.cute_dsl_utils import get_device_capacity, torch2cute_dtype_map
-from quack.gemm import gemm as quack_gemm
-from quack.gemm_default_epi import GemmDefaultSm100
+from DLKernel.cute_dsl_utils import get_device_capacity, torch2cute_dtype_map
+from DLKernel.gemm import gemm as dlkernel_gemm
+from DLKernel.gemm_default_epi import GemmDefaultSm100
 
 # SplitKMode from gemm_config, not gemm_interface (same object): gemm_interface
 # pulls in the blockscaled modules, which would defeat the deferred import in
 # _run_blockscaled and cost every dense run ~0.5s of startup.
-from quack.gemm_config import SplitKMode
+from DLKernel.gemm_config import SplitKMode
 
 """
-GEMM benchmark using quack.gemm.gemm() for both the dense path and the SM100
+GEMM benchmark using DLKernel.gemm.gemm() for both the dense path and the SM100
 blockscaled path (mx/nv fp8/fp6/fp4, mixed A/B formats), including blockscaled
 varlen_m. Blockscaled is selected by passing --sf_dtype, --sf_vec_size and/or
 per-operand --bs_format_a/--bs_format_b registry names; everything
-runs through the same unified quack.gemm.gemm() dispatch (with SFA/SFB), so
+runs through the same unified DLKernel.gemm.gemm() dispatch (with SFA/SFB), so
 the tile/cluster flags apply identically and the timings include the real
 dispatch overhead users pay.
 
@@ -112,7 +112,7 @@ def parse_cluster_shape_mnk(s: str):
 
 
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GEMM benchmark using quack.gemm.gemm()")
+    parser = argparse.ArgumentParser(description="GEMM benchmark using DLKernel.gemm.gemm()")
 
     parser.add_argument(
         "--mnkl",
@@ -256,7 +256,7 @@ def _quantize_dense_operand(l, mn, k, mn_major, fmt):
                dtype, K- or MN-major on the trailing two dims
       scale_contig: (l, rm, rk, 32, 4, 4) blocked scale factors
     """
-    from quack.blockscaled.operand import BlockScaledOperand
+    from DLKernel.blockscaled.operand import BlockScaledOperand
 
     x = (torch.randn(l, mn, k, device="cuda", dtype=torch.bfloat16) * k**-0.5).contiguous()
     op = BlockScaledOperand.quantize(x, fmt)
@@ -272,14 +272,14 @@ def _quantize_dense_operand(l, mn, k, mn_major, fmt):
 def _run_blockscaled(args):
     """Blockscaled (mx/nv fp8/fp6/fp4) path; A and B may carry different formats.
 
-    Both dense and varlen_m run through the unified quack.gemm.gemm() dispatch
+    Both dense and varlen_m run through the unified DLKernel.gemm.gemm() dispatch
     (SFA/SFB tensors, dynamic-shape compile cache).
     """
     # Deferred on purpose: the only blockscaled-only module here that the top of
     # the file doesn't already pull in transitively. It drags in
-    # quack.blockscaled.operand + .quantize for ~0.5s -- ~30% of startup that
+    # DLKernel.blockscaled.operand + .quantize for ~0.5s -- ~30% of startup that
     # dense runs would pay for nothing. See the SplitKMode import note above.
-    from quack.blockscaled.utils import (
+    from DLKernel.blockscaled.utils import (
         create_blockscaled_varlen_m_operands,
         scale_blocked_for_cublas,
         torch_dtype_for_cutlass,
@@ -307,7 +307,7 @@ def _run_blockscaled(args):
             "blockscaled derives tile K from the MMA instruction; pass --tile_shape_mnk M,N"
         )
     d_dtype = cutlass.dtype(args.d_dtype)
-    from quack.blockscaled.operand import BlockScaledFormat
+    from DLKernel.blockscaled.operand import BlockScaledFormat
 
     quant_fmt = None
     if args.quant_out is not None:
@@ -430,7 +430,7 @@ def _run_blockscaled(args):
         B = mB.permute(2, 0, 1)
 
         def fn():
-            quack_gemm(
+            dlkernel_gemm(
                 mA,
                 B,
                 mD,
@@ -478,7 +478,7 @@ def _run_blockscaled(args):
             ).permute(1, 2, 0)
 
         def fn():
-            quack_gemm(
+            dlkernel_gemm(
                 A,
                 B,
                 mD.permute(2, 0, 1) if quant_fmt is None else mD,
@@ -511,7 +511,7 @@ def _run_blockscaled(args):
             torch.testing.assert_close(mD.float(), ref, atol=tol, rtol=1e-3)
         elif quant_fmt is not None:
             # Dequantize (D, SFD) and bound the error by the quantization step.
-            from quack.blockscaled.quantize import dequant_operand, unpack_scale_blocked_to_2d
+            from DLKernel.blockscaled.quantize import dequant_operand, unpack_scale_blocked_to_2d
 
             vec_d = quant_fmt.sf_vec_size
             ref = torch.einsum("mkl,nkl->lmn", a_ref, b_ref)
@@ -541,7 +541,7 @@ def _run_blockscaled(args):
     print(f"a_major: {a_major}, b_major: {b_major}")
 
     flops = 2 * m * n * k * l
-    timing = _bench_and_report("quack ", fn, flops, args.warmup_iterations, args.iterations)
+    timing = _bench_and_report("DLKernel ", fn, flops, args.warmup_iterations, args.iterations)
 
     if args.varlen_m:
         print("(skipping cuBLAS: varlen_m not supported)")
@@ -569,7 +569,7 @@ def _run_blockscaled(args):
                 f"got {fmt_a.name} x {fmt_b.name} -> {quant_fmt.name})"
             )
             return
-        from quack.bench.cublaslt_quant_out import CublasLtQuantOutGemm
+        from DLKernel.bench.cublaslt_quant_out import CublasLtQuantOutGemm
 
         g = CublasLtQuantOutGemm(
             A[0].contiguous(),
@@ -586,11 +586,11 @@ def _run_blockscaled(args):
             torch.cuda.synchronize()
             vals_eq = torch.equal(D_cub.view(torch.uint8), mD[0].view(torch.uint8))
             sf_eq = torch.equal(SFD_cub.view(torch.uint8), mSFD[0].view(torch.uint8))
-            print(f"quack vs cuBLAS quant-out: values bit_exact={vals_eq}  SF bit_exact={sf_eq}")
+            print(f"DLKernel vs cuBLAS quant-out: values bit_exact={vals_eq}  SF bit_exact={sf_eq}")
         t_cublas = _bench_and_report(
             "cuBLAS", g.run, flops, args.warmup_iterations, args.iterations
         )
-        print(f"  (quack speedup vs cuBLAS: {t_cublas / timing:.2f}x)")
+        print(f"  (DLKernel speedup vs cuBLAS: {t_cublas / timing:.2f}x)")
         return
     if fmt_a.name != fmt_b.name or fmt_a.elem_bits == 6:
         # F.scaled_mm takes one scaling recipe per fp8/fp4 operand dtype; mixed
@@ -630,12 +630,12 @@ def _run_blockscaled(args):
         err = (mD.squeeze(-1).float() - out_cublas.float()).abs().max().item()
         same_dtype = mD.dtype == out_cublas.dtype
         exact = same_dtype and torch.equal(mD.squeeze(-1), out_cublas)
-        print(f"quack vs cuBLAS: max_abs_err={err:.3e}  bit_exact={exact}")
+        print(f"DLKernel vs cuBLAS: max_abs_err={err:.3e}  bit_exact={exact}")
 
     t_cublas = _bench_and_report(
         "cuBLAS", fn_cublas, flops, args.warmup_iterations, args.iterations
     )
-    print(f"  (quack speedup vs cuBLAS: {t_cublas / timing:.2f}x)")
+    print(f"  (DLKernel speedup vs cuBLAS: {t_cublas / timing:.2f}x)")
 
 
 def run(args):
@@ -694,7 +694,7 @@ def run(args):
     device = "cuda"
 
     # ── Tensor creation ───────────────────────────────────────────────────────
-    # quack.gemm.gemm() conventions:
+    # DLKernel.gemm.gemm() conventions:
     #   A: (l, m, k) or (total_m, k) if varlen_m
     #   B: (l, n, k)
     #   D: (l, m, n) or (total_m, n) if varlen_m — n-major
@@ -756,7 +756,7 @@ def run(args):
 
     # ── Run / ref check ───────────────────────────────────────────────────────
     def fn():
-        quack_gemm(
+        dlkernel_gemm(
             A,
             B,
             D,
@@ -829,7 +829,7 @@ def run(args):
         fn_cublas = lambda: torch.bmm(A, B.mT)
         _bench_and_report("cuBLAS", fn_cublas, flops, warmup, repeats)
 
-    timing = _bench_and_report("quack ", fn, flops, warmup, repeats, gbps_bytes=total_bytes)
+    timing = _bench_and_report("DLKernel ", fn, flops, warmup, repeats, gbps_bytes=total_bytes)
     fn()
 
     if fn_cublas is not None:

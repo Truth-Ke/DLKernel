@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from quack.cute_dsl_utils import get_device_capacity
-from quack.rmsnorm import (
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.rmsnorm import (
     _compile_rmsnorm_fwd,
     rmsnorm,
     rmsnorm_bwd,
@@ -14,7 +14,7 @@ from quack.rmsnorm import (
     rmsnorm_fwd_tuned,
     rmsnorm_ref,
 )
-from quack.rmsnorm_config import RmsNormBwdConfig, RmsNormFwdConfig
+from DLKernel.rmsnorm_config import RmsNormBwdConfig, RmsNormFwdConfig
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024

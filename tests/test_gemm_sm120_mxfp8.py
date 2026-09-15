@@ -21,11 +21,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
-from quack.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm_config import GemmConfig
-from quack.gemm_interface import (
+from DLKernel.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
+from DLKernel.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm_config import GemmConfig
+from DLKernel.gemm_interface import (
     _prep_blockscaled,
     _sf_batch_canonicalize,
     _unpack_operand,
@@ -38,9 +38,9 @@ from quack.gemm_interface import (
 )
 
 _ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
-# get_device_capacity honors the QUACK_ARCH proxy override, but the blockscaled
+# get_device_capacity honors the DLKERNEL_ARCH proxy override, but the blockscaled
 # mma kinds exist on sm_120/121 silicon only and ptxas always targets the
-# physical GPU — so the H100 QUACK_ARCH=120 CI legs must skip these.
+# physical GPU — so the H100 DLKERNEL_ARCH=120 CI legs must skip these.
 _PHYSICAL_ARCH = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
 requires_sm120 = pytest.mark.skipif(
     _ARCH != 12 or _PHYSICAL_ARCH != 12,
@@ -163,7 +163,7 @@ def test_sm120_mxfp8_varlen_m(seqlens_m):
     (tile-aligned per-batch padding, batch dim 1); SFB stays per-expert."""
     import cutlass
 
-    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+    from DLKernel.blockscaled.utils import create_blockscaled_varlen_m_operands
 
     num_experts = len(seqlens_m)
     n, k = 256, 256
@@ -197,7 +197,7 @@ def test_sm120_mxfp8_vs_cublas():
         A.qdata, B.qdata, scale_a=sfa_flat, scale_b=sfw_flat, out_dtype=torch.bfloat16
     )
     assert torch.equal(out, out_cublas), (
-        f"quack != cuBLAS: max_err={(out.float() - out_cublas.float()).abs().max().item()}"
+        f"DLKernel != cuBLAS: max_err={(out.float() - out_cublas.float()).abs().max().item()}"
     )
 
 
@@ -349,7 +349,7 @@ def test_sm120_plain_mixed_fp8_gemm(tile_m):
     A = (torch.randn(m, k, device="cuda") / math.sqrt(k)).to(torch.float8_e4m3fn)
     B = (torch.randn(n, k, device="cuda") / math.sqrt(k)).to(torch.float8_e5m2)
     D = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
-    from quack.gemm import gemm as gemm_ffi
+    from DLKernel.gemm import gemm as gemm_ffi
 
     gemm_ffi(A, B, D, None, None, tile_m, 128, 1, 1)
     torch.cuda.synchronize()
@@ -479,7 +479,7 @@ def test_sm120_mxfp8_varlen_k_poisoned_sf_pad(seqlens_k):
     sf_valid_insts_last_tile). Poison
     the pad with 0xFF (e8m0 NaN): any consumed pad byte NaNs whole output rows
     via NaN-scale x 0-value products."""
-    from quack.blockscaled.utils import create_blockscaled_varlen_k_operands
+    from DLKernel.blockscaled.utils import create_blockscaled_varlen_k_operands
 
     num_experts = len(seqlens_k)
     m, n, sf_vec = 256, 256, 32

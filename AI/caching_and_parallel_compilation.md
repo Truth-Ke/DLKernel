@@ -1,6 +1,6 @@
 # Caching and Parallel Compilation
 
-QuACK compiles CUDA kernels at runtime via CuTe DSL. Each compilation generates MLIR IR,
+DLKernel compiles CUDA kernels at runtime via CuTe DSL. Each compilation generates MLIR IR,
 lowers to PTX, and JIT-links — taking ~0.5–1 s for reduction-style kernels and 10 s+ for
 large GEMM configs. A test run or autotune sweep triggers dozens-to-hundreds of
 compilations (different dtypes, tile sizes, activations), so naive serial compilation
@@ -11,7 +11,7 @@ GPU-blind CPU workers and `CompilePending` is raised; the caller defers that wor
 runs something else, and retries once the `.o` lands.** One mechanism serves tests
 (`pytest --async-compile`), autotune sweeps, and CI.
 
-## Layer 1: `@jit_cache` Decorator (`quack/cache/jit.py`)
+## Layer 1: `@jit_cache` Decorator (`DLKernel/cache/jit.py`)
 
 Each `_compile_*` function (e.g. `_compile_gemm` in `gemm.py`, `Softmax.compile` in
 `softmax.py`) is decorated with `@jit_cache`, providing in-memory and persistent disk
@@ -41,7 +41,7 @@ process, calling the same kernel config twice skips compilation and disk I/O ent
 
 On in-memory miss, checks for a cached `.o` (object file) on disk. The disk key is
 `(fn.__qualname__, *args, **sorted_kwargs)`, hashed with SHA-256. The cache directory
-includes a **source fingerprint** — a SHA-256 of all `quack/*.py` files plus
+includes a **source fingerprint** — a SHA-256 of all `DLKernel/*.py` files plus
 Python/CUTLASS/TVM-FFI versions. Any source change invalidates the entire `.o` cache
 (the compile *keys* are source-independent — this is what makes re-warming after an
 edit cheap and parallel).
@@ -81,10 +81,10 @@ workers, autotune sweeps). `FileLock` (`fcntl.flock`) serializes access:
 
 | Variable | Default | Description |
 |---|---|---|
-| `QUACK_CACHE_ENABLED` | `1` | Set to `0` to disable disk cache (in-memory cache still active) |
-| `QUACK_CACHE_DIR` | `/tmp/$USER/quack_cache` | Override cache location |
+| `DLKERNEL_CACHE_ENABLED` | `1` | Set to `0` to disable disk cache (in-memory cache still active) |
+| `DLKERNEL_CACHE_DIR` | `/tmp/$USER/dlkernel_cache` | Override cache location |
 
-## Layer 2: Async Compile Pool (`quack/cache/async_compile.py`)
+## Layer 2: Async Compile Pool (`DLKernel/cache/async_compile.py`)
 
 ### The Constraints
 
@@ -110,7 +110,7 @@ not-yet-run work into a false pass. Only the defer loops catch it.
 
 Two callers implement the loop:
 
-- **pytest** (`quack/testing/pytest_plugin.py`, `--async-compile[=N]`): tests are the
+- **pytest** (`DLKernel/testing/pytest_plugin.py`, `--async-compile[=N]`): tests are the
   work items. A deferred test's reports are discarded and it is re-run later.
 - **the autotuner** (`Autotuner.__call__` → `benchmark()` under `pool_scope()`):
   candidate configs are the work items. A cold config rotates to the back of the bench
@@ -131,18 +131,18 @@ Same architecture as PyTorch Inductor's compile-worker `SubprocPool`: one sideca
 process pays the heavy import once, workers fork from it copy-on-write.
 
 - `_make_executor()` builds a `ProcessPoolExecutor` on a **`forkserver`** context with
-  `set_forkserver_preload(["quack.cache._pool_preload"])`. The preload imports
+  `set_forkserver_preload(["DLKernel.cache._pool_preload"])`. The preload imports
   torch + cutlass + tvm_ffi (~13 s) exactly once; each worker forks in ~0.1 s.
   Measured effect: pool CPU cost for a 130-key cold run dropped from ~11 CPU-min
   (spawn, 32 workers × import) to ~1 CPU-min.
-- **Workers are GPU-blind.** The preload pins `QUACK_ARCH`/`CUTE_DSL_ARCH` (via
+- **Workers are GPU-blind.** The preload pins `DLKERNEL_ARCH`/`CUTE_DSL_ARCH` (via
   `nvidia-smi --query-gpu=compute_cap`, no CUDA context) and sets
-  `CUDA_VISIBLE_DEVICES=""`. An explicit `QUACK_ARCH` env override wins — CI
-  cross-compiles (e.g. `QUACK_ARCH=120` on an H100) and workers must target the
+  `CUDA_VISIBLE_DEVICES=""`. An explicit `DLKERNEL_ARCH` env override wins — CI
+  cross-compiles (e.g. `DLKERNEL_ARCH=120` on an H100) and workers must target the
   *requested* arch, not the physical one. Fork-safety follows: the sidecar never
-  initializes CUDA. (This flushed out a real bug: `import quack` used to initialize
+  initializes CUDA. (This flushed out a real bug: `import DLKernel` used to initialize
   CUDA at import time via `rmsnorm_config._detect_arch_major()`; it now honors
-  `QUACK_ARCH`.)
+  `DLKERNEL_ARCH`.)
 - **`_neutral_main()`**: multiprocessing child prep re-executes the user's `__main__`
   script (`runpy.run_path`) so pickles referencing `__main__` resolve. Our tasks never
   reference `__main__`, and a user script with CUDA work at top level would kill every
@@ -162,12 +162,12 @@ process pays the heavy import once, workers fork from it copy-on-write.
 | `pool_scope()` | scoped activation (autotuner); reuses the active pool or wraps the shared executor; `CompilePending` cannot escape the block into unrelated code |
 | `suppress_pool()` | make `get_active_pool()` return None inside — the force-sync escape hatch |
 | `CompilePool.submit / poll / mark_external / prewarm / stats` | per-sha bookkeeping; `poll` states: `new / pending / done / failed` |
-| `get_shared_executor()` | process-wide executor for scoped pools (`QUACK_COMPILE_WORKERS`, default 8) |
+| `get_shared_executor()` | process-wide executor for scoped pools (`DLKERNEL_COMPILE_WORKERS`, default 8) |
 
 | Variable | Default | Description |
 |---|---|---|
-| `QUACK_ASYNC_COMPILE_START` | `forkserver` | set to `spawn` to disable the fork sidecar |
-| `QUACK_COMPILE_WORKERS` | `8` | shared-executor size (autotune sweeps outside pytest) |
+| `DLKERNEL_ASYNC_COMPILE_START` | `forkserver` | set to `spawn` to disable the fork sidecar |
+| `DLKERNEL_COMPILE_WORKERS` | `8` | shared-executor size (autotune sweeps outside pytest) |
 
 ## Layer 3: Autotuning (`autotuner.py`)
 
@@ -179,8 +179,8 @@ JSON key includes package version, tuning key (tensor metadata), and config stri
 
 | Variable | Default | Description |
 |---|---|---|
-| `QUACK_CACHE_AUTOTUNING` | unset | Set to `1` to enable disk caching of tuning results |
-| `QUACK_FORCE_CACHE_UPDATE` | unset | Set to `1` to ignore cached tuning results |
+| `DLKERNEL_CACHE_AUTOTUNING` | unset | Set to `1` to enable disk caching of tuning results |
+| `DLKERNEL_FORCE_CACHE_UPDATE` | unset | Set to `1` to ignore cached tuning results |
 
 ### Compile/Bench Overlap
 
@@ -209,7 +209,7 @@ A config whose compile genuinely fails falls through to an in-process compile in
 `_bench`, whose `(RuntimeError, MemoryError)` handler records `float("inf")` — failed
 configs never win, and never contaminate timings with compile cost.
 
-## Single-Pass Test Workflow (`quack/testing/pytest_plugin.py`)
+## Single-Pass Test Workflow (`DLKernel/testing/pytest_plugin.py`)
 
 ```bash
 # One command, cold or warm cache:
@@ -260,13 +260,13 @@ gap prints the missing tests and flips the exit status to failure.
 ### CI (`.github/actions/gpu-test/action.yml`)
 
 Single pass: `pytest tests/ -n $NUM_GPUS --dist worksteal --async-compile=24`. The
-per-runner `QUACK_CACHE_DIR` carries `.o` files across runs; cross-arch legs set
-`QUACK_ARCH` (honored by the pool's arch pinning).
+per-runner `DLKERNEL_CACHE_DIR` carries `.o` files across runs; cross-arch legs set
+`DLKERNEL_ARCH` (honored by the pool's arch pinning).
 
 ## `custom_op` Fakes Are Pure No-ops
 
 All kernels use `@torch.library.custom_op` via the `cute_op` decorator
-(`quack/dsl/torch_library_op.py`). The registered fake is a **pure no-op**: our ops
+(`DLKernel/dsl/torch_library_op.py`). The registered fake is a **pure no-op**: our ops
 only mutate their inputs, so Dynamo / AOT autograd need no shape effect, and running
 the body under tracing would pay compile latency at trace time (or crash for
 shape/dtype combos the kernel intentionally rejects). Kernel compilation is owned
@@ -308,12 +308,12 @@ pytest --async-compile=32
 
 | File | Role |
 |------|------|
-| `quack/cache/jit.py` | `@jit_cache` (in-memory + `.o` disk cache), `FileLock`, pool integration (step 3b) |
-| `quack/cache/async_compile.py` | `CompilePending`, `CompilePool`, forkserver sidecar, `pool_scope`, `suppress_pool`, `_neutral_main` |
-| `quack/cache/_pool_preload.py` | forkserver preload: arch pinning (no CUDA), torch/cutlass import |
-| `quack/testing/pytest_plugin.py` | `--async-compile` flag, single-proc + xdist defer loops, integrity check |
+| `DLKernel/cache/jit.py` | `@jit_cache` (in-memory + `.o` disk cache), `FileLock`, pool integration (step 3b) |
+| `DLKernel/cache/async_compile.py` | `CompilePending`, `CompilePool`, forkserver sidecar, `pool_scope`, `suppress_pool`, `_neutral_main` |
+| `DLKernel/cache/_pool_preload.py` | forkserver preload: arch pinning (no CUDA), torch/cutlass import |
+| `DLKernel/testing/pytest_plugin.py` | `--async-compile` flag, single-proc + xdist defer loops, integrity check |
 | `autotuner.py` | bench loop under `pool_scope` (compile/bench overlap), `FileCacheManager` result cache |
-| `quack/dsl/torch_library_op.py` | `cute_op`: custom_op with pure no-op fakes |
+| `DLKernel/dsl/torch_library_op.py` | `cute_op`: custom_op with pure no-op fakes |
 | `tests/test_async_compile.py`, `tests/test_autotuner.py`, `tests/test_cache.py` | regression tests encoding the failure modes above |
 
 ## History

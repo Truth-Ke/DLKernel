@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from quack.rotary import apply_rotary, apply_rotary_emb, apply_rotary_emb_kv_, apply_rotary_emb_qkv_
+from DLKernel.rotary import apply_rotary, apply_rotary_emb, apply_rotary_emb_kv_, apply_rotary_emb_qkv_
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -100,10 +100,16 @@ def pad_input(x_unpad, indices, batch, seqlen):
 
 
 def cuda_event_names(prof):
+    # Only real device events count: under torch.compile(), kineto also records
+    # Dynamo's "# Call CompiledFxGraph ... #" user annotation and attributes it to
+    # the CUDA device, which would otherwise inflate the kernel count (flaky when
+    # the annotation lands inside the profiled block). ``is_user_annotation``
+    # distinguishes them reliably (False for kernels/memcpys, True for annotations).
     return [
         event.name
         for event in prof.events()
         if str(getattr(event, "device_type", "")).endswith("CUDA")
+        and not getattr(event, "is_user_annotation", False)
     ]
 
 

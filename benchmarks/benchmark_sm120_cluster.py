@@ -20,9 +20,9 @@ from triton.testing import do_bench
 import cutlass
 import cutlass.torch as cutlass_torch
 
-from quack.rmsnorm import rmsnorm_fwd, rmsnorm_bwd, rmsnorm
-from quack.softmax import softmax
-from quack.cross_entropy import cross_entropy_fwd, cross_entropy
+from DLKernel.rmsnorm import rmsnorm_fwd, rmsnorm_bwd, rmsnorm
+from DLKernel.softmax import softmax
+from DLKernel.cross_entropy import cross_entropy_fwd, cross_entropy
 
 
 def io_bytes(kernel, M, N, db):
@@ -201,7 +201,7 @@ def run_sweep(M, N_vals, dtype, warmup=5, rep=50):
 
 
 def print_table(results, dtype_name):
-    # Quack-only columns
+    # DLKernel-only columns
     q_cols = [
         "rmsnorm_fwd", "rmsnorm_fwd_res", "rmsnorm_bwd",
         "softmax_fwd", "softmax_bwd", "ce_fwd", "ce_bwd",
@@ -210,24 +210,24 @@ def print_table(results, dtype_name):
         "rmsnorm fwd", "rmsnorm fwd+res", "rmsnorm bwd",
         "softmax fwd", "softmax bwd", "CE fwd", "CE bwd",
     ]
-    print(f"\n=== {dtype_name} — quack (GB/s) ===\n")
+    print(f"\n=== {dtype_name} — DLKernel (GB/s) ===\n")
     print("| N | " + " | ".join(q_headers) + " |")
     print("|---" * (len(q_headers) + 1) + "|")
     for row in results:
         vals = [str(row.get(c, "-")) for c in q_cols]
         print(f"| {row['N']} | " + " | ".join(vals) + " |")
 
-    # Comparison table (quack vs torch.compile)
+    # Comparison table (DLKernel vs torch.compile)
     cmp = [
         ("rmsnorm fwd", "rmsnorm_fwd", "rmsnorm_fwd_ref"),
         ("softmax fwd", "softmax_fwd", "softmax_fwd_ref"),
         ("CE fwd", "ce_fwd", "ce_fwd_ref"),
     ]
-    print(f"\n=== {dtype_name} — quack vs torch.compile (GB/s) ===\n")
+    print(f"\n=== {dtype_name} — DLKernel vs torch.compile (GB/s) ===\n")
     header = "| N |"
     sep = "|---|"
     for label, _, _ in cmp:
-        header += f" {label} quack | {label} compile |"
+        header += f" {label} DLKernel | {label} compile |"
         sep += "---|---|"
     print(header)
     print(sep)

@@ -10,8 +10,8 @@ from triton.testing import Benchmark, do_bench, perf_report
 import cutlass
 import cutlass.torch as cutlass_torch
 
-from quack.bench.bench_utils import run_and_print
-from quack.softmax import softmax
+from DLKernel.bench.bench_utils import run_and_print
+from DLKernel.softmax import softmax
 
 try:
     from liger_kernel.transformers.functional import liger_softmax
@@ -50,7 +50,7 @@ def _result(numel_rw: int, elem_bytes: int, ms: float) -> dict:
 
 def _fwd_providers():
     providers = [
-        ("quack", "quack"),
+        ("DLKernel", "DLKernel"),
         ("torch_compile", "torch.compile"),
     ]
     if liger_softmax is not None:
@@ -60,7 +60,7 @@ def _fwd_providers():
 
 def _bwd_providers():
     return [
-        ("quack", "quack"),
+        ("DLKernel", "DLKernel"),
         ("torch_compile", "torch.compile"),
     ]
 
@@ -102,7 +102,7 @@ def softmax_fwd_runner(M, N, provider, dtype_name):
 
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch_dtype)
 
-    if provider == "quack":
+    if provider == "DLKernel":
         fn = lambda: softmax(x)
     elif provider == "torch_compile":
         compiled = torch.compile(lambda x: F.softmax(x, dim=-1))
@@ -125,7 +125,7 @@ def softmax_bwd_runner(M, N, provider, dtype_name):
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch_dtype, requires_grad=True)
     x_ref = x.detach().clone().requires_grad_()
 
-    if provider == "quack":
+    if provider == "DLKernel":
         y = softmax(x)
         dy = torch.randn_like(y)
         fn = lambda: torch.autograd.grad(y, x, grad_outputs=dy, retain_graph=True)

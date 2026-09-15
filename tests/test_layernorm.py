@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.rmsnorm import (
+from DLKernel.rmsnorm import (
     layernorm_bwd,
     layernorm_fwd,
     layernorm_mean_ref,

@@ -6,9 +6,9 @@ torch references, independent of the variant wrappers."""
 import pytest
 import torch
 
-from quack.epilogue.ops import ColVecReduce, RowVecReduce
-from quack.gemm_config import GemmConfig
-from quack.epilogue.frontend import gemm_epilogue
+from DLKernel.epilogue.ops import ColVecReduce, RowVecReduce
+from DLKernel.gemm_config import GemmConfig
+from DLKernel.epilogue.frontend import gemm_epilogue
 
 torch.manual_seed(0)
 
@@ -100,10 +100,10 @@ def test_rowvec_reduce_finalized():
     "of M is dropped (colsum comes back as the sum over the first half of the rows)",
 )
 def test_rowvec_reduce_cluster_m2():
-    from quack.cute_dsl_utils import get_device_capacity
+    from DLKernel.cute_dsl_utils import get_device_capacity
 
     # The corruption is observed on SM100/SM110 only; other archs pass this
-    # kernel, which would strict-XPASS. Gate by quack capability (QUACK_ARCH
+    # kernel, which would strict-XPASS. Gate by DLKernel capability (DLKERNEL_ARCH
     # aware) so the xfail encodes exactly the known-bad configuration.
     if get_device_capacity(torch.device("cuda"))[0] not in (10, 11):
         pytest.skip("cluster_M=2 RowVecReduce corruption is an SM100/SM110 bug")
@@ -167,7 +167,7 @@ def test_batched_3d():
 
 
 def test_eager_tuned_smoke():
-    """tuned=True rides quack.gemm_runtime.autotune (sweep once per metadata class,
+    """tuned=True rides DLKernel.gemm_runtime.autotune (sweep once per metadata class,
     warm replay after); numerics must match the pinned-config call."""
     A, B = _inputs(m=256, n=512, k=256)
     bias = torch.randn(1, B.shape[-1], device="cuda", dtype=torch.float32)
@@ -192,11 +192,11 @@ def test_from_class_static():
     the plan/run interface without the fn frontend. Power API: B arrives
     dispatch-shaped (n, k), epi_args explicit (all default-epi ops absent =
     plain D = A @ B)."""
-    from quack.cute_dsl_utils import get_device_capacity
-    from quack.gemm import GemmDefaultSm100
-    from quack.epilogue.frontend import epilogue_from_class
+    from DLKernel.cute_dsl_utils import get_device_capacity
+    from DLKernel.gemm import GemmDefaultSm100
+    from DLKernel.epilogue.frontend import epilogue_from_class
 
-    # quack capability, not torch's: QUACK_ARCH overrides (e.g. the CI sm120
+    # DLKernel capability, not torch's: DLKERNEL_ARCH overrides (e.g. the CI sm120
     # legs) dispatch non-SM100 classes on SM100 hardware.
     if get_device_capacity(torch.device("cuda"))[0] not in (10, 11):
         pytest.skip("SM100 class")
@@ -210,7 +210,7 @@ def test_from_class_static():
 
 @pytest.mark.parametrize("fullgraph", [True])
 def test_torch_compile_single_op(fullgraph):
-    """The single quack::gemm_epi custom op: any epilogue object under
+    """The single dlkernel::gemm_epi custom op: any epilogue object under
     torch.compile, numerics matching eager."""
     A, B = _inputs(m=256, n=512, k=256)
     bias = torch.randn(1, B.shape[-1], device="cuda", dtype=torch.float32)

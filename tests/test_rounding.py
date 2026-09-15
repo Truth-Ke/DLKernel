@@ -4,7 +4,7 @@
 Contract under test (PTX cvt.rs semantics on the e2m1 grid): with D_top the
 top 8 discarded mantissa bits of |x| relative to its grid cell's ulp, the
 value rounds away from zero iff D_top + r8 >= 256 — bits of x below the top 8
-can never bridge the carry (integer-plus-residue argument in quack/rounding.py).
+can never bridge the carry (integer-plus-residue argument in DLKernel/rounding.py).
 Specials follow satfinite: NaN -> 0x7 (+6.0, sign dropped), |x| > 6 incl Inf
 -> sign|0x7, +-0 keeps its sign. The reference model below encodes exactly
 this rule; the emulation must match it BITWISE, and — independently of the
@@ -29,8 +29,8 @@ import cutlass.cute as cute
 from cutlass import Int32, Uint32, Float32
 from cutlass.cute.runtime import from_dlpack
 
-from quack.cute_dsl_utils import get_compile_target_capacity
-from quack.rounding import (
+from DLKernel.cute_dsl_utils import get_compile_target_capacity
+from DLKernel.rounding import (
     PHILOX_KEY_A,
     PHILOX_KEY_B,
     PHILOX_N_ROUNDS_DEFAULT,

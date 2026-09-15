@@ -9,8 +9,8 @@ Expected: PASS
 """
 import math
 import torch
-from quack.gemm import gemm
-from quack.gemm_interface import gemm_ref
+from DLKernel.gemm import gemm
+from DLKernel.gemm_interface import gemm_ref
 
 torch.random.manual_seed(42)
 device = "cuda"

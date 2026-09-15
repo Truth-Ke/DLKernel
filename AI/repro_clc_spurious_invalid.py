@@ -28,12 +28,12 @@ INGREDIENT MATRIX (each necessary, jointly sufficient):
 
 IMPACT: any CLC scheduler treating invalid-response as pool-empty retires
 early. Harmless for exact grids (un-granted clusters just launch), but it
-was the root cause of the July 2026 quack varlen corruption: the padding
-drain (removed/fixed in quack/tile_scheduler.py cancel_pending_tail) fired
+was the root cause of the July 2026 DLKernel varlen corruption: the padding
+drain (removed/fixed in DLKernel/tile_scheduler.py cancel_pending_tail) fired
 cancels at such retirements, canceling REAL pending tiles whose output rows
 then silently kept stale memory.
 
-In-situ variant (fires in 1-2 sweep iterations): quack varlen gemm loop +
+In-situ variant (fires in 1-2 sweep iterations): DLKernel varlen gemm loop +
 contender + exit-valid printf in the drain; 24/24 corrupting drains showed
 an invalid exit at mid-pool position followed by 79-256 valid grants.
 """

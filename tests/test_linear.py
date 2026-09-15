@@ -5,10 +5,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.linear import linear_func, linear_act_func, act_linear_func, gated_linear_func
-from quack.linear import linear_gated_func
-from quack.mlp import mlp_func
-from quack.gemm_interface import (
+from DLKernel.linear import linear_func, linear_act_func, act_linear_func, gated_linear_func
+from DLKernel.linear import linear_gated_func
+from DLKernel.mlp import mlp_func
+from DLKernel.gemm_interface import (
     gemm,
     gemm_act,
     gemm_add,
@@ -29,10 +29,10 @@ from quack.gemm_interface import (
     gemm_norm_act,
     gemm_norm_act_ref,
 )
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm_config import GemmConfig
-from quack.rounding import RoundingMode
-from quack.rms_final_reduce import rms_final_reduce
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm_config import GemmConfig
+from DLKernel.rounding import RoundingMode
+from DLKernel.rms_final_reduce import rms_final_reduce
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -956,7 +956,7 @@ def test_gemm_norm_act_colvec_and_rowvec(input_dtype, M, N, K, tile_M, tile_N):
     device = "cuda"
     if get_device_capacity(torch.device(device))[0] != 9:
         pytest.skip("This regression test targets SM90.")
-    from quack.epilogue.library import norm_act_mod
+    from DLKernel.epilogue.library import norm_act_mod
 
     torch.manual_seed(0)
     A = torch.randn(1, M, K, device=device, dtype=input_dtype)

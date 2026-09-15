@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from quack.gemm_interface import gemm_symmetric
+from DLKernel.gemm_interface import gemm_symmetric
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

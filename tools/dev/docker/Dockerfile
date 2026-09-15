@@ -14,9 +14,7 @@
 #   workspaces are expected to be bind-mounted at runtime.
 #
 # Build:
-#   tools/dev/docker/build.sh [--image] [--push] [--sif]   (tags tridao/quack-kernels-dev:YY.MM.DD)
-# or by hand:
-#   docker build -f tools/dev/docker/Dockerfile -t kernel-dev:cu134 .
+#   docker build -f tools/dev/docker/Dockerfile -t dl-kernels-dev:YY.MM.DD .
 #
 # Useful build args:
 #   --build-arg CUTLASS_DSL_VERSION=4.7.1
@@ -201,7 +199,6 @@ RUN python${PYTHON_VERSION} -m pip install "setuptools<82" wheel packaging "uv==
         ipdb \
         ipython \
         loguru \
-        matplotlib \
         "nsight-python==${NSIGHT_PYTHON_VERSION}" \
         "cuda-python==${CUDA_PYTHON_VERSION}" \
         "compileiq==${COMPILEIQ_VERSION}" \

@@ -1,13 +1,14 @@
-# Copyright (c) 2026, QuACK team.
+# Copyright (c) 2026, DLKernel team.
 # Split-K GEMM: correctness vs fp32 reference, run-to-run bitwise determinism, exact
 # equivalence of split_k=1 with the baseline kernel, and serial/staged agreement.
 
+import DLKernel
 import pytest
 import torch
 
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm import gemm as quack_gemm
-from quack.gemm_interface import SplitKMode, gemm, gemm_add, gemm_add_inplace, gemm_ref
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm import gemm as dlkernel_gemm
+from DLKernel.gemm_interface import SplitKMode, gemm, gemm_add, gemm_add_inplace, gemm_ref
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -18,10 +19,20 @@ pytestmark = pytest.mark.skipif(
 DETERMINISM_RUNS = 3
 
 
-def _assert_close_double_baseline(out, out_ref, out_pt, mult=2, atol=1e-4):
-    assert (out.float() - out_ref).abs().max().item() < mult * (
-        out_pt.float() - out_ref
-    ).abs().max().item() + atol
+def _assert_close_double_baseline(out, out_ref, out_pt, mult=2, atol=1e-4, rtol=1e-4):
+    """Kernel error must stay within `mult` x the same-precision baseline's error, plus a
+    floor that tracks the output magnitude (atol + rtol * |out_ref|max).
+
+    The floor is what keeps the check meaningful when the baseline is exact: with
+    out_dtype=float32 the plain f32 matmul IS the fp32 reference (baseline error 0), so
+    `atol` alone would demand a bitwise match from a kernel that merely reorders the K
+    reduction - fp32 addition is not associative (~8e-6 of the magnitude at K=4160). Real
+    bugs (a dropped partial, a twice-applied epilogue) are O(|out_ref|), far above it.
+    """
+    err = (out.float() - out_ref).abs().max().item()
+    baseline_err = (out_pt.float() - out_ref).abs().max().item()
+    bound = mult * baseline_err + atol + rtol * out_ref.abs().max().item()
+    assert err < bound, f"err {err:.3e} >= bound {bound:.3e} (baseline {baseline_err:.3e})"
 
 
 def _make_inputs(m, n, k, L, dtype, seed=0):
@@ -58,6 +69,37 @@ def test_gemm_split_k(L, out_dtype, split_k, split_k_mode):
         assert torch.equal(out, r), "split_k result is not bitwise deterministic"
 
 
+def test_split_k_tolerance_floor_still_catches_structural_errors():
+    """The magnitude floor must not make _assert_close_double_baseline vacuous: with an
+    exact baseline (out_dtype=float32 -> out_pt IS out_ref, baseline error 0) a dropped
+    split-K partial or a twice-applied epilogue is O(|out_ref|) and must still fail."""
+    m, n, k = 64, 80, 4160
+    for scale, bias in ((1.0, 0.0), (1e-3, 0.0), (1.0, 3.0)):
+        A, B = _make_inputs(m, n, k, None, torch.bfloat16, seed=17)
+        A = A * scale
+        B = B * scale
+        out_ref = gemm_ref(A.float(), B.float()) + bias
+        # This is the actual same-precision PyTorch baseline used by the kernel test.
+        out_pt = (A.float() @ B.float()) + bias
+        _assert_close_double_baseline(out_pt, out_ref, out_pt, mult=2)
+        # For bf16, compare in the output dtype so conversion error is not
+        # mistaken for reduction-order error.
+        bf16_ref = out_ref.to(torch.bfloat16)
+        bf16_pt = out_pt.to(torch.bfloat16)
+        _assert_close_double_baseline(bf16_pt, bf16_ref, bf16_pt, mult=2)
+
+        # Use a deliberately large corruption representative of a missing partial;
+        # the test targets the predicate's ability to reject an O(output)-scale error,
+        # not the particular random split's cancellation pattern.
+        dropped_partial = out_ref + 10 * out_ref.abs().clamp_min(1)
+        with pytest.raises(AssertionError):
+            _assert_close_double_baseline(dropped_partial, out_ref, out_pt, mult=2)
+        with pytest.raises(AssertionError):
+            _assert_close_double_baseline(
+                out_ref + 10 * out_ref.abs().clamp_min(1), out_ref, out_pt, mult=2
+            )
+
+
 @pytest.mark.parametrize(
     "persistent,dynamic_persistent", [(False, False), (True, False), (True, True)]
 )
@@ -77,9 +119,9 @@ def test_gemm_split_k_schedulers(split_k_mode, persistent, dynamic_persistent):
     )
 
     def run(out):
-        quack_gemm(
+        dlkernel_gemm(
             A,
-            B.mT,  # quack.gemm takes B as (L, N, K)
+            B.mT,  # DLKernel.gemm takes B as (L, N, K)
             out,
             None,
             tile_count_semaphore,
@@ -171,13 +213,13 @@ def test_gemm_split_k_staged_grid_not_inflated():
     serial_z = max_kernel_grid_z(SplitKMode.SERIAL)
     staged_z = max_kernel_grid_z(SplitKMode.SEPARATE)
     if serial_z is None or staged_z is None:
-        pytest.skip("profiler did not expose the QuACK GEMM grid")
+        pytest.skip("profiler did not expose the DLKernel GEMM grid")
     # The GEMM dominates grid z in both modes (the reduce kernel's z is just L)
     assert staged_z <= serial_z, f"staged GEMM grid z inflated: {staged_z} vs serial {serial_z}"
 
 
 def _max_gemm_grid_z(fn):
-    """Grid.z of the QuACK GEMM launched by fn().
+    """Grid.z of the DLKernel GEMM launched by fn().
 
     grid.z is NOT split_k directly: the default config runs a persistent (pingpong)
     scheduler, so grid.z == num_persistent_clusters == n_clusters * split_k when the
@@ -207,7 +249,7 @@ def _max_gemm_grid_z(fn):
         for e in events
         if e.get("cat") == "kernel"
         and "grid" in e.get("args", {})
-        and "quack" in e.get("name", "").lower()
+        and DLKernel.__name__.lower() in e.get("name", "").lower()
         and "gemm" in e.get("name", "").lower()
     ]
     return max(zs) if zs else None
@@ -219,8 +261,8 @@ def test_gemm_split_k_config_autotuner_surface():
     split-k variants for occupancy-starved shapes (and only when split_k is None)."""
     from dataclasses import replace
 
-    from quack.autotuner import AutotuneConfig
-    from quack.gemm_interface import default_config, gemm_tuned, prune_invalid_gemm_configs
+    from DLKernel.autotuner import AutotuneConfig
+    from DLKernel.gemm_interface import default_config, gemm_tuned, prune_invalid_gemm_configs
 
     m, n, k = 256, 512, 16384
     A, B = _make_inputs(m, n, k, None, torch.bfloat16)
@@ -353,7 +395,7 @@ def test_gemm_split_k_rejects_unsupported():
         gemm(A, B, cu_seqlens_m=cu_seqlens_m, tuned=False, split_k=2)
     with pytest.raises(Exception, match="split_k"):
         gemm(A, B, tuned=False, split_k=2, split_k_mode="bogus")
-    from quack.gemm_interface import gemm_act, gemm_symmetric
+    from DLKernel.gemm_interface import gemm_act, gemm_symmetric
 
     with pytest.raises(NotImplementedError, match="split_k"):
         gemm_act(A, B, activation="relu", split_k=2)
@@ -392,9 +434,9 @@ def test_gemm_split_k_full_linear_epilogue(split_k_mode):
     D_base = torch.empty(L, m, n, dtype=torch.bfloat16, device="cuda")
 
     def run(out, **kw):
-        quack_gemm(
+        dlkernel_gemm(
             A,
-            B.mT,  # quack.gemm takes B as (L, N, K)
+            B.mT,  # DLKernel.gemm takes B as (L, N, K)
             out,
             C,
             None,
@@ -448,7 +490,7 @@ def test_gemm_split_k_m_major_out_with_epilogue(split_k_mode):
     base = torch.empty(L, n, m, dtype=torch.bfloat16, device="cuda").mT
 
     def run(out, **kw):
-        quack_gemm(
+        dlkernel_gemm(
             A,
             B.mT,
             out,
@@ -563,7 +605,7 @@ def test_gemm_split_k_odd_epi_subtile_count():
     D_base = torch.empty(L, m, n, dtype=torch.bfloat16, device="cuda")
 
     def run(out, **kw):
-        quack_gemm(
+        dlkernel_gemm(
             A,
             B.mT,
             out,

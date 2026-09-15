@@ -6,7 +6,7 @@ from cutlass import Float16, Float32
 import cutlass.cute as cute
 import cutlass.cute.tensor as cutlass_cute_tensor
 
-from quack.dsl import cute_tensor
+from DLKernel.dsl import cute_tensor
 
 
 def test_rmem_tensor_to_materializes_converted_fragment(monkeypatch) -> None:

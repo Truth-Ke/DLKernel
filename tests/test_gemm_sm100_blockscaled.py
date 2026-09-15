@@ -3,7 +3,7 @@ import torch
 
 import cutlass
 
-from quack.blockscaled.utils import (
+from DLKernel.blockscaled.utils import (
     blockscaled_gemm_reference,
     compile_blockscaled_gemm_tvm_ffi,
     create_blockscaled_operand_quantized,
@@ -14,15 +14,15 @@ from quack.blockscaled.utils import (
     scale_blocked_for_cublas,
     scale_view_for_kernel,
 )
-from quack.blockscaled.operand import (
+from DLKernel.blockscaled.operand import (
     MXFP4,
     MXFP6_E2M3,
     MXFP6_E2M3_PACKED,
     MXFP8_E4M3,
     NVFP4,
 )
-from quack.gemm_default_epi import GemmDefaultSm100
-from quack.blockscaled.quantize import to_blocked
+from DLKernel.gemm_default_epi import GemmDefaultSm100
+from DLKernel.blockscaled.quantize import to_blocked
 
 
 def _skip_if_not_sm100():
@@ -538,7 +538,7 @@ def test_blockscaled_correctness(
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("mn,sf_k,l", [(128, 4, 1), (256, 16, 1), (384, 12, 2), (512, 8, 1)])
 def test_scale_layout_matches_cublas(mn, sf_k, l):
-    """The quack kernel scale-view and cuBLAS's to_blocked must share the
+    """The DLKernel scale-view and cuBLAS's to_blocked must share the
     same underlying byte layout (they both represent the PTX
     tcgen05 scale-factor atom, tiled in the same outer order)."""
     torch.manual_seed(0)
@@ -583,7 +583,7 @@ def test_scale_layout_matches_cublas(mn, sf_k, l):
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: quantized MXFP8 inputs through quack kernel vs cuBLAS vs dequant ref
+# End-to-end: quantized MXFP8 inputs through the DLKernel GEMM vs cuBLAS vs dequant ref
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "mma_tiler_mn,cluster_shape_mn,m,n,k",
@@ -632,7 +632,7 @@ def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
     # Reference: dequant matmul (a_ref/b_ref are already dequantized)
     d_ref = torch.einsum("mkl,nkl->mnl", a_ref, b_ref)
     err = (mD.float() - d_ref).abs().max().item()
-    assert err < 5e-3, f"quack vs dequant max_err={err}"
+    assert err < 5e-3, f"DLKernel vs dequant max_err={err}"
 
     # cuBLAS: bit-exact match expected (same operand bits, same scale bytes, same hw MMA)
     from torch.nn.functional import scaled_mm as F_scaled_mm, ScalingType, SwizzleType
@@ -653,7 +653,7 @@ def test_blockscaled_mxfp8_quantized(mma_tiler_mn, cluster_shape_mn, m, n, k):
         output_dtype=torch.bfloat16,
     )
     assert torch.equal(mD.squeeze(-1), out_cublas), (
-        f"quack != cuBLAS: max_err={(mD.squeeze(-1).float() - out_cublas.float()).abs().max().item()}"
+        f"DLKernel != cuBLAS: max_err={(mD.squeeze(-1).float() - out_cublas.float()).abs().max().item()}"
     )
 
 
@@ -663,7 +663,7 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     """MXFP8 with A in {k,m}-major × B in {k,n}-major. The SF tensor layout
     stays K-major (hardware convention); only A/B operand strides differ."""
     _skip_if_not_sm100()
-    from quack.blockscaled.quantize import to_mx
+    from DLKernel.blockscaled.quantize import to_mx
 
     m, n, k, l = 256, 256, 256, 1
     sf_vec = 32
@@ -694,7 +694,7 @@ def test_blockscaled_mxfp8_major_modes(a_major, b_major):
     # Sanity: stride(0) == 1 iff mn-major.
     assert (mA.stride(0) == 1) == (a_major == "m"), f"mA stride: {mA.stride()}"
     assert (mB.stride(0) == 1) == (b_major == "n"), f"mB stride: {mB.stride()}"
-    from quack.blockscaled.utils import pack_scale_2d_to_blocked_contig
+    from DLKernel.blockscaled.utils import pack_scale_2d_to_blocked_contig
 
     a_sc = pack_scale_2d_to_blocked_contig(sa_2d)
     b_sc = pack_scale_2d_to_blocked_contig(sb_2d)
@@ -883,11 +883,11 @@ def test_blockscaled_mxfp8_varlen_k(seqlens_k):
     ],
 )
 def test_blockscaled_varlen_k_public_api(seqlens_k):
-    """varlen_k through the public quack.gemm.gemm API (jit-cached compile path).
+    """varlen_k through the public DLKernel.gemm.gemm API (jit-cached compile path).
     A is (m, total_k) m-major, B is (n, total_k) n-major, and BOTH SFA/SFB are
     tile-aligned K-padded buffers passed as (1, rm/rn, total_padded_rk, 32, 4, 4)."""
     _skip_if_not_sm100()
-    from quack.gemm import gemm as gemm_public
+    from DLKernel.gemm import gemm as gemm_public
 
     num_experts = len(seqlens_k)
     m, n, sf_vec = 256, 256, 32
@@ -931,8 +931,8 @@ def test_blockscaled_varlen_k_mixed_dtype(seqlens_k, a_fmt, b_fmt):
     are possible here: varlen_k needs m-major A / n-major B, while packed
     sub-byte (fp4/fp6) operands must be K-major."""
     _skip_if_not_sm100()
-    from quack.gemm import gemm as gemm_public
-    from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY
+    from DLKernel.gemm import gemm as gemm_public
+    from DLKernel.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY
 
     a_dtype = BLOCKSCALED_FORMAT_REGISTRY[a_fmt].to_cutlass_dtype()
     b_dtype = BLOCKSCALED_FORMAT_REGISTRY[b_fmt].to_cutlass_dtype()
@@ -986,7 +986,7 @@ def test_blockscaled_varlen_k_poisoned_sf_pad(seqlens_k, tile_cluster):
     NaN via 0-value x NaN-scale products in the K tail. Instruction issue is a
     leader-only decision, so 2-CTA MMA (tile_M 256) is covered too."""
     _skip_if_not_sm100()
-    from quack.gemm import gemm as gemm_public
+    from DLKernel.gemm import gemm as gemm_public
 
     (tile_m, tile_n), (cluster_m, cluster_n) = tile_cluster
     num_experts = len(seqlens_k)
@@ -1031,13 +1031,13 @@ def test_blockscaled_varlen_k_poisoned_sf_pad(seqlens_k, tile_cluster):
     ],
 )
 def test_blockscaled_varlen_m_public_api(seqlens_m, b_major, fmt):
-    """varlen_m through the public quack.gemm.gemm API (jit-cached compile path).
+    """varlen_m through the public DLKernel.gemm.gemm API (jit-cached compile path).
     SFA is the tile-aligned M-padded buffer passed as a
     (1, total_padded_rm, rk, 32, 4, 4) view."""
     _skip_if_not_sm100()
     if fmt != "mxfp8" and b_major == "n":
         pytest.skip("fp4 operands must be K-major")
-    from quack.gemm import gemm as gemm_public
+    from DLKernel.gemm import gemm as gemm_public
 
     ab_dtype, sf_dtype, sf_vec = VARLEN_FMT[fmt]
     num_experts = len(seqlens_m)
@@ -1080,7 +1080,7 @@ def test_blockscaled_varlen_m_public_api(seqlens_m, b_major, fmt):
 def test_blockscaled_varlen_m_extended_formats_public_api(fmt):
     """The benchmark's varlen generator supports every advertised same-format input."""
     _skip_if_not_sm100()
-    from quack.gemm import gemm as gemm_public
+    from DLKernel.gemm import gemm as gemm_public
 
     seqlens_m = [100, 156]
     num_experts = len(seqlens_m)
@@ -1218,10 +1218,10 @@ def test_mxfp8_split_k(batched, split_k, split_k_mode):
     the plain (split_k=1) MXFP8 kernel to within ~1 bf16 ULP and stay deterministic for
     serial."""
     _skip_if_not_sm100()
-    from quack.blockscaled.operand import BlockScaledOperand
-    from quack.blockscaled.utils import blockscaled_quantize
-    from quack.gemm_config import SplitKMode
-    from quack.gemm_interface import gemm, gemm_blockscaled_ref
+    from DLKernel.blockscaled.operand import BlockScaledOperand
+    from DLKernel.blockscaled.utils import blockscaled_quantize
+    from DLKernel.gemm_config import SplitKMode
+    from DLKernel.gemm_interface import gemm, gemm_blockscaled_ref
 
     mode = SplitKMode[split_k_mode.upper()]
     # Small M/N, large K -> the regime split-K targets. K a multiple of 32 (sf_vec).
@@ -1259,10 +1259,10 @@ def test_mxfp8_split_k_staged_rejected():
     """SEPARATE needs a block-scaled-reachable reduction kernel (not yet wired); it must
     raise a clear error rather than silently misconfigure."""
     _skip_if_not_sm100()
-    from quack.blockscaled.operand import BlockScaledOperand
-    from quack.blockscaled.utils import blockscaled_quantize
-    from quack.gemm_config import SplitKMode
-    from quack.gemm_interface import gemm
+    from DLKernel.blockscaled.operand import BlockScaledOperand
+    from DLKernel.blockscaled.utils import blockscaled_quantize
+    from DLKernel.gemm_config import SplitKMode
+    from DLKernel.gemm_interface import gemm
 
     M, N, K = 256, 256, 2048
     torch.manual_seed(0)
@@ -1284,13 +1284,13 @@ def test_mxfp8_split_k_staged_rejected():
 
 def test_mma_kind_mirrors_kernel_inst_k():
     """The tcgen05 kind rules are encoded at two layers that key on different
-    things: quack.blockscaled.operand.mma_kind_for_pair (format names, torch
+    things: DLKernel.blockscaled.operand.mma_kind_for_pair (format names, torch
     layer) and GemmSm100._blockscaled_mma_inst_k (storage cutlass dtypes,
     kernel layer). Pin the mirror so they cannot drift apart: every
     hardware-representable pair must get the instruction K of its kind
     (mxf4/mxf4nvf4 -> 64, mxf8f6f4 -> 32). Host-only, no GPU needed."""
-    from quack.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
-    from quack.cute_dsl_utils import torch2cute_dtype_map
+    from DLKernel.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
+    from DLKernel.cute_dsl_utils import torch2cute_dtype_map
 
     kind_inst_k = {"mxf4": 64, "mxf4nvf4": 64, "mxf8f6f4": 32}
     fmts = list(BLOCKSCALED_FORMAT_REGISTRY.values())

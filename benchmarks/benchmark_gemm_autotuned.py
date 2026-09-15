@@ -12,14 +12,14 @@ Usage:
     python benchmarks/benchmark_gemm_autotuned.py --M 8192 --N 8192 --K 4096
 
     # Control worker count
-    QUACK_COMPILE_WORKERS=8 python benchmarks/benchmark_gemm_autotuned.py
+    DLKERNEL_COMPILE_WORKERS=8 python benchmarks/benchmark_gemm_autotuned.py
 
     # Cold start: clear .so + autotuning caches to see parallel pre-compilation
     python benchmarks/benchmark_gemm_autotuned.py --cold
 
 Environment variables:
-    QUACK_COMPILE_WORKERS   Number of parallel compile workers (default: 4)
-    QUACK_PRINT_AUTOTUNING  Set to "1" for verbose autotuner output (always on in this script)
+    DLKERNEL_COMPILE_WORKERS   Number of parallel compile workers (default: 4)
+    DLKERNEL_PRINT_AUTOTUNING  Set to "1" for verbose autotuner output (always on in this script)
 """
 
 import argparse
@@ -32,10 +32,10 @@ import torch
 import torch.nn.functional as F
 from triton.testing import do_bench
 
-from quack.autotuner import default_cache_dir
-from quack.cache import get_cache_path
-from quack.gemm_config import GemmConfig
-from quack.gemm_interface import (
+from DLKernel.autotuner import default_cache_dir
+from DLKernel.cache import get_cache_path
+from DLKernel.gemm_config import GemmConfig
+from DLKernel.gemm_interface import (
     act_to_pytorch_fn_map,
     gemm,
     gemm_act,
@@ -47,7 +47,7 @@ from quack.gemm_interface import (
 
 def clear_caches():
     """Clear both the .so kernel cache and the autotuning result cache."""
-    # .so kernel cache (from quack.cache.get_cache_path)
+    # .so kernel cache (from DLKernel.cache.get_cache_path)
     so_cache = str(get_cache_path())
     if os.path.isdir(so_cache):
         shutil.rmtree(so_cache)
@@ -87,7 +87,7 @@ def benchmark_gemm(m, n, k, dtype=torch.bfloat16, repeats=30, config=None):
     ms_pt = do_bench(lambda: F.linear(a, w), warmup=5, rep=repeats)
     tf_pt = tflops(nflops, ms_pt)
 
-    print(f"  quack: {ms:.3f}ms  {tf:.1f} TFLOPS  {gbps:.0f} GB/s")
+    print(f"  DLKernel: {ms:.3f}ms  {tf:.1f} TFLOPS  {gbps:.0f} GB/s")
     print(f"  cuBLAS: {ms_pt:.3f}ms  {tf_pt:.1f} TFLOPS")
     print(f"  speedup: {ms_pt / ms:.2f}x")
     return ms, tf
@@ -184,7 +184,7 @@ def benchmark_gemm_act(
     ms_pt = do_bench(ref_fn, warmup=5, rep=repeats)
     tf_pt = tflops(nflops, ms_pt)
 
-    print(f"  quack: {ms:.3f}ms  {tf:.1f} TFLOPS")
+    print(f"  DLKernel: {ms:.3f}ms  {tf:.1f} TFLOPS")
     print(f"  cuBLAS + torch.compile: {ms_pt:.3f}ms  {tf_pt:.1f} TFLOPS")
     print(f"  speedup: {ms_pt / ms:.2f}x")
     return ms, tf
@@ -234,7 +234,7 @@ def benchmark_gemm_dgated(
     ms_pt = do_bench(ref_fn, warmup=5, rep=repeats)
     tf_pt = tflops(nflops, ms_pt)
 
-    print(f"  quack: {ms:.3f}ms  {tf:.1f} TFLOPS")
+    print(f"  DLKernel: {ms:.3f}ms  {tf:.1f} TFLOPS")
     print(f"  cuBLAS + torch.compile: {ms_pt:.3f}ms  {tf_pt:.1f} TFLOPS")
     print(f"  speedup: {ms_pt / ms:.2f}x")
     return ms, tf
@@ -307,8 +307,8 @@ def main():
     if args.cold:
         clear_caches()
 
-    os.environ["QUACK_PRINT_AUTOTUNING"] = "1"
-    os.environ["QUACK_FORCE_CACHE_UPDATE"] = "1"
+    os.environ["DLKERNEL_PRINT_AUTOTUNING"] = "1"
+    os.environ["DLKERNEL_FORCE_CACHE_UPDATE"] = "1"
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
     M, N, K = args.M, args.N, args.K
     gated_activations = (
@@ -335,7 +335,7 @@ def main():
 
     if args.only_gated:
         print(
-            f"GEMM gated activation benchmark  (workers={os.environ.get('QUACK_COMPILE_WORKERS', '4')})"
+            f"GEMM gated activation benchmark  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '4')})"
         )
         print(f"  batch={args.batch}, dim={args.dim}, ffn={ffn}, dtype={args.dtype}")
         if forced_config is not None:
@@ -358,7 +358,7 @@ def main():
 
     if args.only_dgated:
         print(
-            f"GEMM gated backward benchmark  (workers={os.environ.get('QUACK_COMPILE_WORKERS', '4')})"
+            f"GEMM gated backward benchmark  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '4')})"
         )
         print(f"  batch={args.batch}, dim={args.dim}, ffn={ffn}, dtype={args.dtype}")
         if forced_config is not None:
@@ -379,7 +379,7 @@ def main():
             )
         return
 
-    print(f"GEMM autotuning demo  (workers={os.environ.get('QUACK_COMPILE_WORKERS', '4')})")
+    print(f"GEMM autotuning demo  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '4')})")
     print(f"  M={M}, N={N}, K={K}, dtype={args.dtype}")
     if forced_config is not None:
         print(f"  forced config: {forced_config}")

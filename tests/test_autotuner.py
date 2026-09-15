@@ -1,6 +1,6 @@
 import pytest
 
-from quack.autotuner import AutotuneConfig
+from DLKernel.autotuner import AutotuneConfig
 
 
 def test_autotune_config_supports_multi_kwarg_hash_and_equality():
@@ -32,9 +32,9 @@ def test_autotune_bench_loop_defers_and_retries(monkeypatch):
     precompiles via fake tensors — the bench loop discovers cold keys with
     the real tensors in-process and overlaps compilation via the pool.
     """
-    from quack.autotuner import Autotuner, AutotuneConfig
-    from quack.cache import async_compile
-    from quack.cache.async_compile import CompilePending
+    from DLKernel.autotuner import Autotuner, AutotuneConfig
+    from DLKernel.cache import async_compile
+    from DLKernel.cache.async_compile import CompilePending
 
     class _StubPool:
         """poll() reports 'pending' once per sha, then 'done'."""
@@ -90,10 +90,10 @@ def test_autotune_wedged_pool_falls_back_in_process(monkeypatch):
     cap the config is benched with the pool suppressed (in-process compile),
     so autotuning always terminates.
     """
-    import quack.autotuner as at
-    from quack.autotuner import Autotuner, AutotuneConfig
-    from quack.cache import async_compile
-    from quack.cache.async_compile import CompilePending, get_active_pool
+    import DLKernel.autotuner as at
+    from DLKernel.autotuner import Autotuner, AutotuneConfig
+    from DLKernel.cache import async_compile
+    from DLKernel.cache.async_compile import CompilePending, get_active_pool
 
     class _WedgedPool:
         def poll(self, sha):

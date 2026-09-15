@@ -4,7 +4,7 @@
 The symmetric GEMM only computes the upper triangle and mirrors, so it should
 be ~2x faster than a full GEMM for compute-bound sizes.
 
-Compares quack gemm_symmetric against cuBLAS (torch.matmul / torch.bmm).
+Compares DLKernel gemm_symmetric against cuBLAS (torch.matmul / torch.bmm).
 
 Usage:
     python benchmarks/benchmark_gemm_symmetric.py
@@ -19,7 +19,7 @@ import time
 import torch
 from triton.testing import do_bench
 
-from quack.gemm_interface import gemm_symmetric
+from DLKernel.gemm_interface import gemm_symmetric
 
 
 def tflops(flops, ms):
@@ -67,7 +67,7 @@ def benchmark_symmetric(M, K, L=1, dtype=torch.bfloat16, repeats=30):
     ms_pt = do_bench(fn_cublas, warmup=5, rep=repeats)
     tf_pt = tflops(nflops, ms_pt)
 
-    print(f"  quack:  {ms:.3f}ms  {tf:.1f} TFLOPS  {gbps:.0f} GB/s")
+    print(f"  DLKernel:  {ms:.3f}ms  {tf:.1f} TFLOPS  {gbps:.0f} GB/s")
     print(f"  cuBLAS: {ms_pt:.3f}ms  {tf_pt:.1f} TFLOPS")
     print(f"  speedup: {ms_pt / ms:.2f}x")
     return ms, tf

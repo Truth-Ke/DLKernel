@@ -4,7 +4,7 @@
 Designed for both wall-clock benchmarking and Nsight Compute profiling of
 GEMM epilogue-heavy kernels. The mod is named by dotted path (``--mod
 package.module:attr``); factory-minted mods are called inline in the
-module's namespace (``--mod "quack.epilogue.library:norm_act_mod(activation='relu',
+module's namespace (``--mod "DLKernel.epilogue.library:norm_act_mod(activation='relu',
 gated=False, has_c=False, has_rowvec=False, has_colvec=False)"``).
 
 Buffers: A (m, k) and B (n, k) are randn (B scaled 1/sqrt(k)); reduce-sink
@@ -21,17 +21,17 @@ benchmark_gemm_epi.py / benchmark_gemm_autotuned.py.
 
 Examples:
     python benchmarks/benchmark_gemm_epilogues.py \\
-        --mod quack.epilogue.scaled_exp:scaled_exp_epi \\
+        --mod DLKernel.epilogue.scaled_exp:scaled_exp_epi \\
         --mnkl 4096,128256,1024,1 \\
         --tile_shape_mnk 128,256 --cluster_shape_mn 2,1 \\
         --epi-arg max_log2=tile_n
     python benchmarks/benchmark_gemm_epilogues.py \\
-        --mod quack.epilogue.library:amax_epi --mnkl 8192,8192,4096 --tile_shape_mnk 128,256
+        --mod DLKernel.epilogue.library:amax_epi --mnkl 8192,8192,4096 --tile_shape_mnk 128,256
     python benchmarks/benchmark_gemm_epilogues.py \\
-        --mod quack.epilogue.library:qknorm_epi --mnkl 4096,2048,4096 \\
+        --mod DLKernel.epilogue.library:qknorm_epi --mnkl 4096,2048,4096 \\
         --tile_shape_mnk 128,256 --epi-arg qk=f32:128
     ncu python benchmarks/benchmark_gemm_epilogues.py \\
-        --mod quack.epilogue.library:relu_mod --profile --tile_shape_mnk 128,256
+        --mod DLKernel.epilogue.library:relu_mod --profile --tile_shape_mnk 128,256
 """
 
 import argparse
@@ -44,8 +44,8 @@ from pathlib import Path
 
 import torch
 
-from quack.autotuner import _gpu_warmup
-from quack.gemm_config import GemmConfig
+from DLKernel.autotuner import _gpu_warmup
+from DLKernel.gemm_config import GemmConfig
 
 _EPI_ARG_DTYPES = {
     "f32": torch.float32,
@@ -184,7 +184,7 @@ def _write_csv(path: str, record: dict) -> None:
 
 def _load_mod(spec: str):
     """Import a @gemm_epilogue mod from 'package.module:attr'. An attr with a
-    call, e.g. 'quack.epilogue.library:norm_act_mod(activation="relu", ...)', is
+    call, e.g. 'DLKernel.epilogue.library:norm_act_mod(activation="relu", ...)', is
     evaluated in the module's namespace (factory-minted mods)."""
     import importlib
 
@@ -308,9 +308,9 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mod",
         required=True,
-        help="dotted path of a @gemm_epilogue mod ('quack.epilogue.scaled_exp:scaled_exp_epi'), "
+        help="dotted path of a @gemm_epilogue mod ('DLKernel.epilogue.scaled_exp:scaled_exp_epi'), "
         "or a factory call evaluated in the module namespace "
-        "(\"quack.epilogue.library:norm_act_mod(activation='relu', ...)\")",
+        "(\"DLKernel.epilogue.library:norm_act_mod(activation='relu', ...)\")",
     )
     parser.add_argument(
         "--epi-arg",

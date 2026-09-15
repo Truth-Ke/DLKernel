@@ -1,4 +1,4 @@
-# QuACK CI
+# DLKernel CI
 
 CI runs on self-hosted GPU runners (h100, b300, h100/sm120) inside an Apptainer
 SIF pulled from a Docker image on Docker Hub. Triggered on every push to `main`
@@ -9,7 +9,7 @@ and on PRs.
 | File | Purpose |
 |------|---------|
 | `tools/ci/docker/Dockerfile` | image recipe (one Dockerfile, two variants via build args) |
-| `tools/ci/docker/build.sh` | step flags `--image` / `--push` / `--sif` per variant: build the docker image, push to `tridao/quack-kernels`, and/or build the runner's cached SIF |
+| `tools/ci/docker/build.sh` | step flags `--image` / `--push` / `--sif` per variant: build the docker image, push to `<owner>/dl-kernels`, and/or build the runner's cached SIF |
 | `.github/workflows/_test.yml` | reusable workflow with lint/changes/test jobs and the matrix; **the image tag pins live here** |
 | `.github/workflows/ci.yml`, `ci-pr.yml` | thin shells that call `_test.yml` on push / PR |
 | `.github/actions/gpu-test/action.yml` | composite action — pulls SIF, runs single-pass pytest |
@@ -18,8 +18,15 @@ and on PRs.
 
 | Variant | Docker image (latest) | Notes |
 |---------|------------------------|-------|
-| `cu129` | `tridao/quack-kernels:cu12.9-DATE` | base cute-dsl |
-| `cu132` | `tridao/quack-kernels:cu13.2-DATE` | cute-dsl[cu13] |
+| `cu129` | `<owner>/dl-kernels:cu12.9-DATE` | base cute-dsl |
+| `cu132` | `<owner>/dl-kernels:cu13.2-DATE` | cute-dsl[cu13] |
+
+CI reads the image namespace from the `DLKERNEL_IMAGE_REPO` repository variable
+(required — set it to the lowercase Docker Hub namespace that holds the images,
+e.g. `myuser/dl-kernels`). `build.sh` picks the namespace up from
+`DOCKERHUB_USER` / `REGISTRY_REPO`, falling back to the (lowercased) owner of
+the `origin` git remote — point both at the same namespace or CI will re-pull
+(or fail) after you push.
 
 The cu12.9 variant uses PyTorch 2.14 cu126 wheels because cu129 wheels are no
 longer published. The `cu129` variant name and `cu12.9` image tag are retained
@@ -38,7 +45,7 @@ compatibility libcuda shim so it remains runnable on 575-series kernel drivers.
 | h100 | sm120 | ✓ | ✓ |
 
 The cu126 torch wheels lack Blackwell support, so B300 runs only with cu132.
-The h100/sm120 jobs select QuACK's SM120 implementations with `QUACK_ARCH=120`
+The h100/sm120 jobs select DLKernel's SM120 implementations with `DLKERNEL_ARCH=120`
 but compile and execute on H100 hardware, so both wheel variants work there.
 
 ## Test strategy
@@ -51,8 +58,8 @@ Per `gpu-test/action.yml`: a single pass with async kernel compilation —
   contention. Cold kernel-compile misses are shipped to a pool of 24 CPU
   workers (forkserver sidecar, GPU-blind) while the affected tests defer and
   retry once their `.o` lands; warm runs pay nothing. The
-  persistent kernel cache (`QUACK_CACHE_DIR`) carries `.o` files across runs
-  on the same runner. CI prunes QuACK source-fingerprint cache directories
+  persistent kernel cache (`DLKERNEL_CACHE_DIR`) carries `.o` files across runs
+  on the same runner. CI prunes DLKernel source-fingerprint cache directories
   older than 7 days before each test run, plus interrupted `.o.tmp.*` exports
   older than 1 day.
 
@@ -62,7 +69,10 @@ The action pulls `docker://$IMAGE` into `${CI_WORK_DIR:-$HOME}/<tagslug>.sif`
 on first use, then reuses the cached file on subsequent jobs with the same
 tag. After each pull, **stale SIFs from previous image bumps are auto-deleted**;
 the cleanup whitelist keeps both currently-pinned variants (`IMAGE_CU129` and
-`IMAGE_CU132`), so cu129 and cu132 don't thrash each other's caches.
+`IMAGE_CU132`), so cu129 and cu132 don't thrash each other's caches. Only files
+matching the `<namespace>-dl-kernels-<tag>-<date>.sif` slug (plus the legacy
+pre-rename `*quack-kernels*.sif` glob) are candidates, so hand-pulled SIFs like
+`~/dl-kernels.sif` survive.
 
 ## Cutting a new image
 
@@ -70,7 +80,7 @@ The image tags are **pinned in `.github/workflows/_test.yml`** (used by both
 ci.yml and ci-pr.yml). Three steps:
 
 ```bash
-# 1. Build & push from a box that has docker (one-time Hub login: `docker login -u tridao`)
+# 1. Build & push from a box that has docker (one-time Hub login: `docker login -u $DOCKERHUB_USER`)
 ./tools/ci/docker/build.sh --image --push
 # On a runner, add --sif to also pre-build the SIFs the gpu-test action caches
 # (rename them to .sif.hold until step 3 lands, or the action's prune deletes
@@ -82,8 +92,8 @@ ci.yml and ci-pr.yml). Three steps:
 ```yaml
 # 2. Bump IMAGE_CU129 and IMAGE_CU132 in .github/workflows/_test.yml:
 env:
-  IMAGE_CU129: tridao/quack-kernels:cu12.9-NEW_DATE
-  IMAGE_CU132: tridao/quack-kernels:cu13.2-NEW_DATE
+  IMAGE_CU129: ${{ vars.DLKERNEL_IMAGE_REPO }}:cu12.9-NEW_DATE
+  IMAGE_CU132: ${{ vars.DLKERNEL_IMAGE_REPO }}:cu13.2-NEW_DATE
 ```
 
 ```bash
@@ -99,16 +109,17 @@ That's it — runners auto-pull the new SIFs on the next CI run and prune the ol
 For ad-hoc debugging on a runner, pull the same image CI uses:
 
 ```bash
-apptainer pull ~/quack.sif docker://tridao/quack-kernels:cu12.9-DATE
-apptainer exec --nv --writable-tmpfs ~/quack.sif bash
+# $OWNER is CI's namespace: the DLKERNEL_IMAGE_REPO repository variable
+apptainer pull ~/dl-kernels.sif docker://$OWNER/dl-kernels:cu12.9-DATE
+apptainer exec --nv --writable-tmpfs ~/dl-kernels.sif bash
 ```
 
-For private images, set `APPTAINER_DOCKER_USERNAME=tridao` and
+For private images, set `APPTAINER_DOCKER_USERNAME=<dockerhub-user>` and
 `APPTAINER_DOCKER_PASSWORD=$DOCKERHUB_TOKEN` before running.
 
 ## Public vs private image (Docker Hub)
 
-The current `tridao/quack-kernels` repo is intended to be public, so CI needs no
+The current `<owner>/dl-kernels` repo is intended to be public, so CI needs no
 Docker Hub secrets. If you flip it to private, add `DOCKERHUB_USERNAME` and
 `DOCKERHUB_TOKEN` as repo secrets and prepend a login step before the
 gpu-test action:

@@ -8,8 +8,8 @@ from triton.testing import Benchmark, do_bench, perf_report
 
 import cutlass
 
-from quack.bench.bench_utils import run_and_print
-from quack.topk import topk, topk_bwd
+from DLKernel.bench.bench_utils import run_and_print
+from DLKernel.topk import topk, topk_bwd
 
 try:
     import rtopk
@@ -33,14 +33,14 @@ def _result(num_bytes: int, ms: float) -> dict:
 
 
 def _fwd_providers():
-    providers = [("quack", "quack"), ("torch", "torch.topk")]
+    providers = [("DLKernel", "DLKernel"), ("torch", "torch.topk")]
     if rtopk is not None:
         providers.append(("rtopk", "rtopk"))
     return providers
 
 
 def _bwd_providers():
-    return [("quack", "quack"), ("torch", "torch")]
+    return [("DLKernel", "DLKernel"), ("torch", "torch")]
 
 
 def make_fwd_benchmark(M: int, dtype_name: str, softmax: bool, x_vals=None) -> Benchmark:
@@ -80,7 +80,7 @@ def topk_fwd_runner(N, k, provider, M, dtype_name, softmax):
     elem_bytes = dtype.itemsize
     x = torch.randn(M, N, device="cuda", dtype=dtype)
 
-    if provider == "quack":
+    if provider == "DLKernel":
         fn = lambda: topk(x, k, softmax=softmax)
     elif provider == "torch":
         fn = lambda: torch.topk(x, k, dim=-1, largest=True, sorted=True)[0]
@@ -100,7 +100,7 @@ def topk_bwd_runner(N, k, provider, M, dtype_name, softmax):
     elem_bytes = dtype.itemsize
     x = torch.randn(M, N, device="cuda", dtype=dtype, requires_grad=True)
 
-    if provider == "quack":
+    if provider == "DLKernel":
         out, idx = topk(x, k, softmax=softmax)
         dvalues = torch.randn_like(out)
         fn = lambda: topk_bwd(dvalues, out, idx, N, softmax=softmax)

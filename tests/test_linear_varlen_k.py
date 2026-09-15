@@ -3,9 +3,9 @@ import math
 import pytest
 import torch
 
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm import gemm as quack_gemm
-from quack.gemm_interface import (
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm import gemm as dlkernel_gemm
+from DLKernel.gemm_interface import (
     gemm,
     gemm_ref,
     gemm_add,
@@ -70,7 +70,7 @@ def run_lowlevel_varlen_k_gemm(
         if dynamic_persistent and device_capacity == 9
         else None
     )
-    quack_gemm(
+    dlkernel_gemm(
         A,
         B,
         out,
@@ -110,7 +110,7 @@ def test_gemm_varlen_k_tma_gather_matches_cpasync(
         [torch.zeros(1, dtype=torch.int32), seq_lens.cumsum(0).to(torch.int32)]
     ).to(device)
     A, A_idx = generate_A_with_gather(m, total_k, device, input_dtype, gather_A=True)
-    # B for quack_gemm varlen_k: 2D (n, total_k), n-major (stride(-2)==1)
+    # B for dlkernel_gemm varlen_k: 2D (n, total_k), n-major (stride(-2)==1)
     B_ref = torch.randn((total_k, n), device=device, dtype=input_dtype) / math.sqrt(
         total_k / num_groups
     )

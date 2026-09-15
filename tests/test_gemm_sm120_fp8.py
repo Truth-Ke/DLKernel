@@ -15,12 +15,12 @@ import math
 import pytest
 import torch
 
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm import gemm
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm import gemm
 
-# QUACK_ARCH-aware, like test_gemm_transform: the fp8 warp-MMA path is
+# DLKERNEL_ARCH-aware, like test_gemm_transform: the fp8 warp-MMA path is
 # sm_89+ mma.sync, so it compiles and runs correctly on the H100 CI proxy
-# leg (QUACK_ARCH=120). The accumulator numbers in the docstring are RTX
+# leg (DLKERNEL_ARCH=120). The accumulator numbers in the docstring are RTX
 # 5090 measurements; H100's mma.sync fp8 accumulate is full fp32 RNE
 # (+1 onto 2^n survives through n=23, +3 rounds to +4 at ulp 2 — measured
 # with the same probe), so the drift bound holds with margin there.

@@ -1,16 +1,16 @@
-# Copyright (c) 2026, QuACK team.
-"""Blockscaled (MXFP8) AllGather+GEMM benchmark: quack staged-SFA transport vs
+# Copyright (c) 2026, DLKernel team.
+"""Blockscaled (MXFP8) AllGather+GEMM benchmark: DLKernel staged-SFA transport vs
 torch-native and async-TP baselines.
 
 Methods (all forward AG+GEMM, D = all_gather_M(A) @ B^T):
 
-    bf16_roof        dense bf16 quack GEMM on pre-gathered A (compute roof)
-    mx_roof          dense mxfp8 quack GEMM on pre-gathered A/SFA (compute roof;
+    bf16_roof        dense bf16 DLKernel GEMM on pre-gathered A (compute roof)
+    mx_roof          dense mxfp8 DLKernel GEMM on pre-gathered A/SFA (compute roof;
                      tile config picked by a small built-in sweep per shape)
-    quack_bf16_ag    AllGatherRunner + gated bf16 GEMM
-    quack_mx_staged  this work: BlockScaledAllGatherRunner — fp8 bytes AND
+    dlkernel_bf16_ag    AllGatherRunner + gated bf16 GEMM
+    dlkernel_mx_staged  this work: BlockScaledAllGatherRunner — fp8 bytes AND
                      blocked scale factors ride the CE push under one flag set
-    quack_mx_nccl    quack byte transport for A + exposed NCCL gather for the
+    dlkernel_mx_nccl    DLKernel byte transport for A + exposed NCCL gather for the
                      packed SFA (isolates the staged-SFA win)
     torch_bf16       dist.all_gather_into_tensor + torch.matmul
     torch_mx         dist.all_gather_into_tensor (bytes + packed SFA) +
@@ -57,10 +57,10 @@ from datetime import timedelta
 import torch
 import torch.distributed as dist
 
-from quack.blockscaled.operand import BlockScaledOperand
-from quack.blockscaled.quantize import pack_scale_2d_to_blocked_contig, to_mx
-from quack.distributed import AllGatherRunner, BlockScaledAllGatherRunner
-from quack.gemm import gemm as quack_gemm
+from DLKernel.blockscaled.operand import BlockScaledOperand
+from DLKernel.blockscaled.quantize import pack_scale_2d_to_blocked_contig, to_mx
+from DLKernel.distributed import AllGatherRunner, BlockScaledAllGatherRunner
+from DLKernel.gemm import gemm as dlkernel_gemm
 
 SF_VEC = 32
 ROUNDS, BURST = 10, 10
@@ -226,7 +226,7 @@ def run_shape(rank, ws, device, M, N, K):
 
     def mk_roof(cfg):
         def fn():
-            quack_gemm(a_q_full, b_q, d, None, None, *cfg, SFA=sfa_static, SFB=sfb, **MX)
+            dlkernel_gemm(a_q_full, b_q, d, None, None, *cfg, SFA=sfa_static, SFB=sfb, **MX)
 
         return fn
 
@@ -253,27 +253,27 @@ def run_shape(rank, ws, device, M, N, K):
     methods = {}
 
     def bf16_roof():
-        quack_gemm(a_hp_full, b_hp, d, None, None, 256, 256, 2, 1)
+        dlkernel_gemm(a_hp_full, b_hp, d, None, None, 256, 256, 2, 1)
 
     def mx_roof():
-        quack_gemm(a_q_full, b_q, d, None, None, *CFG, SFA=sfa_static, SFB=sfb, **MX)
+        dlkernel_gemm(a_q_full, b_q, d, None, None, *CFG, SFA=sfa_static, SFB=sfb, **MX)
 
-    def quack_bf16_ag():
+    def dlkernel_bf16_ag():
         with runner_bf16.gather(a_hp) as (a_full, ag_args):
-            quack_gemm(a_full, b_hp, d, None, None, 256, 256, 2, 1, ag_args=ag_args)
+            dlkernel_gemm(a_full, b_hp, d, None, None, 256, 256, 2, 1, ag_args=ag_args)
 
-    def quack_mx_staged():
+    def dlkernel_mx_staged():
         packed = pack_scale_2d_to_blocked_contig(a_sc.view(1, m, K // SF_VEC))
         op = BlockScaledOperand(a_q, packed, "mxfp8_e4m3")
         with runner_mx.gather(op) as (a_op, ag_args):
-            quack_gemm(
+            dlkernel_gemm(
                 a_op.qdata, b_q, d, None, None, *CFG,
                 SFA=a_op.scale, SFB=sfb, **MX, ag_args=ag_args,
             )
 
     sfa_nccl = torch.empty_like(sfa_static)
 
-    def quack_mx_nccl():
+    def dlkernel_mx_nccl():
         packed = pack_scale_2d_to_blocked_contig(a_sc.view(1, m, K // SF_VEC))
         dist.all_gather_into_tensor(
             sfa_nccl.view(torch.uint8).view(-1),
@@ -281,7 +281,7 @@ def run_shape(rank, ws, device, M, N, K):
             group=_PG,
         )
         with runner_mx.gather(a_q_u8) as (a_full, ag_args):
-            quack_gemm(
+            dlkernel_gemm(
                 a_full.view(torch.float8_e4m3fn), b_q, d, None, None, *CFG,
                 SFA=sfa_nccl, SFB=sfb, **MX, ag_args=ag_args,
             )
@@ -361,9 +361,9 @@ def run_shape(rank, ws, device, M, N, K):
 
     methods["bf16_roof"] = (bf16_roof, ref_bf16, bf16_tol)
     methods["mx_roof"] = (mx_roof, ref, mx_tol)
-    methods["quack_bf16_ag"] = (quack_bf16_ag, ref_bf16, bf16_tol)
-    methods["quack_mx_staged"] = (quack_mx_staged, ref, mx_tol)
-    methods["quack_mx_nccl"] = (quack_mx_nccl, ref, mx_tol)
+    methods["dlkernel_bf16_ag"] = (dlkernel_bf16_ag, ref_bf16, bf16_tol)
+    methods["dlkernel_mx_staged"] = (dlkernel_mx_staged, ref, mx_tol)
+    methods["dlkernel_mx_nccl"] = (dlkernel_mx_nccl, ref, mx_tol)
     methods["torch_bf16"] = (torch_bf16, ref_bf16, bf16_tol)
     methods["torch_mx"] = (torch_mx, ref, mx_tol)
     methods["asynctp_bf16"] = (asynctp_bf16, ref_bf16, bf16_tol)

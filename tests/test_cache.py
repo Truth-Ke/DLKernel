@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Tri Dao.
-"""Unit tests for ``quack.cache``.
+"""Unit tests for ``DLKernel.cache``.
 
 These are deliberately *small and synchronous*: they exercise the package's
 mutable-state plumbing without launching real CuTe kernels, so they catch
@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 
 
-# Note: ``quack.cache`` is intentionally re-imported inside each test below;
+# Note: ``DLKernel.cache`` is intentionally re-imported inside each test below;
 # the inside-function import makes the dependency explicit at the test
 # boundary.
 
@@ -23,45 +23,45 @@ import os
 
 
 def test_public_api_symbols_resolve():
-    """Every name advertised in ``quack.cache.__all__`` must actually exist
-    on the package and be importable as ``from quack.cache import X``.
+    """Every name advertised in ``DLKernel.cache.__all__`` must actually exist
+    on the package and be importable as ``from DLKernel.cache import X``.
 
     This is the regression test for the brittle import order in
     ``__init__.py``: if a maintainer reorders flag defs vs. submodule
     imports, the package will fail to initialize and this test fires.
     """
-    import quack.cache
+    import DLKernel.cache
 
-    for name in quack.cache.__all__:
-        assert hasattr(quack.cache, name), (
-            f"quack.cache advertises {name!r} in __all__ but it's missing"
+    for name in DLKernel.cache.__all__:
+        assert hasattr(DLKernel.cache, name), (
+            f"DLKernel.cache advertises {name!r} in __all__ but it's missing"
         )
 
 
 def test_static_config_flags_live_on_package_init():
-    """Static-config flags must be direct attributes of the ``quack.cache``
+    """Static-config flags must be direct attributes of the ``DLKernel.cache``
     package object so that callers can set them once (before importing
     submodules that read them).
 
     """
-    import quack.cache
+    import DLKernel.cache
 
     for name in ("CACHE_ENABLED", "CACHE_DIR", "EXTRA_SOURCE_DIRS"):
-        assert name in vars(quack.cache), (
-            f"static-config flag {name!r} should be a direct attribute of quack.cache, not a re-export"
+        assert name in vars(DLKernel.cache), (
+            f"static-config flag {name!r} should be a direct attribute of DLKernel.cache, not a re-export"
         )
 
 
 def test_jit_module_sees_live_flags():
-    """``quack.cache.jit`` reads flags via ``_state`` (the partially-imported
+    """``DLKernel.cache.jit`` reads flags via ``_state`` (the partially-imported
     package). A regression that breaks this would surface as the disk cache
     silently ignoring ``CACHE_ENABLED=0``.
     """
-    import quack.cache
-    import quack.cache.jit as jit_module
+    import DLKernel.cache
+    import DLKernel.cache.jit as jit_module
 
     # `_state` should be the package object itself.
-    assert jit_module._state is quack.cache
+    assert jit_module._state is DLKernel.cache
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ def test_jit_cache_lock_serializes_redundant_compiles(tmp_path):
     marker_dir.mkdir()
 
     # Inline child script. We monkey-patch ``cute.runtime.load_module`` before
-    # importing ``quack.cache`` so the load path returns a harmless stub
+    # importing ``DLKernel.cache`` so the load path returns a harmless stub
     # (the ``.o`` written by export is a placeholder, not a real CuTe object).
     # The actual thing under test is purely the lock + recheck logic in
     # ``jit_cache.wrapper``; no GPU or real CuTe involvement is needed.
@@ -114,7 +114,7 @@ def test_jit_cache_lock_serializes_redundant_compiles(tmp_path):
             import os, sys, time
             from pathlib import Path
 
-            # Stub cute.runtime.load_module BEFORE importing quack.cache so
+            # Stub cute.runtime.load_module BEFORE importing DLKernel.cache so
             # downstream readers (post-compile load path) don't choke on the
             # placeholder .o we'll write.
             import cutlass.cute as _cute
@@ -123,12 +123,12 @@ def test_jit_cache_lock_serializes_redundant_compiles(tmp_path):
                     return lambda *a, **k: None
             _cute.runtime.load_module = lambda path, enable_tvm_ffi=True: _StubMod()
 
-            import quack.cache
+            import DLKernel.cache
 
             MARKER_DIR = Path({str(marker_dir)!r})
             BARRIER = Path({str(barrier)!r})
 
-            @quack.cache.jit_cache
+            @DLKernel.cache.jit_cache
             def _compile_stub(key):
                 # Atomically record that THIS process ran the compile body.
                 # Filename includes pid + ns clock so concurrent writes never
@@ -167,8 +167,8 @@ def test_jit_cache_lock_serializes_redundant_compiles(tmp_path):
 
     env = {
         **os.environ,
-        "QUACK_CACHE_DIR": str(cache_dir),
-        "QUACK_CACHE_ENABLED": "1",
+        "DLKERNEL_CACHE_DIR": str(cache_dir),
+        "DLKERNEL_CACHE_ENABLED": "1",
     }
 
     N = 8
@@ -216,7 +216,7 @@ def test_parse_concat_layout_roundtrip():
     eager bodies and the fake registration. A regression that breaks one
     side without the other reintroduces the 7acaadd compile-key drift.
     """
-    from quack.gemm_interface import _parse_concat_layout
+    from DLKernel.gemm_interface import _parse_concat_layout
 
     assert _parse_concat_layout(None) is None
     assert _parse_concat_layout("") is None  # empty string → None
@@ -230,7 +230,7 @@ def test_parse_concat_layout_roundtrip():
 
 def test_merge_tensor_helper():
     """Shared ``Union[scalar, Tensor]`` schema-split merge."""
-    from quack.gemm_interface import _merge_tensor
+    from DLKernel.gemm_interface import _merge_tensor
 
     assert _merge_tensor(1.0, None) == 1.0
     assert _merge_tensor(1.0, "T") == "T"  # non-None tensor_value wins

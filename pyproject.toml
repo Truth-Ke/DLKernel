@@ -3,7 +3,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "quack-kernels"
+name = "DLKernel"
 dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = [
@@ -16,7 +16,6 @@ dependencies = [
 [project.optional-dependencies]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7"]
 heuristics = ["nvidia-matmul-heuristics"]
-jax = ["jax", "jax-tvm-ffi"]
 bench = ["pandas", "tyro"]
 dev = [
     "pre-commit",
@@ -27,10 +26,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["quack*"]
+include = ["DLKernel*"]
 
 [tool.setuptools.dynamic]
-version = {attr = "quack.__version__"}
+version = {attr = "DLKernel.__version__"}
 
 [[tool.uv.index]]
 name = "pytorch-cu132"
@@ -45,7 +44,7 @@ torch = [
 [tool.pytest.ini_options]
 # Disable pytest plugins we don't need. These add per-test hook dispatch and
 # session-end work that costs ~1-2s on a 2k-test file with no functional
-# benefit for quack's CI workflow:
+# benefit for DLKernel's CI workflow:
 #   - cacheprovider:        .pytest_cache/ lastfailed bookkeeping (writes to disk per session)
 #   - unraisableexception:  3x gc.collect() at session end to flush sys.unraisablehook (0.6s)
 #   - threadexception:      same idea for threading.excepthook (~tens of ms)

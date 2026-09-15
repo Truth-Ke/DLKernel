@@ -4,19 +4,16 @@ import os
 # This needs to be set before any PyTorch modules are imported
 os.environ["TORCH_COMPILE_DONATED_BUFFER"] = "0"
 
-import matplotlib.pyplot as plt
-import numpy as np
-
 import torch
 import torch.nn as nn
 import triton.testing
 
-from quack.rmsnorm import QuackRMSNorm
+from DLKernel.rmsnorm import DLKernelRMSNorm
 from tabulate import tabulate
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):  # Changed to 1e-6 to match QuackRMSNorm
+    def __init__(self, dim, eps=1e-6):  # Changed to 1e-6 to match DLKernelRMSNorm
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
@@ -171,7 +168,7 @@ def benchmark_rmsnorm_backward_cuda(
     # Make copies to avoid any potential memory sharing issues
     input_data_pytorch = input_data_shared.clone()
     input_data_torchcompile = input_data_shared.clone()
-    input_data_quack = input_data_shared.clone()
+    input_data_dlkernel = input_data_shared.clone()
 
     # Ensure all operations are completed before benchmarking
     torch.cuda.synchronize()
@@ -203,13 +200,13 @@ def benchmark_rmsnorm_backward_cuda(
     )
     results.append(result)
 
-    # Benchmark QuackRMSNorm
-    print("Benchmarking Quack RMSNorm...")
-    quack_rms_norm = QuackRMSNorm(dim=normalized_dim).cuda().to(dtype)
+    # Benchmark DLKernelRMSNorm
+    print("Benchmarking DLKernel RMSNorm...")
+    dlkernel_rms_norm = DLKernelRMSNorm(dim=normalized_dim).cuda().to(dtype)
     result = benchmark_backward_implementation(
-        "Quack RMSNorm",
-        quack_rms_norm,
-        input_data_quack,
+        "DLKernel RMSNorm",
+        dlkernel_rms_norm,
+        input_data_dlkernel,
         num_iterations,
         warmup_iterations,
     )
@@ -241,8 +238,8 @@ def display_results_table(all_results):
     print("=" * 80)
 
     # Collect speedup data for graphs
-    quack_vs_pytorch_speedups = []
-    quack_vs_torchcompile_speedups = []
+    dlkernel_vs_pytorch_speedups = []
+    dlkernel_vs_torchcompile_speedups = []
     config_labels = []
 
     for config in configs:
@@ -282,32 +279,34 @@ def display_results_table(all_results):
         print(f"\nBatch Size: {batch_size}, Sequence Length: {seq_len}, Hidden Size: {hidden_size}")
         print(tabulate(table_data, headers=headers, tablefmt="grid"))
 
-        # Calculate and print the speedup of Quack vs TorchCompile
+        # Calculate and print the speedup of DLKernel vs TorchCompile
         pytorch_time = next(
             r["avg_time_ms"] for r in results if r["implementation"] == "PyTorch RMSNorm"
         )
         torchcompile_time = next(
             r["avg_time_ms"] for r in results if r["implementation"] == "TorchCompile RMSNorm"
         )
-        quack_time = next(
-            r["avg_time_ms"] for r in results if r["implementation"] == "Quack RMSNorm"
+        dlkernel_time = next(
+            r["avg_time_ms"] for r in results if r["implementation"] == "DLKernel RMSNorm"
         )
 
-        quack_vs_pytorch = pytorch_time / quack_time if quack_time > 0 else float("inf")
-        quack_vs_torchcompile = torchcompile_time / quack_time if quack_time > 0 else float("inf")
+        dlkernel_vs_pytorch = pytorch_time / dlkernel_time if dlkernel_time > 0 else float("inf")
+        dlkernel_vs_torchcompile = (
+            torchcompile_time / dlkernel_time if dlkernel_time > 0 else float("inf")
+        )
 
-        print(f"Quack vs PyTorch Speedup: {quack_vs_pytorch:.2f}x")
-        print(f"Quack vs TorchCompile Speedup: {quack_vs_torchcompile:.2f}x")
+        print(f"DLKernel vs PyTorch Speedup: {dlkernel_vs_pytorch:.2f}x")
+        print(f"DLKernel vs TorchCompile Speedup: {dlkernel_vs_torchcompile:.2f}x")
 
         # Collect data for graphs
-        quack_vs_pytorch_speedups.append(quack_vs_pytorch)
-        quack_vs_torchcompile_speedups.append(quack_vs_torchcompile)
+        dlkernel_vs_pytorch_speedups.append(dlkernel_vs_pytorch)
+        dlkernel_vs_torchcompile_speedups.append(dlkernel_vs_torchcompile)
         config_labels.append(f"BS={batch_size}, Seq={seq_len}")
 
     # Collect memory usage data
     pytorch_mem = []
     torchcompile_mem = []
-    quack_mem = []
+    dlkernel_mem = []
 
     for config in configs:
         results = all_results[config]
@@ -316,63 +315,65 @@ def display_results_table(all_results):
                 pytorch_mem.append(result["peak_mem_mb"])
             elif result["implementation"] == "TorchCompile RMSNorm":
                 torchcompile_mem.append(result["peak_mem_mb"])
-            elif result["implementation"] == "Quack RMSNorm":
-                quack_mem.append(result["peak_mem_mb"])
+            elif result["implementation"] == "DLKernel RMSNorm":
+                dlkernel_mem.append(result["peak_mem_mb"])
 
     # Calculate average memory usage
     avg_pytorch_mem = sum(pytorch_mem) / len(pytorch_mem) if pytorch_mem else 0
     avg_torchcompile_mem = sum(torchcompile_mem) / len(torchcompile_mem) if torchcompile_mem else 0
-    avg_quack_mem = sum(quack_mem) / len(quack_mem) if quack_mem else 0
+    avg_dlkernel_mem = sum(dlkernel_mem) / len(dlkernel_mem) if dlkernel_mem else 0
 
     # Calculate memory savings percentages
     mem_savings_vs_pytorch = (
-        ((avg_pytorch_mem - avg_quack_mem) / avg_pytorch_mem * 100) if avg_pytorch_mem > 0 else 0
+        ((avg_pytorch_mem - avg_dlkernel_mem) / avg_pytorch_mem * 100) if avg_pytorch_mem > 0 else 0
     )
     mem_savings_vs_torchcompile = (
-        ((avg_torchcompile_mem - avg_quack_mem) / avg_torchcompile_mem * 100)
+        ((avg_torchcompile_mem - avg_dlkernel_mem) / avg_torchcompile_mem * 100)
         if avg_torchcompile_mem > 0
         else 0
     )
 
     # Calculate and print average and median speedups
-    avg_quack_vs_pytorch = sum(quack_vs_pytorch_speedups) / len(quack_vs_pytorch_speedups)
-    avg_quack_vs_torchcompile = sum(quack_vs_torchcompile_speedups) / len(
-        quack_vs_torchcompile_speedups
+    avg_dlkernel_vs_pytorch = sum(dlkernel_vs_pytorch_speedups) / len(dlkernel_vs_pytorch_speedups)
+    avg_dlkernel_vs_torchcompile = sum(dlkernel_vs_torchcompile_speedups) / len(
+        dlkernel_vs_torchcompile_speedups
     )
 
     # Calculate median speedups
-    median_quack_vs_pytorch = sorted(quack_vs_pytorch_speedups)[len(quack_vs_pytorch_speedups) // 2]
-    median_quack_vs_torchcompile = sorted(quack_vs_torchcompile_speedups)[
-        len(quack_vs_torchcompile_speedups) // 2
+    median_dlkernel_vs_pytorch = sorted(dlkernel_vs_pytorch_speedups)[
+        len(dlkernel_vs_pytorch_speedups) // 2
+    ]
+    median_dlkernel_vs_torchcompile = sorted(dlkernel_vs_torchcompile_speedups)[
+        len(dlkernel_vs_torchcompile_speedups) // 2
     ]
 
     # If there's an even number of samples, take the average of the two middle values
-    if len(quack_vs_pytorch_speedups) % 2 == 0:
-        middle = len(quack_vs_pytorch_speedups) // 2
-        median_quack_vs_pytorch = (
-            sorted(quack_vs_pytorch_speedups)[middle - 1]
-            + sorted(quack_vs_pytorch_speedups)[middle]
+    if len(dlkernel_vs_pytorch_speedups) % 2 == 0:
+        middle = len(dlkernel_vs_pytorch_speedups) // 2
+        median_dlkernel_vs_pytorch = (
+            sorted(dlkernel_vs_pytorch_speedups)[middle - 1]
+            + sorted(dlkernel_vs_pytorch_speedups)[middle]
         ) / 2
 
-    if len(quack_vs_torchcompile_speedups) % 2 == 0:
-        middle = len(quack_vs_torchcompile_speedups) // 2
-        median_quack_vs_torchcompile = (
-            sorted(quack_vs_torchcompile_speedups)[middle - 1]
-            + sorted(quack_vs_torchcompile_speedups)[middle]
+    if len(dlkernel_vs_torchcompile_speedups) % 2 == 0:
+        middle = len(dlkernel_vs_torchcompile_speedups) // 2
+        median_dlkernel_vs_torchcompile = (
+            sorted(dlkernel_vs_torchcompile_speedups)[middle - 1]
+            + sorted(dlkernel_vs_torchcompile_speedups)[middle]
         ) / 2
 
     print("\n" + "=" * 80)
     print("PERFORMANCE SUMMARY")
     print("-" * 80)
-    print(f"Average Quack vs PyTorch Speedup: {avg_quack_vs_pytorch:.2f}x across all sizes tested")
+    print(f"Average DLKernel vs PyTorch Speedup: {avg_dlkernel_vs_pytorch:.2f}x across all sizes tested")
     print(
-        f"Median Quack vs PyTorch Speedup: {median_quack_vs_pytorch:.2f}x across all sizes tested"
+        f"Median DLKernel vs PyTorch Speedup: {median_dlkernel_vs_pytorch:.2f}x across all sizes tested"
     )
     print(
-        f"Average Quack vs TorchCompile Speedup: {avg_quack_vs_torchcompile:.2f}x across all sizes tested"
+        f"Average DLKernel vs TorchCompile Speedup: {avg_dlkernel_vs_torchcompile:.2f}x across all sizes tested"
     )
     print(
-        f"Median Quack vs TorchCompile Speedup: {median_quack_vs_torchcompile:.2f}x across all sizes tested"
+        f"Median DLKernel vs TorchCompile Speedup: {median_dlkernel_vs_torchcompile:.2f}x across all sizes tested"
     )
 
     print("\n" + "-" * 80)
@@ -380,131 +381,10 @@ def display_results_table(all_results):
     print("-" * 80)
     print(f"Average PyTorch RMSNorm Memory: {avg_pytorch_mem:.2f} MB")
     print(f"Average TorchCompile RMSNorm Memory: {avg_torchcompile_mem:.2f} MB")
-    print(f"Average Quack RMSNorm Memory: {avg_quack_mem:.2f} MB")
+    print(f"Average DLKernel RMSNorm Memory: {avg_dlkernel_mem:.2f} MB")
     print(f"Memory Savings vs PyTorch: {mem_savings_vs_pytorch:.2f}%")
     print(f"Memory Savings vs TorchCompile: {mem_savings_vs_torchcompile:.2f}%")
     print("=" * 80)
-
-    # Generate and save graphs
-    generate_speedup_graphs(
-        quack_vs_pytorch_speedups, quack_vs_torchcompile_speedups, config_labels
-    )
-
-
-def generate_speedup_graphs(quack_vs_pytorch, quack_vs_torchcompile, config_labels):
-    """Generate and save speedup comparison graphs."""
-    # Create output directory if it doesn't exist
-    output_dir = os.path.dirname(os.path.abspath(__file__))
-    visual_output_dir = os.path.join(output_dir, "visual_outputs")
-    os.makedirs(visual_output_dir, exist_ok=True)
-
-    plt.figure(figsize=(14, 8))
-
-    # Create x positions for the bars
-    x = np.arange(len(config_labels))
-    width = 0.35
-
-    # Plot bars
-    plt.bar(x - width / 2, quack_vs_pytorch, width, label="Quack vs PyTorch")
-    plt.bar(x + width / 2, quack_vs_torchcompile, width, label="Quack vs TorchCompile")
-
-    # Add horizontal line at y=1 (no speedup/slowdown)
-    plt.axhline(y=1.0, color="r", linestyle="-", alpha=0.3)
-
-    # Add labels and title
-    plt.xlabel("Configuration (Batch Size, Sequence Length)")
-    plt.ylabel("Speedup Factor (higher is better)")
-    plt.title("RMSNorm Backward Pass Implementation Speedup Comparison")
-    plt.xticks(x, config_labels, rotation=45, ha="right")
-
-    # Determine appropriate y-axis tick intervals based on max value
-    max_speedup = max(max(quack_vs_pytorch), max(quack_vs_torchcompile))
-    y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
-
-    # Choose appropriate tick interval based on the maximum value
-    if y_max <= 5:
-        tick_interval = 0.5
-    elif y_max <= 10:
-        tick_interval = 1.0
-    elif y_max <= 20:
-        tick_interval = 2.0
-    else:
-        tick_interval = 5.0
-
-    plt.yticks(np.arange(0, y_max + tick_interval, tick_interval))
-    plt.grid(axis="y", linestyle="-", alpha=0.3)
-
-    plt.tight_layout()
-    plt.legend()
-
-    # Save the figure
-    output_path = os.path.join(visual_output_dir, "rmsnorm_backward_speedup_comparison.png")
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"\nSpeedup graph saved to: {output_path}")
-
-    # Quack vs PyTorch comparison
-    plt.figure(figsize=(14, 6))
-    plt.bar(x, quack_vs_pytorch, color="blue", alpha=0.7)
-    plt.axhline(y=1.0, color="r", linestyle="-", alpha=0.3)
-    plt.xlabel("Configuration (Batch Size, Sequence Length)")
-    plt.ylabel("Speedup Factor (higher is better)")
-    plt.title("Quack RMSNorm vs PyTorch RMSNorm Backward Pass Speedup")
-    plt.xticks(x, config_labels, rotation=45, ha="right")
-
-    # Determine appropriate y-axis tick intervals based on max value
-    max_speedup = max(quack_vs_pytorch)
-    y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
-
-    # Choose appropriate tick interval based on the maximum value
-    if y_max <= 5:
-        tick_interval = 0.5
-    elif y_max <= 10:
-        tick_interval = 1.0
-    elif y_max <= 20:
-        tick_interval = 2.0
-    else:
-        tick_interval = 5.0
-
-    plt.yticks(np.arange(0, y_max + tick_interval, tick_interval))
-    plt.grid(axis="y", linestyle="-", alpha=0.3)
-
-    plt.tight_layout()
-
-    output_path = os.path.join(visual_output_dir, "quack_vs_pytorch_backward_speedup.png")
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"Quack vs PyTorch graph saved to: {output_path}")
-
-    # Quack vs TorchCompile comparison
-    plt.figure(figsize=(14, 6))
-    plt.bar(x, quack_vs_torchcompile, color="green", alpha=0.7)
-    plt.axhline(y=1.0, color="r", linestyle="-", alpha=0.3)
-    plt.xlabel("Configuration (Batch Size, Sequence Length)")
-    plt.ylabel("Speedup Factor (higher is better)")
-    plt.title("Quack RMSNorm vs TorchCompile RMSNorm Backward Pass Speedup")
-    plt.xticks(x, config_labels, rotation=45, ha="right")
-
-    # Determine appropriate y-axis tick intervals based on max value
-    max_speedup = max(quack_vs_torchcompile)
-    y_max = max(2.0, np.ceil(max_speedup * 1.1))  # At least 2.0 or 10% above max
-
-    # Choose appropriate tick interval based on the maximum value
-    if y_max <= 5:
-        tick_interval = 0.5
-    elif y_max <= 10:
-        tick_interval = 1.0
-    elif y_max <= 20:
-        tick_interval = 2.0
-    else:
-        tick_interval = 5.0
-
-    plt.yticks(np.arange(0, y_max + tick_interval, tick_interval))
-    plt.grid(axis="y", linestyle="-", alpha=0.3)
-
-    plt.tight_layout()
-
-    output_path = os.path.join(visual_output_dir, "quack_vs_torchcompile_backward_speedup.png")
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    print(f"Quack vs TorchCompile graph saved to: {output_path}")
 
 
 if __name__ == "__main__":

@@ -289,7 +289,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from quack.compile_utils import make_fake_tensor as fake_tensor
+from DLKernel.compile_utils import make_fake_tensor as fake_tensor
 
 
 WARP_SIZE = 32

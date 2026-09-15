@@ -1,4 +1,4 @@
-"""Smoke tests for quack.complex.Complex64 through the tvm-ffi compile path."""
+"""Smoke tests for DLKernel.complex.Complex64 through the tvm-ffi compile path."""
 
 import math
 
@@ -12,13 +12,13 @@ import cutlass.cute as cute
 from cutlass import Float32, Float64, Int32, const_expr
 from cutlass._mlir.extras import types as T
 
-from quack.complex import (
+from DLKernel.complex import (
     Complex64,
     allocate_smem_complex,
     complex_storage,
     recast_to_complex64,
 )
-from quack.testing.trace import run_traced
+from DLKernel.testing.trace import run_traced
 
 
 class _ScaleByComplex:
@@ -491,7 +491,7 @@ def test_complex64_mlir_type_is_f64():
     """Tier 4.19 -- mlir_type query needs an MLIR context."""
 
     # run_traced, not `with ir.Context()`: raw contexts corrupt the process
-    # (see quack.testing.trace). The DSL context also has all dialects
+    # (see DLKernel.testing.trace). The DSL context also has all dialects
     # registered, so allow_unregistered_dialects is no longer needed.
     def check():
         assert Complex64.mlir_type == T.f64()

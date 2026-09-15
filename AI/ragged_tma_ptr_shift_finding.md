@@ -56,7 +56,7 @@ Concretely:
 - **TMA loads** (A, B, C): must use `ptr_shift=False` (2-extra-dim, max 3D input)
 - **TMA stores** (D): can use `ptr_shift=True` (1-extra-dim, max 4D input)
 
-This is what `quack/gemm_sm90.py` and `quack/gemm_sm100.py` currently implement.
+This is what `DLKernel/gemm_sm90.py` and `DLKernel/gemm_sm100.py` currently implement.
 
 ## Reproducer scripts
 

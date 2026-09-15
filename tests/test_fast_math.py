@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Tri Dao.
-"""Tests for quack.fast_math.FastDivmod (magic-number divmod).
+"""Tests for DLKernel.fast_math.FastDivmod (magic-number divmod).
 
 Contract under test: exact quotient/remainder for any non-negative Int32 dividend
 (n < 2^31) and any divisor 1 <= d < 2^31, with the divisor-1 magic-wrap sentinel.
@@ -16,7 +16,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack
 
-from quack.fast_math import FastDivmod
+from DLKernel.fast_math import FastDivmod
 
 LIM = 1 << 31
 N = 4096

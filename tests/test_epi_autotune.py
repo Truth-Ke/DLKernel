@@ -1,4 +1,4 @@
-"""Tests for the generic @gemm_epilogue mod autotuner (quack.gemm_runtime.autotune).
+"""Tests for the generic @gemm_epilogue mod autotuner (DLKernel.gemm_runtime.autotune).
 
 Small shapes, injected 2-3 config sweeps (monkeypatched _config_space) so the
 suite stays fast; the full-space sweep is exercised by the llama block harness.
@@ -9,11 +9,11 @@ import math
 import pytest
 import torch
 
-import quack.gemm_runtime.autotune as epi_autotune
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm_runtime.autotune import sink_arg_shapes, tuned_mod_gemm
-from quack.epilogue.library import rms_fused, rstd_swiglu_epi
-from quack.gemm_config import GemmConfig
+import DLKernel.gemm_runtime.autotune as epi_autotune
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm_runtime.autotune import sink_arg_shapes, tuned_mod_gemm
+from DLKernel.epilogue.library import rms_fused, rstd_swiglu_epi
+from DLKernel.gemm_config import GemmConfig
 
 
 def _cap():
@@ -33,7 +33,7 @@ def _cfg(tile_m, tile_n, cluster_m=1, pingpong=False):
 
 @pytest.fixture()
 def small_space(monkeypatch, tmp_path):
-    monkeypatch.setenv("QUACK_CACHE_DIR", str(tmp_path))  # hermetic disk cache
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))  # hermetic disk cache
     cfgs = [_cfg(128, 128), _cfg(128, 256), _cfg(128, 192, pingpong=_cap() in (9, 12))]
     monkeypatch.setattr(epi_autotune, "_config_space", lambda mod, device: cfgs)
     monkeypatch.setattr(epi_autotune, "_MOD_TUNERS", {})
@@ -115,7 +115,7 @@ def test_prune_rules(small_space):
         B=torch.empty((1024, 512), device="cuda", dtype=torch.bfloat16),
         b_kn=False,
     )
-    from quack.autotuner import AutotuneConfig
+    from DLKernel.autotuner import AutotuneConfig
 
     confs = [AutotuneConfig(config=c) for c in small_space + [_cfg(128, 208)]]
     surv = epi_autotune._prune_for_mod(rstd_swiglu_epi, None, confs, named)
@@ -132,7 +132,7 @@ def test_prune_rules(small_space):
 def test_mod_digest_in_disk_key(small_space):
     """The disk-cache directory hash includes the mod digest via key=; two
     mods with different fn bodies must not share tuning files."""
-    from quack.epilogue.library import rms_fused as m1, rstd_swiglu_epi as m2
+    from DLKernel.epilogue.library import rms_fused as m1, rstd_swiglu_epi as m2
 
     t1 = epi_autotune._get_tuner(m1, ("weight",), False, torch.device("cuda"))
     t2 = epi_autotune._get_tuner(m2, ("rstd",), False, torch.device("cuda"))
@@ -142,8 +142,8 @@ def test_mod_digest_in_disk_key(small_space):
 
 
 # Module-level (importable digest anchors) for the transform-aware sweep.
-from quack.epilogue.frontend import gemm_epilogue  # noqa: E402
-from quack.operand_transform import a_transform  # noqa: E402
+from DLKernel.epilogue.frontend import gemm_epilogue  # noqa: E402
+from DLKernel.operand_transform import a_transform  # noqa: E402
 
 
 @gemm_epilogue()
@@ -179,7 +179,7 @@ def test_tuned_w4_transform(small_space):
     crosses as B, and the winner matches the dequant reference."""
     if _cap() != 9:
         pytest.skip("W4 transforms are SM90-only")
-    from quack.operand_transform.formats import W4_FORMATS
+    from DLKernel.operand_transform.formats import W4_FORMATS
 
     device = "cuda"
     torch.random.manual_seed(43)

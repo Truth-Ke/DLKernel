@@ -1,11 +1,11 @@
 import cutlass
 
-from quack.epilogue.ops import ColVecReduce, EpiSmemBytes, RowVecLoad, TileLoad, TileStore
-from quack.testing.trace import run_traced
+from DLKernel.epilogue.ops import ColVecReduce, EpiSmemBytes, RowVecLoad, TileLoad, TileStore
+from DLKernel.testing.trace import run_traced
 
 # smem_bytes needs a live MLIR context for cute layout algebra. run_traced,
 # not `with ir.Context()`: raw contexts corrupt the process (see
-# quack.testing.trace).
+# DLKernel.testing.trace).
 
 
 class _ArgTensor:

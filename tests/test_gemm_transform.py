@@ -2,7 +2,7 @@
 """Gates for the RS mainloop (mma_is_rs=True) and the A-operand transform
 frontend riding it, on both register-sourced mainloops: SM90 RS (WGMMA) and
 SM120 (warp MMA — always register-sourced; run on an SM90 part via
-QUACK_ARCH=120, the kernel uses no SM120-exclusive instructions).
+DLKERNEL_ARCH=120, the kernel uses no SM120-exclusive instructions).
 
 RS gate (SM90 only): bitwise-identical to the SS mainloop — same WGMMA
 instruction, same k-tile order, same accumulation order; only the A operand
@@ -24,9 +24,9 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.cute.runtime import from_dlpack
 
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm120
-from quack.tile_scheduler import TileSchedulerOptions
+from DLKernel.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from DLKernel.gemm_default_epi import GemmDefaultSm90, GemmDefaultSm120
+from DLKernel.tile_scheduler import TileSchedulerOptions
 
 _ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
 pytestmark = pytest.mark.skipif(
@@ -40,7 +40,7 @@ _TORCH2CUTE = {torch.bfloat16: cutlass.BFloat16, torch.float16: cutlass.Float16}
 
 
 def _run_gemm(A, B, D, tile_mnk, cluster_mnk, pingpong, mma_is_rs, transform_a=None, aux=None):
-    from quack.operand_transform import TransformAOperand
+    from DLKernel.operand_transform import TransformAOperand
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     mA = from_dlpack(A, assumed_align=16)
@@ -172,7 +172,7 @@ def test_rs_identity_short_k():
 
 # ── @a_transform fn frontend (value family) ──────────────────────────────────
 
-from quack.operand_transform import a_transform  # noqa: E402
+from DLKernel.operand_transform import a_transform  # noqa: E402
 
 
 @a_transform(vec_size=2)
@@ -242,8 +242,8 @@ def test_a_transform_consts():
 
 
 def test_a_transform_semantic_keys():
-    assert _identity2_a.__quack_semantic_key__() != _identity8_a.__quack_semantic_key__()
-    assert _identity2_a.__quack_semantic_key__() != _halve_a.__quack_semantic_key__()
+    assert _identity2_a.__dlkernel_semantic_key__() != _identity8_a.__dlkernel_semantic_key__()
+    assert _identity2_a.__dlkernel_semantic_key__() != _halve_a.__dlkernel_semantic_key__()
 
     def make_scale(c):
         @a_transform(vec_size=2)
@@ -252,7 +252,7 @@ def test_a_transform_semantic_keys():
 
         return scale
 
-    assert make_scale(0.5).__quack_semantic_key__() != make_scale(0.25).__quack_semantic_key__(), (
+    assert make_scale(0.5).__dlkernel_semantic_key__() != make_scale(0.25).__dlkernel_semantic_key__(), (
         "closure constants must reach the semantic key"
     )
 
@@ -299,7 +299,7 @@ def _check_colvec_strip(
     mod=None,
     gran=None,
 ):
-    from quack.operand_transform.host import transform_a_operand
+    from DLKernel.operand_transform.host import transform_a_operand
 
     mod = mod if mod is not None else _colvec_ktile_scale_a
     A, B, strip, A_pre = _make_colvec_strip_case(m, n, k, tile_mnk[2], gran, a_major)
@@ -364,7 +364,7 @@ def _check_kvec_m64(
     """kvec_m64 gate (the LCE dw strip shape): one pow2 value per (m64 row
     block, k-element), bitwise vs host-prescaled SS. The strip is (M/64,
     rk*tile_K) k-contiguous, K padded to whole k-tiles."""
-    from quack.operand_transform.host import transform_a_operand
+    from DLKernel.operand_transform.host import transform_a_operand
 
     torch.manual_seed(5)
     if a_major == "k":
@@ -439,8 +439,8 @@ def test_a_transform_colvec_ktile_via_host_plan():
     crosses as the transform_a_operand bundle, the operand fake is derived
     from the mod + tile_M, and the launch is bitwise == the plain plan on
     prescaled A."""
-    from quack.gemm_runtime.host import build_gemm_epi_plan, run_gemm_epi_plan
-    from quack.operand_transform.host import transform_a_operand
+    from DLKernel.gemm_runtime.host import build_gemm_epi_plan, run_gemm_epi_plan
+    from DLKernel.operand_transform.host import transform_a_operand
 
     m, n, k = 384, 256, 512
     A, B, strip, A_pre = _make_colvec_strip_case(m, n, k, tile_k=64, seed=11)
@@ -490,7 +490,7 @@ def test_a_transform_args_validation():
         return x
 
     assert (
-        _colvec_ktile_scale_a.__quack_semantic_key__()[-1] != _no_args.__quack_semantic_key__()[-1]
+        _colvec_ktile_scale_a.__dlkernel_semantic_key__()[-1] != _no_args.__dlkernel_semantic_key__()[-1]
     )
 
 
@@ -499,7 +499,7 @@ def test_a_transform_via_host_plan():
     build_gemm_epi_plan(transform_a=<mod>) compiles/launches through the same
     machinery as every epilogue variant, bitwise == the plain plan on
     host-prescaled A (exact for the power-of-2 fn)."""
-    from quack.gemm_runtime.host import build_gemm_epi_plan, run_gemm_epi_plan
+    from DLKernel.gemm_runtime.host import build_gemm_epi_plan, run_gemm_epi_plan
 
     torch.manual_seed(7)
     m, n, k = 256, 256, 512
@@ -539,9 +539,9 @@ def test_a_transform_args_epi_mod_gemm():
     host-prescaled A. The eager __call__ surface takes the RAW operand
     tensors (transform_operands=) and builds the bundle itself from the
     resolved config; pre-built bundles there are rejected."""
-    from quack.gemm_config import GemmConfig
-    from quack.epilogue.frontend import gemm_epilogue
-    from quack.operand_transform.host import transform_a_operand
+    from DLKernel.gemm_config import GemmConfig
+    from DLKernel.epilogue.frontend import gemm_epilogue
+    from DLKernel.operand_transform.host import transform_a_operand
 
     @gemm_epilogue()
     def _vscale(acc, v):
@@ -592,12 +592,12 @@ def test_a_transform_args_epi_mod_gemm():
 
 
 def test_a_transform_torch_compile():
-    """transform_a under torch.compile rides the single quack::gemm_epi op:
+    """transform_a under torch.compile rides the single dlkernel::gemm_epi op:
     the handle crosses by semantic digest, runtime operand tensors ride the
     op's input list (ta__<name>), and the op body rebuilds the bundle —
     numerics match eager exactly (same kernels either way)."""
-    from quack.gemm_config import GemmConfig
-    from quack.epilogue.frontend import gemm_epilogue
+    from DLKernel.gemm_config import GemmConfig
+    from DLKernel.epilogue.frontend import gemm_epilogue
 
     @gemm_epilogue()
     def _vscale_c(acc, v):
@@ -646,9 +646,9 @@ def test_a_transform_dropout_torch_compile():
     """Dropout on A under torch.compile: the seed tensor rides the op input
     list like any runtime operand; the mask is a pure function of (m, k,
     seed, offset) so compiled == eager bitwise."""
-    from quack.gemm_config import GemmConfig
-    from quack.epilogue.library import identity_epi
-    from quack.operand_transform import dropout_a
+    from DLKernel.gemm_config import GemmConfig
+    from DLKernel.epilogue.library import identity_epi
+    from DLKernel.operand_transform import dropout_a
 
     torch.manual_seed(11)
     m, k = 256, 512
@@ -681,7 +681,7 @@ def test_a_transform_dropout_torch_compile():
 def test_a_transform_epi_mod_composition():
     """Value transforms compose with @gemm_epilogue fns through the eager
     mod(A, B, transform_a=...) surface (autotune bypassed; default config)."""
-    from quack.epilogue.frontend import gemm_epilogue
+    from DLKernel.epilogue.frontend import gemm_epilogue
 
     @gemm_epilogue()
     def _plus_bias(acc, bias):
@@ -706,9 +706,9 @@ def _dropout_via_identity(A, seed, offset, p, tile_mnk=(128, 128, 64), pingpong=
     (under split-k too: only the split containing k = j contributes). Runs
     through mod.gemm — the seed bundle exercises the full host path (fakes,
     plan keys, warm cache)."""
-    from quack.epilogue.frontend import gemm_epilogue
-    from quack.operand_transform import dropout_a
-    from quack.operand_transform.host import transform_a_operand
+    from DLKernel.epilogue.frontend import gemm_epilogue
+    from DLKernel.operand_transform import dropout_a
+    from DLKernel.operand_transform.host import transform_a_operand
 
     global _ident_epi
     if "_ident_epi" not in globals():
@@ -760,7 +760,7 @@ def test_dropout_semantics_and_determinism():
     assert not torch.equal(D1, D3) and not torch.equal(D1, D4)
     # the direct-compile layer (TransformAOperand straight into the kernel)
     # produces the identical mask
-    from quack.operand_transform import dropout_a
+    from DLKernel.operand_transform import dropout_a
 
     seed_t = torch.tensor([1234, 0], dtype=torch.int64, device="cuda")
     D_direct = torch.empty(m, k, dtype=torch.bfloat16, device="cuda")
@@ -803,9 +803,9 @@ def test_dropout_p_zero_and_scale_via_epi():
     assert torch.equal(D0, A), "p=0 must be a bitwise passthrough"
     # 1/(1-p) folded into the epilogue (the mainloop is mask-only); *2 is a
     # pow2 so the fused fp32 scale == scaling the masked bf16 result exactly
-    from quack.epilogue.frontend import gemm_epilogue
-    from quack.operand_transform import dropout_a
-    from quack.operand_transform.host import transform_a_operand
+    from DLKernel.epilogue.frontend import gemm_epilogue
+    from DLKernel.operand_transform import dropout_a
+    from DLKernel.operand_transform.host import transform_a_operand
 
     @gemm_epilogue()
     def _drop_scale_epi(acc):

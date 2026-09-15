@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
 from torch.profiler import profile, ProfilerActivity
-from quack.mlp import MLP
+from DLKernel.mlp import MLP
 
 device = "cuda"
 dtype = torch.bfloat16

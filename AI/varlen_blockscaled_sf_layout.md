@@ -1,6 +1,6 @@
 # Variable-length blockscaled SF layout (tile-aligned per-batch padding)
 
-How the quack SM100 blockscaled GEMM stores scale factors (SFA / SFB) when the
+How the DLKernel SM100 blockscaled GEMM stores scale factors (SFA / SFB) when the
 varying dimension (M for `varlen_m`, K for `varlen_k`) has per-expert lengths
 that are **not necessarily multiples of 128**. Without padding, SF tiles
 (which cover 128 source rows/cols) would straddle expert boundaries; with
@@ -221,32 +221,32 @@ a tile-unit offset integer.
 
 ## Implementation pointers
 
-- `quack/varlen_utils.py`
+- `DLKernel/varlen_utils.py`
   - `VarlenManager.offset_batch_SFA` — padded M or K offset via compound coord.
   - `VarlenManager.offset_batch_SFB` — padded K offset for `varlen_k`.
-- `quack/gemm_sm100.py` — layout setup distinguishes `varlen_m` (pad M from
+- `DLKernel/gemm_sm100.py` — layout setup distinguishes `varlen_m` (pad M from
   `mSFA.shape[1] * 128`) vs `varlen_k` (pad K from `mSFA.shape[2] * 128`).
-- `quack/blockscaled/utils.py`
+- `DLKernel/blockscaled/utils.py`
   - `create_blockscaled_varlen_m_operands(seqlens_m=...)`
   - `create_blockscaled_varlen_k_operands(seqlens_k=...)`
   - Both fill a source-unit torch buffer at offset
     `(c_b // 128 + b) * 128`, then pass through
     `pack_scale_2d_to_blocked_contig` to the `(1, rmn, rk, 32, 4, 4)` layout.
 - Public API (both `varlen_m` and `varlen_k`):
-  - `quack/gemm.py::gemm(..., cu_seqlens_m=..., SFA=..., SFB=...)` — SFA is the
+  - `DLKernel/gemm.py::gemm(..., cu_seqlens_m=..., SFA=..., SFB=...)` — SFA is the
     padded buffer viewed as `(1, total_padded_rm, rk, 32, 4, 4)`, SFB per-batch
     `(L, rn, rk, 32, 4, 4)`. In `_compile_gemm` the fake SFA gets its own batch
     sym (its batch dim is 1, not `l`).
-  - `quack/gemm.py::gemm(..., cu_seqlens_k=..., SFA=..., SFB=...)` — A is
+  - `DLKernel/gemm.py::gemm(..., cu_seqlens_k=..., SFA=..., SFB=...)` — A is
     `(m, total_k)` m-major, B `(n, total_k)` n-major; both SFA and SFB are
     K-padded `(1, rm/rn, total_padded_rk, 32, 4, 4)` buffers (both fake SF
     tensors get their own batch syms).
-  - `quack/gemm_tvm_ffi_utils.py::validate_blockscaled_sf(num_batches=..., varlen_k=...)` —
+  - `DLKernel/gemm_tvm_ffi_utils.py::validate_blockscaled_sf(num_batches=..., varlen_k=...)` —
     checks `SFA.shape[1] >= ceil(total_m/128) + (L-1)` (varlen_m) or
     `SF*.shape[2] >= ceil(total_k/128) + (L-1)` (varlen_k, both buffers).
-  - `quack/gemm_interface.py::gemm((A, SFA), (B, SFB), cu_seqlens_m=...)` and
+  - `DLKernel/gemm_interface.py::gemm((A, SFA), (B, SFB), cu_seqlens_m=...)` and
     `gemm((A, SFA), (B, SFB), cu_seqlens_k=...)` (B passed as `(total_k, n)`).
-- `quack/layout_utils.py`
+- `DLKernel/layout_utils.py`
   - `tile_atom_to_shape_SF_strided(shape, sf_vec_size, sf_strides)` — builds
     the CuTe layout using mSFA's own strides and shape, so the padded total
     (not the unpadded `mA.shape`) drives the outer rm/rk count.
@@ -255,7 +255,7 @@ a tile-unit offset integer.
 
 `tests/test_gemm_sm100_blockscaled.py`:
 - `test_blockscaled_varlen_m_public_api` — same setup through
-  `quack.gemm.gemm` (3 patterns × 2 B-majors × 3 formats); interface-level coverage in
+  `DLKernel.gemm.gemm` (3 patterns × 2 B-majors × 3 formats); interface-level coverage in
   `tests/test_gemm_blockscaled_interface.py::test_blockscaled_gemm_varlen_m`.
 - `test_blockscaled_varlen_m_nonaligned` — 4 seqlen patterns × 2 B-majors × 3 formats.
   Patterns include `[128, 128, 128]`, `[100, 200, 150]`, `[30, 300, 64, 200]`,
@@ -263,7 +263,7 @@ a tile-unit offset integer.
 - `test_blockscaled_mxfp8_varlen_k` — 6 patterns including non-128-aligned
   `[96, 160, 128]`, `[32, 256, 64, 128]` and non-32-aligned `[100, 220, 65]`,
   `[1, 33, 158, 192]` (partial last scale block per expert).
-- `test_blockscaled_varlen_k_public_api` — same through `quack.gemm.gemm`
+- `test_blockscaled_varlen_k_public_api` — same through `DLKernel.gemm.gemm`
   (3 patterns incl. non-32-aligned); interface-level coverage in
   `tests/test_gemm_blockscaled_interface.py::test_blockscaled_gemm_varlen_k`.
 

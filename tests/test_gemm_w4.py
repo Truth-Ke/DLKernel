@@ -13,11 +13,11 @@ registering itself.
 import pytest
 import torch
 
-from quack.blockscaled import nvfp4_utils as U
-from quack.operand_transform.formats import W4_FORMATS
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm_w4 import gemm_w4a16
-from quack.operand_transform import PackedInput, a_transform
+from DLKernel.blockscaled import nvfp4_utils as U
+from DLKernel.operand_transform.formats import W4_FORMATS
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm_w4 import gemm_w4a16
+from DLKernel.operand_transform import PackedInput, a_transform
 
 _ARCH = get_device_capacity(torch.device("cuda"))[0] if torch.cuda.is_available() else 0
 pytestmark = pytest.mark.skipif(
@@ -230,7 +230,7 @@ def test_gemm_sf_split_k(split_k):
 
 
 def _w4a8_setup(m, n, k, seed=13):
-    from quack.gemm_w4 import quantize_act_per_token_fp8
+    from DLKernel.gemm_w4 import quantize_act_per_token_fp8
 
     fmt = W4_FORMATS["int4sm"]
     torch.manual_seed(seed)
@@ -253,7 +253,7 @@ def test_gemm_w4a8_decode_exactness(k):
     bf16 rounding at D — same as the reference cast): pins the fp8-fragment
     blob order, the strip slots, and the per-k-tile promote (k sweeps the
     first/preload/steady/last mainloop tile structures)."""
-    from quack.gemm_w4 import gemm_w4a8
+    from DLKernel.gemm_w4 import gemm_w4a8
 
     fmt = W4_FORMATS["int4sm"]
     torch.manual_seed(14)
@@ -279,7 +279,7 @@ def test_gemm_w4a8_decode_exactness(k):
 )
 @sm90_only
 def test_gemm_w4a8_shapes(m, n, k):
-    from quack.gemm_w4 import gemm_w4a8
+    from DLKernel.gemm_w4 import gemm_w4a8
 
     af, sfa, blob, sf_blob, ref = _w4a8_setup(m, n, k)
     out = gemm_w4a8(af, blob, sf_blob, act_scale=sfa)
@@ -290,7 +290,7 @@ def test_gemm_w4a8_shapes(m, n, k):
 @pytest.mark.parametrize("tile_m,tile_n", [(64, 128), (128, 128), (128, 192)])
 @sm90_only
 def test_gemm_w4a8_configs(tile_m, tile_n):
-    from quack.gemm_w4 import gemm_w4a8
+    from DLKernel.gemm_w4 import gemm_w4a8
 
     af, sfa, blob, sf_blob, ref = _w4a8_setup(128, 1024, 2048, seed=15)
     out = gemm_w4a8(af, blob, sf_blob, act_scale=sfa, tile_m=tile_m, tile_n=tile_n, split_k=1)
@@ -301,7 +301,7 @@ def test_gemm_w4a8_configs(tile_m, tile_n):
 @pytest.mark.parametrize("split_k", [2, 4])
 @sm90_only
 def test_gemm_w4a8_split_k(split_k):
-    from quack.gemm_w4 import gemm_w4a8
+    from DLKernel.gemm_w4 import gemm_w4a8
 
     af, sfa, blob, sf_blob, ref = _w4a8_setup(8, 1024, 8192, seed=16)
     out = gemm_w4a8(af, blob, sf_blob, act_scale=sfa, tile_m=128, tile_n=16, split_k=split_k)
@@ -314,7 +314,7 @@ def test_gemm_w4a8_folded_decode_exactness(k):
     """Folded W4A8 (int4smf): the scaled-LUT decode's e4m3 rounding must
     match the reference exactly — one-hot acts pin the per-(row, tile) table
     build (cvt.rn.satfinite) against dequant_int4smf_reference bitwise."""
-    from quack.gemm_w4 import gemm_w4a8
+    from DLKernel.gemm_w4 import gemm_w4a8
 
     fmt = W4_FORMATS["int4smf"]
     torch.manual_seed(18)
@@ -348,7 +348,7 @@ def test_gemm_w4a8_folded_decode_exactness(k):
     ],
 )
 def test_gemm_w4a8_folded_shapes(m, n, k):
-    from quack.gemm_w4 import gemm_w4a8, quantize_act_per_token_fp8
+    from DLKernel.gemm_w4 import gemm_w4a8, quantize_act_per_token_fp8
 
     fmt = W4_FORMATS["int4smf"]
     torch.manual_seed(19)
@@ -368,7 +368,7 @@ def test_gemm_w4a8_folded_shapes(m, n, k):
 @sm90_only
 def test_gemm_w4a8_bf16_act_convenience():
     """bf16 acts quantize per-token internally; bitwise == the manual path."""
-    from quack.gemm_w4 import gemm_w4a8, quantize_act_per_token_fp8
+    from DLKernel.gemm_w4 import gemm_w4a8, quantize_act_per_token_fp8
 
     torch.manual_seed(17)
     m, n, k = 32, 512, 1024
@@ -456,7 +456,7 @@ def test_w4_epi_mod_composition():
     (mod(act, blob, transform_a=...)): everything is caller-oriented — out is
     (m, n_full); a per-out-channel vector infers as the kernel colvec, a
     per-token vector as the kernel rowvec (the swap_ab pin/inference flip)."""
-    from quack.epilogue.frontend import gemm_epilogue
+    from DLKernel.epilogue.frontend import gemm_epilogue
 
     @gemm_epilogue()
     def _bias_tscale(acc, bias, tscale):
@@ -488,14 +488,14 @@ def test_w4_epi_mod_composition():
 
 def test_w4_epi_mod_torch_compile():
     """Layout-owning transforms under torch.compile through the single
-    quack::gemm_epi op: the format crosses by digest (w4_transform handle —
+    dlkernel::gemm_epi op: the format crosses by digest (w4_transform handle —
     a bare string name has none and is rejected), the SF strip rides the op
     input list, and D's N comes from the blob rows (n_override) on the fake
     side. Compiled == eager bitwise."""
     import pytest
 
-    from quack.epilogue.frontend import gemm_epilogue
-    from quack.operand_transform import w4_transform
+    from DLKernel.epilogue.frontend import gemm_epilogue
+    from DLKernel.operand_transform import w4_transform
 
     @gemm_epilogue()
     def _bias_w4c(acc, bias):

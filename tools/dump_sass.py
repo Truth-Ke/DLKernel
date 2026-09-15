@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dump PTX and SASS of cute-dsl kernels from a script or Python module.
 
-Disables the QuACK persistent kernel cache, sets CUTE_DSL_KEEP=ptx,cubin, runs
+Disables the DLKernel persistent kernel cache, sets CUTE_DSL_KEEP=ptx,cubin, runs
 the target, then disassembles all generated .cubin files with nvdisasm.
 
 Usage::
@@ -64,7 +64,7 @@ def main():
     parser.add_argument(
         "--use-cache",
         action="store_true",
-        help="Allow QuACK to use its persistent .o cache instead of forcing recompilation",
+        help="Allow DLKernel to use its persistent .o cache instead of forcing recompilation",
     )
     args = parser.parse_args(our_argv)
     if args.module is not None:
@@ -88,14 +88,14 @@ def main():
 
     env = os.environ.copy()
     if not args.use_cache:
-        env["QUACK_CACHE_ENABLED"] = "0"
+        env["DLKERNEL_CACHE_ENABLED"] = "0"
     add_cute_keep_tokens(env, {"ptx", "cubin"})
     env["CUTE_DSL_DUMP_DIR"] = str(out_dir.resolve())
 
     print(f"Running: {' '.join(cmd)}")
     print(f"Dump dir: {out_dir.resolve()}\n")
     if not args.use_cache:
-        print("QuACK cache: disabled via QUACK_CACHE_ENABLED=0\n")
+        print("DLKernel cache: disabled via DLKERNEL_CACHE_ENABLED=0\n")
     subprocess.run(cmd, env=env)
 
     ptx_files = sorted(out_dir.glob("*.ptx"))

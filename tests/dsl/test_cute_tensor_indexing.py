@@ -6,9 +6,9 @@ import cutlass.cute as cute
 
 import cutlass.cute.tensor as cute_tensor
 
-from quack.dsl import cute_tensor_indexing
-from quack.dsl.cute_tensor_indexing import _canonicalize_cute_tensor_index
-from quack.testing.trace import run_traced
+from DLKernel.dsl import cute_tensor_indexing
+from DLKernel.dsl.cute_tensor_indexing import _canonicalize_cute_tensor_index
+from DLKernel.testing.trace import run_traced
 
 
 def test_canonicalize_colon_and_ellipsis() -> None:
@@ -45,7 +45,7 @@ def test_canonicalize_single_full_slice() -> None:
 
 def test_patched_getitem_reaches_real_cute_tensor() -> None:
     # run_traced, not `with ir.Context()`: raw contexts corrupt the process
-    # (see quack.testing.trace).
+    # (see DLKernel.testing.trace).
     def check() -> None:
         tensor = cute.make_identity_tensor((2, 3, 4))
         assert str(tensor[:, 1, 2]) == str(tensor[None, 1, 2])
@@ -73,7 +73,7 @@ def test_patched_setitem_forwards_canonicalized_index(monkeypatch) -> None:
     def spy(self, idx, data, *, loc=None, ip=None):
         captured.append((idx, data))
 
-    monkeypatch.setattr(cute_tensor._Tensor, "_quack_original_setitem", spy, raising=False)
+    monkeypatch.setattr(cute_tensor._Tensor, "_dlkernel_original_setitem", spy, raising=False)
     monkeypatch.setattr(cute_tensor._Tensor, "__setitem__", cute_tensor_indexing._make_setitem(spy))
 
     def check() -> None:

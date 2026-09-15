@@ -15,18 +15,18 @@ the quantization step.
 import pytest
 import torch
 
-from quack.gemm_interface import gemm
-from quack.blockscaled import BlockScaledFormat, BlockScaledOperand
-from quack.blockscaled.quantize import dequant_operand, unpack_scale_blocked_to_2d
-from quack.cute_dsl_utils import get_compile_target_capacity, get_device_capacity
+from DLKernel.gemm_interface import gemm
+from DLKernel.blockscaled import BlockScaledFormat, BlockScaledOperand
+from DLKernel.blockscaled.quantize import dequant_operand, unpack_scale_blocked_to_2d
+from DLKernel.cute_dsl_utils import get_compile_target_capacity, get_device_capacity
 
 
 if get_device_capacity()[0] not in (10, 11, 12):
     pytest.skip(reason="Quantized-output GEMM requires SM100/SM110/SM120", allow_module_level=True)
 
-# Dispatch arch (QUACK_ARCH) is not enough: the SFD epilogue's f32->e8m0 and
+# Dispatch arch (DLKERNEL_ARCH) is not enough: the SFD epilogue's f32->e8m0 and
 # f32->e2m1 cvts have no pre-SM100 encoding, so the H100 proxy legs
-# (QUACK_ARCH=120 compiled for sm_90a) fail in NVVM, not at dispatch.
+# (DLKERNEL_ARCH=120 compiled for sm_90a) fail in NVVM, not at dispatch.
 if get_compile_target_capacity()[0] < 10:
     pytest.skip(
         reason="Quantized-output cvts (f32->e8m0/e2m1) need an sm_100+/sm_120+ compile target",
@@ -448,7 +448,7 @@ def test_quant_out_transposed(fmt):
 def test_quant_out_16dp_row():
     """tile_m 64 (16dp256b tmem load): row SFD stays bit-exact; the layout-
     derived store width falls back to byte stores (thread slots interleave)."""
-    from quack.gemm import gemm as gemm_lowlevel
+    from DLKernel.gemm import gemm as gemm_lowlevel
 
     torch.manual_seed(0)
     m, n, k = 256, 256, 128
@@ -486,7 +486,7 @@ def test_quant_out_stochastic_rounding(fmt):
     seed-sensitive, within one full quantization bin of the reference, and
     unbiased (the seed-average converges to the reference, unlike RN whose
     error is parked at up to half a bin)."""
-    from quack.rounding import RoundingMode
+    from DLKernel.rounding import RoundingMode
 
     torch.manual_seed(0)
     m, n, k = 256, 256, 256
@@ -548,7 +548,7 @@ def test_quant_postact_gated(fmt):
     """gemm + swiglu + quantized postact: SF slots live in acc space (one
     vector of vec postact values = 2*vec acc columns of interleaved gate/up)."""
     skip_unsupported(fmt, aux=True)
-    from quack.epilogue.library import swiglu_quant_mod
+    from DLKernel.epilogue.library import swiglu_quant_mod
 
     torch.manual_seed(0)
     l, m, N, k = 1, 256, 1024, 256
@@ -589,7 +589,7 @@ def test_quant_postact_gated_exact():
     """reglu (relu(gate)*up) postact matches a torch fp32 reference bitwise,
     so the mxfp8 SF bytes and values must be exact."""
     skip_unsupported(aux=True)
-    from quack.epilogue.library import gated_quant_mod
+    from DLKernel.epilogue.library import gated_quant_mod
 
     torch.manual_seed(0)
     l, m, N, k = 1, 256, 512, 128
@@ -628,7 +628,7 @@ def test_quant_postact_gated_exact():
 def test_quant_postact_nvfp4_norm_const():
     """nvfp4 postact with the per-tensor second level folded via sfd_norm_const."""
     skip_unsupported("nvfp4", aux=True)
-    from quack.epilogue.library import swiglu_quant_mod
+    from DLKernel.epilogue.library import swiglu_quant_mod
 
     torch.manual_seed(0)
     l, m, N, k = 1, 256, 1024, 256

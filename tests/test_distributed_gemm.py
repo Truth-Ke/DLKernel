@@ -1,5 +1,5 @@
-# Copyright (c) 2026, QuACK team.
-"""Multi-rank correctness tests for AllGatherRunner (quack/distributed/).
+# Copyright (c) 2026, DLKernel team.
+"""Multi-rank correctness tests for AllGatherRunner (DLKernel/distributed/).
 
 Runs under torchrun (one rank per GPU); the pytest entry point spawns
 torchrun as a subprocess on the available GPUs.
@@ -20,19 +20,19 @@ NUM_ITERS = 6  # exercises epoch monotonicity + double-buffer reuse
 
 def _ag_gemm(runner, a_shard, b, d=None):
     """Plain AG+GEMM (D = A_full @ B^T) through the gather() context."""
-    from quack.gemm import gemm as quack_gemm
+    from DLKernel.gemm import gemm as dlkernel_gemm
 
     if d is None:
         d = torch.empty(runner.m_total, b.shape[0], dtype=runner.dtype, device=runner.device)
     with runner.gather(a_shard) as (a_full, ag_args):
-        quack_gemm(a_full, b, d, None, None, 128, 256, 2, 1, ag_args=ag_args)
+        dlkernel_gemm(a_full, b, d, None, None, 128, 256, 2, 1, ag_args=ag_args)
     return d
 
 
 def _run_rank():
     import torch.distributed as dist
 
-    from quack.distributed import AllGatherRunner
+    from DLKernel.distributed import AllGatherRunner
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -99,7 +99,7 @@ def _run_rank():
     # runner.gather() CONTEXT — proves any epilogue-mod GEMM overlaps by
     # calling it inline in the with-body with ONE ag_args kwarg (same route
     # serves rope etc.).
-    from quack.epilogue.library import linear_act_mod
+    from DLKernel.epilogue.library import linear_act_mod
 
     dtype, shard_m, n, k = torch.bfloat16, 1024, 2048, 4096
     torch.manual_seed(4321)

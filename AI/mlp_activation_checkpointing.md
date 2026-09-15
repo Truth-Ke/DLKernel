@@ -2,7 +2,7 @@
 
 ## Summary
 
-QuACK's `MLP` supports three modes for trading memory vs compute:
+DLKernel's `MLP` supports three modes for trading memory vs compute:
 
 | Mode | Forward GEMMs | Backward GEMMs | Total | Saved activations | How |
 |---|---|---|---|---|---|
@@ -92,10 +92,10 @@ def forward(self, x):
 `torch._functorch.config.activation_memory_budget` is a separate mechanism:
 - Requires `torch.compile` to trace the joint forward-backward graph
 - Uses a min-cut partitioner to auto-decide which ops to save vs recompute (budget 0.0–1.0)
-- Cannot see inside custom `autograd.Function` subclasses — QuACK's `LinearActFunc`,
+- Cannot see inside custom `autograd.Function` subclasses — DLKernel's `LinearActFunc`,
   `DActLinearFunc`, etc. are opaque to the compiler
 
-Since QuACK's MLP uses custom autograd Functions with hand-written `save_for_backward` /
+Since DLKernel's MLP uses custom autograd Functions with hand-written `save_for_backward` /
 `backward`, the `activation_memory_budget` knob has **no effect**. Use `recompute=True`
 instead.
 

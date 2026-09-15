@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quack.linear_cross_entropy import (
+from DLKernel.linear_cross_entropy import (
     chunked_linear_cross_entropy,
     linear_cross_entropy_func_ref,
     scaled_exp_lce_supported,
@@ -126,7 +126,7 @@ def test_scaled_exp_linear_cross_entropy_batched():
 
 def test_chunked_linear_cross_entropy_torch_compile_dispatch():
     """Under torch.compile the scaled-exp path records the single
-    quack::lce_scaled_exp_fwd custom op — the host chunk loop (mod.gemm plan
+    dlkernel::lce_scaled_exp_fwd custom op — the host chunk loop (mod.gemm plan
     machinery, jit-cache probes, Triton launches) never gets traced. Same
     kernels either way, so compiled grads match eager scaled-exp bitwise."""
     device = "cuda"

@@ -46,7 +46,7 @@ constraints anchor the rationale where noted.
   briefly behind a `DeprecationWarning`, then removed (D10). Ambiguous detection,
   no fp6, silently dropped NVFP4 per-tensor scales, and required a dtype->format
   inference site (section 1).
-- **torchao `MXTensor` dependency**: its 2-D lazily swizzled scales do not fit quack's
+- **torchao `MXTensor` dependency**: its 2-D lazily swizzled scales do not fit DLKernel's
   permanently-blocked scale atom or varlen padded buffers.
 - **Enum-based format**: recreates the switch-on-format duplication one level up; the
   descriptor dataclass makes new formats data, not code (D4).
@@ -65,7 +65,7 @@ constraints anchor the rationale where noted.
 
 ### Out of scope
 
-- **`nn.Module` / `quack/linear.py` integration and autograd.** The container is
+- **`nn.Module` / `DLKernel/linear.py` integration and autograd.** The container is
   non-differentiable by construction (D1). A kernel constraint shapes any future
   module layer: there is no mixed hp x quantized GEMM - both operands must carry
   scale factors.
@@ -78,7 +78,7 @@ constraints anchor the rationale where noted.
 - **NVFP4 outputs with a computed global amax** (needs a delayed or two-pass amax;
   section 7 requires an explicitly provided per-tensor scale instead).
 
-## 3. `BlockScaledFormat` and `BlockScaledOperand` (`quack/blockscaled/operand.py`)
+## 3. `BlockScaledFormat` and `BlockScaledOperand` (`DLKernel/blockscaled/operand.py`)
 
 ```python
 @dataclass(frozen=True)
@@ -183,7 +183,7 @@ sided-ness — are designed in section 9 and stress-tested in section 10; the
 hardenings they justify in this PR (`cutlass_dtype_name` Optional; explicit
 element-class + recipe gates in `mma_kind_for_pair`) are already in place.
 
-## 4. GEMM interface integration (`quack/gemm_interface.py`)
+## 4. GEMM interface integration (`DLKernel/gemm_interface.py`)
 
 - `_unpack_operand(X)` -> `_Operand(data, sf, fmt, pts, quant_dim)` NamedTuple; accepts
   `BlockScaledOperand | Tensor`. A tuple/list raises `TypeError` pointing at
@@ -195,7 +195,7 @@ element-class + recipe gates in `mma_kind_for_pair`) are already in place.
   unwrap site only applies `_sf_encode`; pts folding into alpha (D8).
 - Both operands must be blockscaled or neither: there is no mixed hp x quantized GEMM
   kernel, so one-sided scale factors are rejected.
-- Custom ops `quack::gemm_out`, `gemm_add_out`, `gemm_add_inplace`, `gemm_act_out`,
+- Custom ops `dlkernel::gemm_out`, `gemm_add_out`, `gemm_add_inplace`, `gemm_act_out`,
   `gemm_gated_out` carry `bs_format_a` / `bs_format_b` (`Optional[str]`; string args
   need no fake-side changes; fakes stay no-ops - D11: A and B formats are
   independent). Op bodies resolve both descriptors; `_sf_decode(SF, fmt)` is
@@ -209,7 +209,7 @@ element-class + recipe gates in `mma_kind_for_pair`) are already in place.
 
 ## 5. Kernel-path plumbing (`gemm.py`, `gemm_epilogue.py`, `gemm_tvm_ffi_utils.py`)
 
-- `quack.gemm.gemm` and `quack.gemm_act.gemm_act` take `bs_format_a`/`bs_format_b`,
+- `DLKernel.gemm.gemm` and `DLKernel.gemm_interface.gemm_act` take `bs_format_a`/`bs_format_b`,
   **both required** when SFA is passed - the kernel-level API carries formats
   explicitly, same as the custom ops.
 - `validate_blockscaled_sf(A, B, SFA, SFB, ..., fmt_a=, fmt_b=)`: per-operand vec
@@ -242,8 +242,8 @@ unpack. Both-fp4 runs the single denser `kind::mxf4nvf4` atom, parameterized by 
 format's scale config (vec 32 e8m0 = mxfp4 - PTX spells that instantiation
 `kind::mxf4` - vec 16 = nvfp4, mirroring CUTLASS C++'s `SM100_MMA_MXF4_SS<..., VS>`);
 nvfp4 pairs only with itself (the scale config is instruction-wide). Concretely,
-quack subclasses the DSL's `MmaMXF4NVF4Op` to un-pin its hardcoded vec 16 and
-always constructs it for both-fp4 (`quack/sm100_utils.py:
+The DLKernel SM100 kernel subclasses the DSL's `MmaMXF4NVF4Op` to un-pin its hardcoded vec 16 and
+always constructs it for both-fp4 (`DLKernel/sm100_utils.py:
 make_blockscaled_trivial_tiled_mma`) - safe because both DSL fp4 op classes build
 the identical MLIR atom type (no kind attribute; the backend derives the PTX
 spelling from the vec size).
@@ -271,7 +271,7 @@ operand - a packed sub-byte gmem operand in any pair other than both-packed-fp4:
   `a/b_mma_dtype` (instruction-descriptor format bits).
 - **mbarrier tx counts packed bytes** (elements x 4 or 6 bits - the gaps are
   not written), matching CUTLASS `sizeof_bits<ElementA> x cosize(SmemLayoutA)`.
-  quack's existing `size_in_bytes(a_dtype, a_smem_layout)` line does this
+  DLKernel's existing `size_in_bytes(a_dtype, a_smem_layout)` line does this
   automatically once the layout is byte-domain and `a_dtype` stays sub-byte.
 - **Constraints** (CUDA driver, cuTensorMapEncodeTiled): unpack operands are
   K-major with logical K % 128 (globalDim[0] rule; also = the 96B fp6 / 64B fp4
@@ -306,8 +306,8 @@ packed fp6 at the boundary.
 
 All other kernel `sf_*` plumbing is input-side; blockscaled D adds the output side.
 
-**Status: shipped for `gemm`** (`quack.epilogue.quantize_out.BlockScaleFactorStore`
-+ `quack::gemm_quant_out`; tests/test_gemm_quant_out.py). `out_dtype` takes a
+**Status: shipped for `gemm`** (`DLKernel.epilogue.quantize_out.BlockScaleFactorStore`
++ `dlkernel::gemm_quant_out`; tests/test_gemm_quant_out.py). `out_dtype` takes a
 format name, `out_quant_dim=-1|-2` is the direction knob (-2 is fp8-only: fp4
 packs along N, which no consumer contracting over M can use), and the call
 returns a `BlockScaledOperand`. gemm_add / act-mod postact quantization still
@@ -330,11 +330,11 @@ tile 128,128 pingpong dynamic-persistent, boost clocks): the SFD epilogue is
 FREE — mxfp8-in 8192³ runs 728 TF with mxfp8 out vs 726 TF with bf16 out (fp8
 D halves store traffic, offsetting the SF work). vs cuBLASLt's D-out-scale
 path (which is the CUTLASS C++ cutlass3x_sm120_bstensorop kernel with
-Sm120BlockScaleFactorRowStore, JIT-shipped): quack 1.02–1.07x faster across
+Sm120BlockScaleFactorRowStore, JIT-shipped): DLKernel 1.02–1.07x faster across
 mxfp8/nvfp4 at 4096³/8192³ (e.g. nvfp4 8192³: 1495 vs 1435 TF), with values
 AND SF bytes bit-identical to cuBLAS in every configuration. cublasLt has no
 mxfp4-out baseline (AlgoGetHeuristic NOT_SUPPORTED for fp4-D + e8m0 out-scale);
-quack runs it at the nvfp4 rate.
+DLKernel runs it at the nvfp4 rate.
 
 - API (D12): `out_dtype` accepts a `BlockScaledFormat` (or name) on
   `gemm`/`gemm_add`/`gemm_act`; the plain blockscaled output default stays bf16. A

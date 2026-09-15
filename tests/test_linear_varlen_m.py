@@ -3,9 +3,9 @@ import math
 import pytest
 import torch
 
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm import gemm as quack_gemm
-from quack.gemm_interface import (
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm import gemm as dlkernel_gemm
+from DLKernel.gemm_interface import (
     gemm,
     gemm_ref,
     gemm_add,
@@ -74,7 +74,7 @@ def run_lowlevel_varlen_m_gemm(
         if dynamic_persistent and device_capacity == 9
         else None
     )
-    quack_gemm(
+    dlkernel_gemm(
         A,
         B,
         out,

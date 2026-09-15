@@ -1,14 +1,14 @@
-# `quack.complex.Complex64` design notes
+# `DLKernel.complex.Complex64` design notes
 
 A native-feeling `complex64` element type for CuTe-DSL kernels, without
-patching the C++ MLIR bindings. Lives in `quack/complex.py`. Validated by
+patching the C++ MLIR bindings. Lives in `DLKernel/complex.py`. Validated by
 `tests/test_complex.py` (44 tests covering constructors, arithmetic matrix,
 methods, class invariants, helpers, the c_pointers boundary, special / edge
 values, auto-promotion, and a smem round-trip). FFT-correctness tests that
 exercise Complex64 through real kernels live in `tests/test_fft.py`.
 
 This file records *why* the design looks the way it does and what was tried
-and rejected. The production native C2C FFT path in `quack/fft.py` already
+and rejected. The production native C2C FFT path in `DLKernel/fft.py` already
 uses Complex64 for register values and IO -- see
 `AI/complex64_fft_migration_plan.md` for the cutover history and remaining
 work.
@@ -187,7 +187,7 @@ Through real kernels (`tests/test_fft.py`):
 
 1. **MLIR boundary loses dtype.** Any code path that constructs a JIT tensor
    from MLIR (smem alloc, recast, ptr-to-tensor) loses the Complex64 tag.
-   Use the wrappers in `quack/complex.py` or call `_retag_as_complex64(t)`
+   Use the wrappers in `DLKernel/complex.py` or call `_retag_as_complex64(t)`
    manually.
 2. **`isinstance(c, Float32) is True`.** Only one cutlass site checks this
    (`nvvm_wrappers.py:441`). Easy to grep for if behavior is suspicious.
@@ -213,7 +213,7 @@ Through real kernels (`tests/test_fft.py`):
    index is dynamic. For small N (8, 16, 32, 64) that's fine; for larger N
    use the LUT pattern via `_twiddle_from_lut_cx` (and friends:
    `_twiddle_cx`, `_twiddle_binary_cx`, `_twiddle_in_range_cx`) in
-   `quack/fft.py`. These wrap the existing tuple-returning helpers and
+   `DLKernel/fft.py`. These wrap the existing tuple-returning helpers and
    return a single `Complex64` value.
 
 ---
@@ -221,7 +221,7 @@ Through real kernels (`tests/test_fft.py`):
 ## File layout
 
 ```
-quack/complex.py
+DLKernel/complex.py
   class Complex64(Float32, width=64, mlir_type=T.f64)
     __init__(x, im=None)        # complex / Float32 / Numeric / ir.Value(f32|f64)
     _pack_ssa(re, im)           # static: two f32 SSAs -> packed f64 SSA
@@ -237,7 +237,7 @@ quack/complex.py
 
   _register_with_tvm_ffi()      # called at import time
 
-quack/fft.py                    # Complex64-native FFT path; *_cx primitives
+DLKernel/fft.py                    # Complex64-native FFT path; *_cx primitives
                                 # (_fft{2,4,8,16,32}_inplace_cx*, _mul_j_cx,
                                 # _apply_stage_twiddle_cx,
                                 # _mul_by_base_twiddle_powers_cx,

@@ -2,7 +2,7 @@ This file provides guidance to coding agents (Claude Code, Codex) when working w
 
 ## Project Overview
 
-QuACK (Quirky Assortment of CuTe Kernels) — high-performance CUDA kernels written in [CuTe-DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html), targeting H100 (SM90), B200/B300 (SM100), and GeForce RTX 50 (SM120) GPUs. Package name: `quack-kernels`.
+DLKernel — high-performance CUDA kernels written in [CuTe-DSL](https://github.com/NVIDIA/cutlass/tree/main/python/CuTeDSL), targeting H100 (SM90), B200/B300 (SM100), and GeForce RTX 50 (SM120) GPUs. Package name: `DLKernel`.
 
 ## Build & Development
 
@@ -15,8 +15,8 @@ pre-commit install
 pip install -e '.[dev,cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
 
 # Lint & format
-ruff check --fix quack/ tests/ benchmarks/
-ruff format quack/ tests/ benchmarks/
+ruff check --fix DLKernel/ tests/ benchmarks/
+ruff format DLKernel/ tests/ benchmarks/
 
 # Run all tests
 pytest tests/
@@ -56,14 +56,14 @@ Key rules:
 - `gemm.py` — public API, validates inputs, selects SM version, caches compiled kernels
 - `gemm_interface.py` — unified interface across SM versions
 - `gemm_sm90.py` / `gemm_sm100.py` — SM-specific implementations
-- `quack/epilogue/` — fused epilogues: `ops.py` (EpiOp vocabulary) → `mixin.py`
+- `DLKernel/epilogue/` — fused epilogues: `ops.py` (EpiOp vocabulary) → `mixin.py`
   (ComposableEpiMixin) → `frontend.py`/`visit.py` (`@gemm_epilogue` fn authoring +
   minted kernel classes) → `library.py` + domain modules (rotary, scaled_exp, ...).
   Hand-written mixins (`gemm_default_epi.py`, `gemm_drmsnorm_bwd.py`) are the escape hatch.
-- `quack/gemm_runtime/` — generic host plumbing shared by every epilogue/transform:
+- `DLKernel/gemm_runtime/` — generic host plumbing shared by every epilogue/transform:
   `identity.py` (digests, refs, registries — a leaf) → `host.py` (plan/compile/launch) →
-  `torch_op.py` (the single `quack::gemm_epi` custom op) + `autotune.py`
-- `quack/operand_transform/` — A-operand transforms (dequant, dropout, value fns):
+  `torch_op.py` (the single `dlkernel::gemm_epi` custom op) + `autotune.py`
+- `DLKernel/operand_transform/` — A-operand transforms (dequant, dropout, value fns):
   `transform.py`/`kinds.py` (kernel-side) → `frontend.py` (`@a_transform`, handles) →
   `host.py` (bundles, W4 config rules) + `formats/` (packed-weight decode formats)
 - `gemm_config.py` — `GemmConfig` dataclass with tile sizes, cluster dims, swizzle settings
@@ -138,5 +138,5 @@ CuTe-DSL:
   registers; make both select arms consume the loaded value.
 - Never `partition_D` a tile smaller than the epilogue tiler (warp
   corruption); derive extents from the copy atom.
-- `QUACK_CACHE_ENABLED=0` for const_expr ablations — the jit cache ignores
+- `DLKERNEL_CACHE_ENABLED=0` for const_expr ablations — the jit cache ignores
   env flags, and identical timings across an ablation mean a stale cubin.

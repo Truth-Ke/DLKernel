@@ -2,7 +2,7 @@
 """Minimal example: intra-kernel IKET trace hooks in CuTe-DSL.
 
 Run with IKET:
-    python -m iket.cli.main --output-dir /tmp/quack_iket --clobber \
+    python -m iket.cli.main --output-dir /tmp/dlkernel_iket --clobber \
         profile --postprocess all -- \
         env PYTHONPATH=. python examples/example_iket_trace.py
 """

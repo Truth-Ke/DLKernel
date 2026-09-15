@@ -14,18 +14,18 @@ inputs:
       wins instead.
     required: true
   image_cu129:
-    description: Docker image for the cu129 variant (e.g. tridao/quack-kernels:cu12.9-DATE)
+    description: Docker image for the cu129 variant (e.g. <owner>/dl-kernels:cu12.9-DATE)
     required: true
   image_cu132:
-    description: Docker image for the cu132 variant (e.g. tridao/quack-kernels:cu13.2-DATE)
+    description: Docker image for the cu132 variant (e.g. <owner>/dl-kernels:cu13.2-DATE)
     required: true
   arch:
     description: >-
-      Optional QUACK_ARCH override (e.g. "120"). When set, quack dispatches to
+      Optional DLKERNEL_ARCH override (e.g. "120"). When set, DLKernel dispatches to
       that arch's kernel implementations while still compiling/running on the
-      host GPU. QUACK_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR, and TRITON_CACHE_DIR
+      host GPU. DLKERNEL_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR, and TRITON_CACHE_DIR
       are all suffixed with both the cuda variant and the arch (e.g.
-      .quack_cache_cu132_sm120), so different (cuda, arch) pairs don't share
+      .dlkernel_cache_cu132_sm120), so different (cuda, arch) pairs don't share
       a cache directory on the same self-hosted runner. See the in-line
       comment near the cache exports for why TORCHINDUCTOR_/TRITON_ isolation
       matters (cross-toolchain cubin collisions → cuModuleLoad SEGV).
@@ -52,6 +52,22 @@ runs:
         IMAGE_CU129: ${{ inputs.image_cu129 }}
         IMAGE_CU132: ${{ inputs.image_cu132 }}
       run: |
+        # IMAGE_* come from the DLKERNEL_IMAGE_REPO repository variable; an unset
+        # variable degrades to a bare ":tag" image ref, which docker/apptainer
+        # reject with a confusing error.
+        for img in "$IMAGE_CU129" "$IMAGE_CU132"; do
+          case "$img" in
+            :*|"") echo "::error::set the DLKERNEL_IMAGE_REPO repository variable (see .github/workflows/_test.yml)"; exit 2 ;;
+          esac
+          case "$img" in
+            *[A-Z]*) echo "::error::DLKERNEL_IMAGE_REPO must be lowercase (docker rejects uppercase namespaces): '$img'"; exit 2 ;;
+          esac
+          case "${img%%:*}" in
+            */*) : ;;
+            *) echo "::error::DLKERNEL_IMAGE_REPO must be a '<namespace>/dl-kernels' repo, e.g. 'myuser/dl-kernels' (got '$img')"; exit 2 ;;
+          esac
+        done
+
         WORK_DIR="${CI_WORK_DIR:-$HOME}"
         mkdir -p "$WORK_DIR/apptainer_cache" /tmp/apptainer_tmp
 
@@ -77,16 +93,19 @@ runs:
           echo "Using cached SIF: $ACTIVE_SIF"
         fi
 
-        # Cleanup: delete *only* old quack-kernels SIFs left from previous image
-        # bumps. Match a strict prefix so unrelated SIFs sharing $WORK_DIR (when
-        # CI_WORK_DIR is unset and $WORK_DIR == $HOME, the runner user's personal
-        # SIFs) are never touched.
-        find "$WORK_DIR" -maxdepth 1 -name "*quack-kernels*.sif" \
+        # Cleanup: delete *only* old dl-kernels SIFs left from previous image
+        # bumps. The pattern matches the slug this action/build.sh produce
+        # ("<namespace>-dl-kernels-<tag>-<date>.sif") so unrelated SIFs sharing
+        # $WORK_DIR (when CI_WORK_DIR is unset and $WORK_DIR == $HOME, the runner
+        # user's personal SIFs, e.g. "~/dl-kernels.sif") are never touched.
+        # The legacy pattern covers SIFs pulled before the project rename; drop
+        # it once every runner has been through a CI run.
+        find "$WORK_DIR" -maxdepth 1 \( -name "*-dl-kernels-*.sif" -o -name "*quack-kernels*.sif" \) \
           ! -name "$(basename "$SIF_CU129")" \
           ! -name "$(basename "$SIF_CU132")" \
           -delete
 
-        echo "QUACK_SIF=$ACTIVE_SIF" >> "$GITHUB_ENV"
+        echo "DLKERNEL_SIF=$ACTIVE_SIF" >> "$GITHUB_ENV"
 
     - name: Compile and run tests
       shell: bash
@@ -152,8 +171,8 @@ runs:
           --env PYTHONNOUSERSITE=1 \
           --env FREE_GPUS="$FREE_GPUS" \
           --env NUM_GPUS="$NUM_GPUS" \
-          $EXTRA_APPTAINER_ENV "$QUACK_SIF" bash -c "
-          # Editable-install over the container's baked-in quack so any code
+          $EXTRA_APPTAINER_ENV "$DLKERNEL_SIF" bash -c "
+          # Editable-install over the container's baked-in DLKernel so any code
           # that reads install metadata (importlib.metadata.version, etc.) sees
           # the PR's version, not the image's snapshot.
           pip install --break-system-packages --no-deps -q -e . &&
@@ -170,26 +189,26 @@ runs:
           # collisions cannot happen; cache-warmup speedups within a leg are
           # preserved.
           if [ -n '$ARCH' ]; then
-            export QUACK_ARCH='$ARCH' &&
-            export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA}_sm$ARCH &&
+            export DLKERNEL_ARCH='$ARCH' &&
+            export DLKERNEL_CACHE_DIR=\$HOME/.dlkernel_cache_${CUDA}_sm$ARCH &&
             export TORCHINDUCTOR_CACHE_DIR=\$HOME/.torchinductor_cache_${CUDA}_sm$ARCH &&
             export TRITON_CACHE_DIR=\$HOME/.triton_cache_${CUDA}_sm$ARCH &&
-            echo \"Using QUACK_ARCH=\$QUACK_ARCH, QUACK_CACHE_DIR=\$QUACK_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR=\$TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR=\$TRITON_CACHE_DIR\"
+            echo \"Using DLKERNEL_ARCH=\$DLKERNEL_ARCH, DLKERNEL_CACHE_DIR=\$DLKERNEL_CACHE_DIR, TORCHINDUCTOR_CACHE_DIR=\$TORCHINDUCTOR_CACHE_DIR, TRITON_CACHE_DIR=\$TRITON_CACHE_DIR\"
           else
-            export QUACK_CACHE_DIR=\$HOME/.quack_cache_${CUDA} &&
+            export DLKERNEL_CACHE_DIR=\$HOME/.dlkernel_cache_${CUDA} &&
             export TORCHINDUCTOR_CACHE_DIR=\$HOME/.torchinductor_cache_${CUDA} &&
             export TRITON_CACHE_DIR=\$HOME/.triton_cache_${CUDA}
           fi &&
-          mkdir -p \$QUACK_CACHE_DIR \$TORCHINDUCTOR_CACHE_DIR \$TRITON_CACHE_DIR &&
-          # Keep the persistent QuACK .o cache bounded on self-hosted
+          mkdir -p \$DLKERNEL_CACHE_DIR \$TORCHINDUCTOR_CACHE_DIR \$TRITON_CACHE_DIR &&
+          # Keep the persistent DLKernel .o cache bounded on self-hosted
           # runners. Cache entries live under source-fingerprint directories;
           # once a fingerprint is older than a week it is unlikely to be reused
           # by active PRs, and stale .o.tmp.* files are interrupted exports.
           (
             if command -v flock >/dev/null 2>&1; then flock 9 || exit 0; fi
-            find \"\$QUACK_CACHE_DIR\" -mindepth 1 -maxdepth 1 -type d -mtime +7 -prune -exec rm -rf {} + || true
-            find \"\$QUACK_CACHE_DIR\" -type f -name '*.tmp.*' -mtime +1 -delete || true
-          ) 9>\"\$QUACK_CACHE_DIR/.prune.lock\" &&
+            find \"\$DLKERNEL_CACHE_DIR\" -mindepth 1 -maxdepth 1 -type d -mtime +7 -prune -exec rm -rf {} + || true
+            find \"\$DLKERNEL_CACHE_DIR\" -type f -name '*.tmp.*' -mtime +1 -delete || true
+          ) 9>\"\$DLKERNEL_CACHE_DIR/.prune.lock\" &&
           # --max-worker-restart N spawns a replacement worker after a worker
           # death so the rest of the suite still runs. The test that was in
           # flight when the worker died is reported as a failure (no retry, so

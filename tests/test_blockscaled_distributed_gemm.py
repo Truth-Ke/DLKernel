@@ -1,6 +1,6 @@
-# Copyright (c) 2026, QuACK team.
+# Copyright (c) 2026, DLKernel team.
 """Multi-rank correctness tests for BlockScaledAllGatherRunner
-(quack/distributed/all_gather_gemm.py).
+(DLKernel/distributed/all_gather_gemm.py).
 
 Runs under torchrun (one rank per GPU); the pytest entry point spawns
 torchrun as a subprocess on the available GPUs.
@@ -28,14 +28,14 @@ FMTS = ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4"]
 def _run_rank():
     import torch.distributed as dist
 
-    from quack.blockscaled.operand import BlockScaledOperand
-    from quack.blockscaled.quantize import (
+    from DLKernel.blockscaled.operand import BlockScaledOperand
+    from DLKernel.blockscaled.quantize import (
         pack_scale_2d_to_blocked_contig,
         to_mx,
         to_mxfp4,
     )
-    from quack.distributed import BlockScaledAllGatherRunner
-    from quack.gemm import gemm as quack_gemm
+    from DLKernel.distributed import BlockScaledAllGatherRunner
+    from DLKernel.gemm import gemm as dlkernel_gemm
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -85,7 +85,7 @@ def _run_rank():
 
     def gated(runner, fmt_a, fmt_b, shard_op, b_q, sfb, d):
         with runner.gather(shard_op) as (a_op, ag_args):
-            quack_gemm(
+            dlkernel_gemm(
                 a_op.qdata,
                 b_q,
                 d,
@@ -123,7 +123,7 @@ def _run_rank():
                 a_q, a_sc = quantize(fmt_a, a_hp)
                 a_q_full, sfa_full = nccl_gathered(fmt_a, a_q, a_sc, m_total, k)
                 d_ref = torch.empty(m_total, n, dtype=torch.bfloat16, device=device)
-                quack_gemm(
+                dlkernel_gemm(
                     a_q_full,
                     b_q,
                     d_ref,
@@ -172,7 +172,7 @@ def _run_rank():
     a_q, a_sc = quantize(fmt, a_hp)
     a_q_full, sfa_full = nccl_gathered(fmt, a_q, a_sc, m_total, k)
     d_ref = torch.empty(m_total, n, dtype=torch.bfloat16, device=device)
-    quack_gemm(
+    dlkernel_gemm(
         a_q_full,
         b_q,
         d_ref,
@@ -199,7 +199,7 @@ def _run_rank():
     # byte-only gather (SFA supplied statically here).
     d = torch.empty_like(d_ref)
     with ag.gather(a_q.view(torch.uint8).contiguous()) as (a_full_u8, ag_args):
-        quack_gemm(
+        dlkernel_gemm(
             a_full_u8.view(a_dtypes[fmt]),
             b_q,
             d,
@@ -256,7 +256,7 @@ def _run_rank():
         torch.cuda.synchronize(device)
         dist.barrier()
         a_q_full, sfa_full = nccl_gathered(fmt, a_q_it, a_sc_it, m_total, k)
-        quack_gemm(
+        dlkernel_gemm(
             a_q_full,
             b_q,
             d_ref,

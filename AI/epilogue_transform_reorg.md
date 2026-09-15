@@ -1,11 +1,11 @@
 # Epilogue / operand-transform reorg
 
 2026-07-29. Design for reorganizing the GEMM epilogue and operand-transform (A)
-stacks so each concern lives in exactly one module, `quack/epilogue/` and
-`quack/operand_transform/` expose "just the right API", and the shared host
+stacks so each concern lives in exactly one module, `DLKernel/epilogue/` and
+`DLKernel/operand_transform/` expose "just the right API", and the shared host
 plumbing (plan/compile, torch op, autotune, identity) becomes a package of its
-own. Companion to the epi_ops fn-frontend design (see `quack/gemm_epilogue.py`
-module docstring) — the *concepts* are unchanged; this is about placement,
+own. Companion to the epi_ops fn-frontend design (see the
+`DLKernel/epilogue/frontend.py` module docstring) — the *concepts* are unchanged; this is about placement,
 duplication, and import direction.
 
 ## Diagnosis (what the accidents of history are)
@@ -64,7 +64,7 @@ What is already right and must be preserved:
   the `EpiOp` colocation of device lifecycle + value port + host schema +
   cache identity on one class. The colocation is not the bug; the placement of
   the shared helpers it needs is.
-* The single `quack::gemm_epi` custom op with digest resolution.
+* The single `dlkernel::gemm_epi` custom op with digest resolution.
 * The fail-closed semantic fingerprint and `GemmClassRef` minting design.
 * The warm-path caches (`_call_cache`, `_plan_cache`): host launch overhead is
   a measured product constraint (~3.5us floor); no reorg may add work there.
@@ -93,7 +93,7 @@ Two rules decide every placement question:
 
 ## Target layout
 
-    quack/epilogue/                    # absorbs epilogues.py (kills the name-twin)
+    DLKernel/epilogue/                    # absorbs epilogues.py (kills the name-twin)
         __init__.py                    # PEP-562 lazy public API
         ops.py                         # <- epi_ops.py (+ absorbs epi_utils.py)
         mixin.py                       # <- epi_composable.py
@@ -103,7 +103,7 @@ Two rules decide every placement question:
         library.py                     # <- epilogues.py (mods + _gen_epi_fn factories)
         rotary.py, scaled_exp.py, head_rmsnorm.py   # domain content, unchanged pattern
 
-    quack/operand_transform/
+    DLKernel/operand_transform/
         __init__.py                    # PEP-562 lazy, as today
         transform.py                   # <- transform_a.py (device side)
         kinds.py                       # NEW: one class per runtime-operand kind, owning
@@ -118,40 +118,43 @@ Two rules decide every placement question:
             qtip.py
         rng.py
 
-    quack/gemm_runtime/                # the generic epilogue-GEMM runtime
+    DLKernel/gemm_runtime/                # the generic epilogue-GEMM runtime
         __init__.py
         identity.py                    # LEAF, zero kernel imports: semantic fingerprinter
                                        #   (public names), module_locator(), LocalModRegistry,
                                        #   payload install, TORCH_OP_* digest registries
         host.py                        # <- gemm_host.py, flavour-blind after the handle protocol
-        torch_op.py                    # <- epi_torch_op.py (quack::gemm_epi, compile_call)
+        torch_op.py                    # <- epi_torch_op.py (dlkernel::gemm_epi, compile_call)
         autotune.py                    # <- epi_autotune.py
 
 `gemm_tvm_ffi_utils.py` stays at top level: it serves the whole GEMM family
-including `quack/gemm.py` (out of scope). `blockscaled/` keeps what it is
+including `DLKernel/gemm.py` (out of scope). `blockscaled/` keeps what it is
 actually about (`operand.py`, `quantize.py`, `nvfp4_utils.py`, `utils.py`).
 `gemm_w4.py` stays as thin sugar with updated imports.
 
 ### Old -> new mapping
 
-| old | new |
-|---|---|
-| `quack/epi_ops.py` | `quack/epilogue/ops.py` |
-| `quack/epi_utils.py` | folded into `epilogue/ops.py`; dead `assume_broadcast_strides` deleted |
-| `quack/epi_composable.py` | `quack/epilogue/mixin.py` |
-| `quack/gemm_epilogue.py` | split: `epilogue/frontend.py` + `epilogue/visit.py` + `epilogue/math.py`; fingerprinter -> `gemm_runtime/identity.py` |
-| `quack/epilogues.py` | `quack/epilogue/library.py` (rope dedup: keep the `rotary.py` family) |
-| `quack/gemm_host.py` | `quack/gemm_runtime/host.py` |
-| `quack/epi_torch_op.py` | `quack/gemm_runtime/torch_op.py` |
-| `quack/epi_autotune.py` | `quack/gemm_runtime/autotune.py` |
-| `quack/operand_transform/transform_a.py` | `quack/operand_transform/transform.py` |
-| `quack/operand_transform/host.py` (ref/payload part) | `gemm_runtime/identity.py` |
-| `quack/operand_transform/host.py` (kind geometry part) | `operand_transform/kinds.py` |
-| `quack/blockscaled/decode_formats.py` | `quack/operand_transform/formats/__init__.py` |
-| `quack/blockscaled/qtip.py` | `quack/operand_transform/formats/qtip.py` |
-| `quack/gemm_w4.py` `_pick_w4_cfg`/`_pick_w4a8_cfg` | `operand_transform/host.py` (kills the upward import from the epilogue frontend) |
+Old paths are the pre-reorg names inside the package (shown relative to the
+package root, since the package directory was renamed after this doc was written).
 
-No back-compat shims: all in-tree importers (`quack/`, `tests/`,
+| old (pre-reorg) | new |
+|---|---|
+| `epi_ops.py` | `DLKernel/epilogue/ops.py` |
+| `epi_utils.py` | folded into `epilogue/ops.py`; dead `assume_broadcast_strides` deleted |
+| `epi_composable.py` | `DLKernel/epilogue/mixin.py` |
+| `gemm_epilogue.py` | split: `epilogue/frontend.py` + `epilogue/visit.py` + `epilogue/math.py`; fingerprinter -> `gemm_runtime/identity.py` |
+| `epilogues.py` | `DLKernel/epilogue/library.py` (rope dedup: keep the `rotary.py` family) |
+| `gemm_host.py` | `DLKernel/gemm_runtime/host.py` |
+| `epi_torch_op.py` | `DLKernel/gemm_runtime/torch_op.py` |
+| `epi_autotune.py` | `DLKernel/gemm_runtime/autotune.py` |
+| `operand_transform/transform_a.py` | `DLKernel/operand_transform/transform.py` |
+| `operand_transform/host.py` (ref/payload part) | `gemm_runtime/identity.py` |
+| `operand_transform/host.py` (kind geometry part) | `operand_transform/kinds.py` |
+| `blockscaled/decode_formats.py` | `DLKernel/operand_transform/formats/__init__.py` |
+| `blockscaled/qtip.py` | `DLKernel/operand_transform/formats/qtip.py` |
+| `gemm_w4.py` `_pick_w4_cfg`/`_pick_w4a8_cfg` | `operand_transform/host.py` (kills the upward import from the epilogue frontend) |
+
+No back-compat shims: all in-tree importers (`DLKernel/`, `tests/`,
 `benchmarks/`) are updated in the same change. `AI/` scratch scripts are not
 updated (they pin old paths; fix on next use).
 
@@ -161,7 +164,7 @@ updated (they pin old paths; fix on next use).
 
 Every `transform_a=` handle (`ATransformMod`, `PackedFormatMod`,
 `DropoutAMod`) implements, in addition to `__call__(gemm)` and
-`__quack_semantic_key__`:
+`__dlkernel_semantic_key__`:
 
 * `resolve_operands(A, tile_m, tile_k) -> (A_for_metadata, bundle, extra_plan_key)` —
   owns the `owned_fmt` blob unpack / `TransformAOperand` assertion / plain
@@ -230,10 +233,10 @@ the ONLY statement of the partial-buffer rule. All seven sites
   lazily import `torch` and fake-tensor helpers (unavoidable: schema methods
   run host-side only), but never `gemm_tvm_ffi_utils` — the two helpers it
   used (`div_for_dtype`, `fake_batched`) move to `compile_utils`.
-* `gemm_runtime/identity.py` imports nothing from `quack` except stdlib-level
+* `gemm_runtime/identity.py` imports nothing from `DLKernel` except stdlib-level
   utils. Anyone may import it.
 * Package `__init__.py`s are PEP-562 lazy; kernel classes import submodules
-  directly (`from quack.epilogue.ops import ...`), never the package root.
+  directly (`from DLKernel.epilogue.ops import ...`), never the package root.
 * `operand_transform/transform.py` must not import `formats/` at module level
   (today's `GemmSm90 -> decode_formats -> qtip` drag): the format is resolved
   by the frontend/handle and passed in.
@@ -254,7 +257,7 @@ compatibility stops being a design constraint on key schemas.
 
 1. **Leaf extraction, no behavior change**: `gemm_runtime/identity.py` +
    `epilogue/math.py`. Convert the lazy imports this un-cycles into top-level
-   imports. Gate: import-graph smoke (`python -c "import quack.gemm_sm90"`
+   imports. Gate: import-graph smoke (`python -c "import DLKernel.gemm_sm90"`
    must not pull torch-op/tvm modules), epilogue + transform test subset.
 2. **Single-source the rules**: sink shapes -> `sink_alloc_shape` everywhere;
    `kinds.py`; handle protocol; delete `gemm_host.gemm_epi_plan_key` (dead)
@@ -275,7 +278,7 @@ compatibility stops being a design constraint on key schemas.
 ## Later campaigns (explicitly out of scope)
 
 * Migrate `gemm_interface.py`'s ~13 hand-written custom ops onto
-  `quack::gemm_epi`; unify the three spellings of eager-bypass.
+  `dlkernel::gemm_epi`; unify the three spellings of eager-bypass.
 * ~~`fn_port` on all ops~~ DONE (2026-07-29 round 2): the four load ops
   declare `fn_port = "row"/"col"/"tile"/"scalar"`; `_pinned_visit_kind` is
   port-only with an `_OPERAND_PORTS` whitelist. Mint-key compat tombstones
@@ -307,7 +310,7 @@ compatibility stops being a design constraint on key schemas.
 * Merge `epi_autotune._prune_for_mod` with
   `gemm_interface.prune_invalid_gemm_configs` into one predicate library in
   `gemm_config`.
-* `quack/gemm.py`'s parallel plain-GEMM stack; `rmsnorm.py`.
+* `DLKernel/gemm.py`'s parallel plain-GEMM stack; `rmsnorm.py`.
 
 ## Implementation status (2026-07-29): SHIPPED
 
@@ -334,7 +337,7 @@ Deviations from the plan above:
   KeyError for ColVecSelect sinks under the tuned path.
 * gemm_w4a16's `if split_k is None` branch is NOT dead (explicitly-tiled
   callers reach it) — kept.
-* Pre-existing, untouched: `quack/sort` E402, benchmark F821s,
+* Pre-existing, untouched: `DLKernel/sort` E402, benchmark F821s,
   tests/test_gemm_rowvec_reduce.py importing a module absent from this tree,
   async-compile pool workers occasionally failing CUDA init on
   device-pinned runs (tests fall back to in-process compiles and pass).

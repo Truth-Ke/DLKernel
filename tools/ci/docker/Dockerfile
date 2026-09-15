@@ -5,9 +5,9 @@ FROM ubuntu:24.04 AS base
 
 # Defaults match build.sh's cu12.9 invocation so a bare `docker build` (no
 # --build-arg) produces a working image on our cu12.9 runners. Pass
-# --build-arg QUACK_EXTRAS=cu13,dev (plus --target cu13) for the cu13.2 variant.
+# --build-arg DLKERNEL_EXTRAS=cu13,dev (plus --target cu13) for the cu13.2 variant.
 ARG TORCH_CUDA=cu126
-ARG QUACK_EXTRAS=dev
+ARG DLKERNEL_EXTRAS=dev
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -33,7 +33,7 @@ RUN pip install --break-system-packages --no-cache-dir \
     rm -rf /usr/local/lib/python3.12/dist-packages/nvidia/cusolver \
            /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libcusolver*.so.*
 
-# Install quack-kernels' transitive dependencies. The package itself is
+# Install DLKernel's transitive dependencies. The package itself is
 # overwritten at run time by an editable install from the mounted repo.
 #
 # Note on cu13 install order: nvidia-cutlass-dsl-libs-cu13 is an OVERLAY on top
@@ -43,9 +43,9 @@ RUN pip install --break-system-packages --no-cache-dir \
 # dependencies before dependents, so -libs-cu13 (which depends on -libs-base)
 # is guaranteed to install last and its files deterministically overlay -libs-base.
 # Switching to uv pip here re-introduces non-deterministic install order.
-COPY pyproject.toml /tmp/quack/pyproject.toml
-COPY quack/ /tmp/quack/quack/
-RUN pip install --break-system-packages --no-cache-dir "/tmp/quack[${QUACK_EXTRAS}]"
+COPY pyproject.toml /tmp/dlkernel/pyproject.toml
+COPY DLKernel/ /tmp/dlkernel/DLKernel/
+RUN pip install --break-system-packages --no-cache-dir "/tmp/dlkernel[${DLKERNEL_EXTRAS}]"
 
 CMD ["/bin/bash"]
 

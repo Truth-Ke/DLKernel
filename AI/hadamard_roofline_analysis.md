@@ -2,7 +2,7 @@
 
 This section compares two single-CTA Hadamard implementations for bf16 input/output with fp32 internal values:
 
-1. **QuACK staged-SMEM implementation** in `quack/hadamard.py`: each logical radix stage does local fp32 butterflies in registers, then performs a full fp32 shared-memory round trip to exchange across threads. The current kernel always takes this path (the `use_3stage` selector is short-circuited to `True`).
+1. **DLKernel staged-SMEM implementation** in `DLKernel/hadamard.py`: each logical radix stage does local fp32 butterflies in registers, then performs a full fp32 shared-memory round trip to exchange across threads. The current kernel always takes this path (the `use_3stage` selector is short-circuited to `True`).
 2. **Previous `fast-hadamard-transform` CUDA implementation**: uses warp shuffles for the 5 within-warp butterfly stages, sandwiched between two shared-memory transposes that expose the 3 cross-warp butterfly stages as additional within-warp shuffles.
 
 The goal is not to model latency or occupancy perfectly; it is a roofline model for the dominant data-movement resources: global-memory bandwidth and the SM-local MIO/shared-memory/shuffle pipe. fp32 add/sub throughput is well above the bottleneck in every case below and is not the binding roof for any configuration.
@@ -62,9 +62,9 @@ GMEM roof = FP ops / GMEM cycles
 
 ## Implementation traffic models
 
-### 1. QuACK staged-SMEM implementation
+### 1. DLKernel staged-SMEM implementation
 
-The active path in `quack/hadamard.py` performs one full fp32 SMEM round trip per logical stage:
+The active path in `DLKernel/hadamard.py` performs one full fp32 SMEM round trip per logical stage:
 
 ```text
 SMEM bytes per stage = 4N store + 4N load = 8N bytes
@@ -90,13 +90,13 @@ When all of (a) `dtype.width == 16` (bf16 or fp16), (b) `N == N_padded`,
 skips that final SMEM round trip and instead computes a register-side
 permutation that lines up a tiled 128-bit gmem store atom whose thread/value
 layouts encode the post-exchange address pattern directly. The implementation
-is `_tail_direct_store_plan` / `_tail_store_copy` in `quack/hadamard.py`. The
+is `_tail_direct_store_plan` / `_tail_store_copy` in `DLKernel/hadamard.py`. The
 result is that for the bf16/fp16 cases listed below the **effective stage
 count** for the SM-local roof is `raw_stages - 1`, not `raw_stages`.
 
 #### Current `EPT` table
 
-With the current `_EPT_BY_N_PADDED` dict in `quack/hadamard.py` and bf16/fp16
+With the current `_EPT_BY_N_PADDED` dict in `DLKernel/hadamard.py` and bf16/fp16
 inputs (tail-direct-store activated when feasible):
 
 | N | L | EPT | log_ept | raw stages | tail_bit_shift | tail_direct_store | effective S | SM-local pressure | SM-local roof |
@@ -110,7 +110,7 @@ which the kernel promotes to `log_ept = 5`; the feasibility predicate
 `tail_bit_shift < log_ept` then fails and the final SMEM round trip is
 kept. 32K therefore stays at the raw S=3.)
 
-For fp32 inputs (or when `QUACK_HADAMARD_TAIL_DIRECT_STORE=0`) the effective
+For fp32 inputs (or when `DLKERNEL_HADAMARD_TAIL_DIRECT_STORE=0`) the effective
 `S` equals the raw stage count, i.e. `S=3` for all three of 8K / 16K / 32K
 with their respective EPTs.
 
@@ -163,13 +163,13 @@ SM-local roof  = (N * L) / (48N / 128)
 | 16K | 14 | 32N bytes | 16N bytes | 48N bytes | 37.3 op/clk/SM |
 | 32K | 15 | 32N bytes | 16N bytes | 48N bytes | 40.0 op/clk/SM |
 
-Thus the old implementation has the equivalent SM-local pressure of **six fp32 SMEM round trips**. QuACK's current bf16/fp16 default uses **two effective round trips** at 8K and 16K (three raw stages minus the tail-direct-store saving) and **three** at 32K (where the feasibility predicate fails); fp32 keeps all three at every size.
+Thus the old implementation has the equivalent SM-local pressure of **six fp32 SMEM round trips**. DLKernel's current bf16/fp16 default uses **two effective round trips** at 8K and 16K (three raw stages minus the tail-direct-store saving) and **three** at 32K (where the feasibility predicate fails); fp32 keeps all three at every size.
 
 ## Roofline results
 
 All entries are effective fp32 Hadamard operation roofs in `op/clk/SM`. The label is the predicted bottleneck (`GMEM` = global-memory-bound, `SM-local` = SM-local-pipe-bound).
 
-### QuACK staged-SMEM implementation
+### DLKernel staged-SMEM implementation
 
 bf16/fp16 with the current default `_EPT_BY_N_PADDED` (effective S=2 at 8K/16K,
 S=3 at 32K):
@@ -188,7 +188,7 @@ falls back to S=3; for B200 this trips the SM-local/GMEM crossover (B_gmem =
 H100, and RTX 5090 stay GMEM-bound at 32K because their GMEM-per-SM-clock
 is below the S=3 threshold.
 
-For fp32 (or `QUACK_HADAMARD_TAIL_DIRECT_STORE=0`), every size is `S=3` and
+For fp32 (or `DLKERNEL_HADAMARD_TAIL_DIRECT_STORE=0`), every size is `S=3` and
 B200 is SM-local-bound at all three: 69.3 / 74.7 / 80.0 op/clk/SM at
 8K / 16K / 32K respectively.
 
@@ -205,7 +205,7 @@ The old implementation is SM-local-bound on A100, H100, and B200 because the 8 s
 
 ## Crossover rules
 
-For QuACK staged-SMEM:
+For DLKernel staged-SMEM:
 
 ```text
 T_smem / T_gmem = S * B_gmem / 64
@@ -223,7 +223,7 @@ Thresholds for the two relevant stage counts:
 S = 3 threshold: B_gmem > 21.3 B/clk/SM
   - bf16/fp16 default at N=32K
   - fp32 at all sizes
-  - any size with QUACK_HADAMARD_TAIL_DIRECT_STORE=0
+  - any size with DLKERNEL_HADAMARD_TAIL_DIRECT_STORE=0
 S = 2 threshold: B_gmem > 32.0 B/clk/SM
   - bf16/fp16 default at N=8K and N=16K
 ```
@@ -252,7 +252,7 @@ B_gmem > 32 / 3 ~= 10.7 B/clk/SM
 
 A100, H100, and B200 are above this threshold; RTX 5090 is below it.
 
-## Predicted roofline gain from QuACK vs previous FHT
+## Predicted roofline gain from DLKernel vs previous FHT
 
 This is the ratio of the overall roofline limit, not a measured speedup.
 
@@ -300,7 +300,7 @@ waste less time on the MIO pipe. **The opposite is true at N=32K on H100**:
 Two facts narrow the cause:
 
 1. **It is not the SMEM round-trip count.** Running `ept=64` with
-   `QUACK_HADAMARD_TAIL_DIRECT_STORE=0` (forcing `S=3` to match `ept=32`'s
+   `DLKERNEL_HADAMARD_TAIL_DIRECT_STORE=0` (forcing `S=3` to match `ept=32`'s
    SMEM pressure) gives 2002 GB/s, still well below `ept=32`'s 2530 GB/s.
    Removing the SMEM saving does not close the gap.
 
@@ -317,7 +317,7 @@ Two facts narrow the cause:
 
 A pure HBM read+write (`torch.clone(x)`) is the empirical upper bound on
 throughput at a given dtype / N / M: same bytes moved, no compute. On the
-same H100 SXM (`CUDA_VISIBLE_DEVICES=7`, `QUACK_CACHE_ENABLED=0`,
+same H100 SXM (`CUDA_VISIBLE_DEVICES=7`, `DLKERNEL_CACHE_ENABLED=0`,
 `triton.testing.do_bench` warmup=10 rep=100, M=16384, N=32768):
 
 | dtype | clone GB/s | clone % HBM peak |
@@ -354,7 +354,7 @@ and clearing the JIT cache between runs):
 
 (In this re-measurement, `TailDirectStorePlan.is_feasible` returns False
 for ept=64 with bf16 N=32K, so its effective S is 3 — matching the
-`QUACK_HADAMARD_TAIL_DIRECT_STORE=0` row in the earlier table above
+`DLKERNEL_HADAMARD_TAIL_DIRECT_STORE=0` row in the earlier table above
 (2002 GB/s). The ept=64 / `S=2` / 2102 GB/s row in that earlier table
 reflects an older run with tail-direct active. Either way, ept=64 is
 slower than ept=32.)

@@ -4,8 +4,8 @@ import torch
 import torch.nn.functional as F
 import torch._dynamo
 
-from quack.mlp import MLP
-from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
+from DLKernel.mlp import MLP
+from DLKernel.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
 
 torch._dynamo.config.cache_size_limit = 64
 

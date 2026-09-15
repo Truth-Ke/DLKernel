@@ -8,8 +8,8 @@ import torch  # noqa: E402
 import torch._functorch.config as _functorch_config  # noqa: E402
 from triton.testing import Benchmark, do_bench, perf_report  # noqa: E402
 
-from quack.bench.bench_utils import run_and_print  # noqa: E402
-from quack.rmsnorm import rmsnorm, rmsnorm_bwd, rmsnorm_fwd, rmsnorm_ref  # noqa: E402
+from DLKernel.bench.bench_utils import run_and_print  # noqa: E402
+from DLKernel.rmsnorm import rmsnorm, rmsnorm_bwd, rmsnorm_fwd, rmsnorm_ref  # noqa: E402
 
 # Inductor's donated-buffer optimization is incompatible with retain_graph=True
 # (used so we benchmark only bwd, not fwd+bwd). Disable it for the torch.compile
@@ -53,14 +53,14 @@ def _bench(fn, **kwargs) -> float:
 
 
 def _fwd_providers():
-    providers = [("quack", "quack"), ("torch_compile", "torch.compile")]
+    providers = [("DLKernel", "DLKernel"), ("torch_compile", "torch.compile")]
     if cudnn is not None:
         providers.append(("cudnn", "cudnn"))
     return providers
 
 
 def _bwd_providers():
-    return [("quack", "quack"), ("torch_compile", "torch.compile")]
+    return [("DLKernel", "DLKernel"), ("torch_compile", "torch.compile")]
 
 
 def make_fwd_benchmark(
@@ -88,7 +88,7 @@ def make_bwd_benchmark(
     suffix = dtype_name + (f"-res-{residual_dtype_name}" if residual_dtype_name else "")
     if x_vals is None:
         x_vals = MN_PAIRS
-        # quack RMSNorm bwd kernel rejects N > 128k with fp32 (smem too small).
+        # DLKernel RMSNorm bwd kernel rejects N > 128k with fp32 (smem too small).
         if DTYPE_MAP[dtype_name].itemsize >= 4:
             x_vals = [(m, n) for (m, n) in x_vals if n <= 128 * 1024]
     return Benchmark(
@@ -165,7 +165,7 @@ def rmsnorm_fwd_runner(M, N, provider, dtype_name, residual_dtype_name):
         else None
     )
 
-    if provider == "quack":
+    if provider == "DLKernel":
         fn = lambda: rmsnorm_fwd(x, w, residual=residual, eps=eps)
         ms = _bench(fn)
         nbytes = _fwd_mem_bytes(x, w, residual)
@@ -208,7 +208,7 @@ def rmsnorm_bwd_runner(M, N, provider, dtype_name, residual_dtype_name):
     rstd = torch.randn(M, device="cuda", dtype=torch.float32)
     dresidual_out = torch.randn_like(residual_out) if residual is not None else None
 
-    if provider == "quack":
+    if provider == "DLKernel":
         in_x = x if residual is None else residual_out
 
         def fn():

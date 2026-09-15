@@ -6,7 +6,7 @@ clusters are still pending. It happens when (a) a second process is
 time-slicing the GPU and (b) several CLC grids are queued back-to-back on a
 stream — ~2.5% of launches under those conditions, zero otherwise. Any CLC
 scheduler that treats an invalid response as "pool empty" retires early; that
-is harmless for exact grids, but quack's varlen padding drain (`afe2ef3`)
+is harmless for exact grids, but DLKernel's varlen padding drain (`afe2ef3`)
 fired blind cancels at exactly these false retirements and killed **real**
 pending tiles, whose output rows silently kept stale allocator memory.
 Fixed by gating the drain on a *decoded phantom* (a valid grant whose work
@@ -56,8 +56,8 @@ Smoking gun (in-situ capture build — drain re-enabled with the exit
 response's valid bit added to a stats printf):
 
 ```
-QUACK-DRAIN: pr=0 base=155 n=256 min=287 max=747  gridtot=1336
-QUACK-DRAIN: pr=0 base=379 n=256 min=587 max=1065 gridtot=1336
+DLKERNEL-DRAIN: pr=0 base=155 n=256 min=287 max=747  gridtot=1336
+DLKERNEL-DRAIN: pr=0 base=379 n=256 min=587 max=1065 gridtot=1336
 ```
 
 `pr=0` = the exit response was invalid; `base` = last real grant (mid-pool);
@@ -77,10 +77,10 @@ controlled experiment, and several produced independently useful facts:
 | Orphaned response write-backs at CTA exit | real hazard, not this bug | fire-and-forget exit fail-stops with Xid 43 in minimal kernels; but a response-drained spray still corrupted |
 | Cross-grid cancels (killing the next launch's clusters) | **refuted** | 0/800 back-to-back-PDL trials; grants never cross grid boundaries |
 | PDL, multicast queries, pipelined 2-in-flight queries | clean | direct probe arms |
-| TMEM allocation, tcgen05 MMA execution | clean / clean | `--tmem` arm; `QUACK_SKIP_MMA` kernel ablation *fires harder* (226 vs 23) |
+| TMEM allocation, tcgen05 MMA execution | clean / clean | `--tmem` arm; `DLKERNEL_SKIP_MMA` kernel ablation *fires harder* (226 vs 23) |
 | TMA/LDG bandwidth or tx-barrier pressure | clean | `--tma-traffic` (2-deep 32KB cp.async.bulk ×3 warps), `--traffic` |
 | Kernel duration / preemption straddling | clean | 36 ms kernels with the retry detector |
-| Cluster shape, sched_stage depth | clean | `QUACK_FORCE_1CTA` fires (30), `QUACK_SCHED_STAGE=1` fires (84) |
+| Cluster shape, sched_stage depth | clean | `DLKERNEL_FORCE_1CTA` fires (30), `DLKERNEL_SCHED_STAGE=1` fires (84) |
 | Contender type | irrelevant | elementwise `mul_` loop fires as hard as matmul |
 
 Production-side scale sweep (signal = `pr=0` drain lines, not test failures):
@@ -129,7 +129,7 @@ back-to-back on a stream and a second process time-slicing the GPU,
 `try_cancel` returns "no pending cluster" while hundreds of the current
 grid's clusters remain pending (~2.5% of launches; B300, driver 595).*
 
-## The fix (shipped in `quack/tile_scheduler.py::cancel_pending_tail`)
+## The fix (shipped in `DLKernel/tile_scheduler.py::cancel_pending_tail`)
 
 Three invariants, replacing the fire-and-forget spray:
 
@@ -142,7 +142,7 @@ Three invariants, replacing the fire-and-forget spray:
 2. **Serial-observed cancels.** Issue → wait → decode, one at a time, so no
    CLC state is ever in flight at CTA exit (fire-and-forget exit fail-stops
    with Xid 43), and a below-baseline grant aborts the drain with a loud
-   `QUACK-SPRAY-ANOMALY` printf instead of silently eating a tile.
+   `DLKERNEL-SPRAY-ANOMALY` printf instead of silently eating a tile.
 3. **Private mailbox.** Responses land in a dedicated slot + mbarrier after
    the sched response ring (+8 Int32 in `sched_smem_size`), never touching
    live ring slots or barriers.
@@ -180,7 +180,7 @@ drain, 300 µs-delayed drain. Delay-only (no cancels): clean.
   `--tma-traffic`, `--pipelined` modes).
 - `AI/repro_clc_grant_monotonicity.py` — grant-order validation (576M
   cancels, monotone) and the Xid-43 fire-and-forget-exit fail-stop repro.
-- `quack/tile_scheduler.py::cancel_pending_tail` — the fixed drain, with the
+- `DLKernel/tile_scheduler.py::cancel_pending_tail` — the fixed drain, with the
   invariants documented in its docstring.
 - Test-level repro: `pytest tests/test_linear_varlen_m.py -k
   "test_gemm_add_varlen_m and 8192"` + same-GPU contender (bad code: 1–7 of

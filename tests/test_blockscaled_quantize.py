@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Tri Dao.
-"""Tests for the MX quantizers (quack/blockscaled/quantize.py): scale modes and
+"""Tests for the MX quantizers (DLKernel/blockscaled/quantize.py): scale modes and
 the dim0 ("columnwise") variant used by training linears (dgrad/wgrad).
 
 Pure-PyTorch quantizers — CPU-runnable; the GEMM-side orientation tests live in
@@ -9,7 +9,7 @@ test_gemm_blockscaled_interface.py.
 import pytest
 import torch
 
-from quack.blockscaled.quantize import F8E4M3_MAX, to_mx, to_mx_dim0
+from DLKernel.blockscaled.quantize import F8E4M3_MAX, to_mx, to_mx_dim0
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])

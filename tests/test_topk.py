@@ -4,7 +4,7 @@ import pytest
 import torch
 
 
-from quack.topk import topk, topk_fwd, topk_bwd
+from DLKernel.topk import topk, topk_fwd, topk_bwd
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024

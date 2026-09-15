@@ -10,8 +10,8 @@ from triton.testing import Benchmark, do_bench, perf_report
 import cutlass
 import cutlass.torch as cutlass_torch
 
-from quack.bench.bench_utils import run_and_print
-from quack.cross_entropy import cross_entropy, cross_entropy_fwd
+from DLKernel.bench.bench_utils import run_and_print
+from DLKernel.cross_entropy import cross_entropy, cross_entropy_fwd
 
 
 MN_PAIRS = [
@@ -45,7 +45,7 @@ def _bench(fn, **kwargs) -> float:
 
 
 def _providers():
-    return [("quack", "quack"), ("torch_compile", "torch.compile")]
+    return [("DLKernel", "DLKernel"), ("torch_compile", "torch.compile")]
 
 
 def make_fwd_benchmark(dtype_name: str, return_dx: bool, x_vals=None) -> Benchmark:
@@ -87,7 +87,7 @@ def cross_entropy_fwd_runner(M, N, provider, dtype_name, return_dx):
     x = 0.1 * torch.randn(M, N, device="cuda", dtype=torch_dtype)
     target = torch.randint(0, N, (M,), device="cuda", dtype=torch.int64)
 
-    if provider == "quack":
+    if provider == "DLKernel":
         fn = lambda: cross_entropy_fwd(x, target, return_dx=return_dx)
         ms = _bench(fn)
         # I/O: read x (+ write dx if return_dx) + read target + write loss
@@ -111,7 +111,7 @@ def cross_entropy_bwd_runner(M, N, provider, dtype_name):
     target = torch.randint(0, N, (M,), device="cuda", dtype=torch.int64)
     dloss = torch.randn(M, device="cuda", dtype=torch.float32)
 
-    if provider == "quack":
+    if provider == "DLKernel":
         loss = cross_entropy(x, target, reduction="none")
         fn = lambda: torch.autograd.grad(loss, x, grad_outputs=dloss, retain_graph=True)
         ms = _bench(fn, grad_to_none=(x,))

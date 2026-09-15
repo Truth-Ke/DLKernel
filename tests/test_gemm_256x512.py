@@ -7,8 +7,8 @@ import math
 import pytest
 import torch
 
-from quack.cute_dsl_utils import get_device_capacity
-from quack.gemm import gemm as quack_gemm
+from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm import gemm as dlkernel_gemm
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or get_device_capacity(torch.device("cuda"))[0] not in (10, 11),
@@ -24,7 +24,7 @@ RTOL = 1e-3
 
 
 def _run_gemm(A, B, D, **kwargs):
-    quack_gemm(
+    dlkernel_gemm(
         A,
         B,
         D,
@@ -87,7 +87,7 @@ def test_gemm_add(k, n):
     C = torch.randn(l, m, n, dtype=DTYPE, device="cuda")
     D = torch.empty(l, m, n, dtype=DTYPE, device="cuda")
     alpha, beta = 0.5, 0.7
-    quack_gemm(
+    dlkernel_gemm(
         A,
         B,
         D,

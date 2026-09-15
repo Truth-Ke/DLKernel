@@ -2,7 +2,7 @@
 """Trace an SM90 GEMM kernel.
 
 Run with IKET:
-    python -m iket.cli.main --output-dir /tmp/quack_gemm_iket --clobber \
+    python -m iket.cli.main --output-dir /tmp/dlkernel_gemm_iket --clobber \
         --context-buffer-size 512M profile --postprocess all --keep \
         --max-ts-cnt-per-warp 8192 -- \
         env PYTHONPATH=. python examples/example_gemm_trace.py
@@ -10,7 +10,7 @@ Run with IKET:
 
 import torch
 
-from quack.gemm import gemm
+from DLKernel.gemm import gemm
 
 M, N, K = 4096, 4096, 4096
 TILE_M, TILE_N = 128, 192

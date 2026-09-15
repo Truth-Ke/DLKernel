@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Tri Dao.
-"""Tests for quack.dsl.mixed_constexpr_if.
+"""Tests for DLKernel.dsl.mixed_constexpr_if.
 
 Contract under test: ``if const_expr(S) and D:`` / ``if const_expr(S) or D:``
 fold the static prefix at trace time and only materialize a dynamic if-region
@@ -25,7 +25,7 @@ from cutlass import Int32, const_expr
 from cutlass.base_dsl.ast_preprocessor import DSLPreprocessor
 from cutlass.cute.runtime import from_dlpack
 
-from quack.dsl.mixed_constexpr_if import _rewrite_elif_chain, rewrite_mixed_constexpr_if
+from DLKernel.dsl.mixed_constexpr_if import _rewrite_elif_chain, rewrite_mixed_constexpr_if
 
 
 # ---------------------------------------------------------------------------

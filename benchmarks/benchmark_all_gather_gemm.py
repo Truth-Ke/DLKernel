@@ -1,10 +1,10 @@
-# Copyright (c) 2026, QuACK team.
-"""8-rank AllGather+GEMM benchmark: quack overlapped AG+GEMM vs baselines.
+# Copyright (c) 2026, DLKernel team.
+"""8-rank AllGather+GEMM benchmark: DLKernel overlapped AG+GEMM vs baselines.
 
 Methods:
   gemm_only   local persistent GEMM on the pre-gathered A (compute roof)
-  quack_ag    this work: reverse-ring CE push + flag-gated shard-rotated persistent GEMM
-  nccl_seq    NCCL all_gather_into_tensor, then the same quack GEMM (exposed comm)
+  dlkernel_ag    this work: reverse-ring CE push + flag-gated shard-rotated persistent GEMM
+  nccl_seq    NCCL all_gather_into_tensor, then the same DLKernel GEMM (exposed comm)
   torch_fused torch.ops.symm_mem.fused_all_gather_matmul (if available)
 
 Protocol (shared-node rules): methods interleaved per round, per-launch CUDA
@@ -22,8 +22,8 @@ Traps that produced WRONG conclusions until fixed (do not relearn):
   before comparing anything.
 - Matched consistency model: static-buffer baselines (ex82/PK/TE) stage
   the LOCAL shard outside the timed loop (their cross-rank transport still
-  runs per iteration) — the honest quack comparator for them is
-  quack_ag_zc; quack_ag additionally pays the per-iteration producer
+  runs per iteration) — the honest DLKernel comparator for them is
+  dlkernel_ag_zc; dlkernel_ag additionally pays the per-iteration producer
   dependency.
 - Burst timing: a dist.barrier per iteration injects cross-rank skew and
   forbids cross-iteration pipelining (+139% -> +69% at one shape when
@@ -34,13 +34,13 @@ Traps that produced WRONG conclusions until fixed (do not relearn):
   peers' compute windows).
 
 Standings for context (settled clocks, matched data, July 2026, ms/iter at
-8192x2048 / 16384x4096 / 32768x2048, K=8192 bf16): TP4 quack (pull era)
+8192x2048 / 16384x4096 / 32768x2048, K=8192 bf16): TP4 DLKernel (pull era)
 0.266/0.869/0.930 — post-refactor ce_push measured parity-or-better
 (0.251/0.847/0.867, boost regime) — vs CUTLASS ex82 0.255/0.921/0.924,
 cuBLASMp SPLIT_P2P 0.281/0.834/0.957, ParallelKittens 0.278/0.909/1.044
 (collapses at TP2), TE UB ring_exchange 0.286/0.897/0.961. TP8 ce_push
 beats-or-ties TE at all common points (incl. 0.972 vs 0.997 at
-32768x2048). quack is the only implementation paying the per-iteration
+32768x2048). DLKernel is the only implementation paying the per-iteration
 producer dependency in these numbers.
 """
 
@@ -52,8 +52,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-from quack.distributed import AllGatherRunner
-from quack.gemm import AllGatherArguments, gemm as quack_gemm
+from DLKernel.distributed import AllGatherRunner
+from DLKernel.gemm import AllGatherArguments, gemm as dlkernel_gemm
 
 
 def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, args):
@@ -72,7 +72,7 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
     )
 
     def run_gemm_only():
-        quack_gemm(
+        dlkernel_gemm(
             a_full,
             b,
             d,
@@ -87,7 +87,7 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
 
     def ag_gemm(a):
         with ag.gather(a) as (a_buf, ag_args):
-            quack_gemm(
+            dlkernel_gemm(
                 a_buf,
                 b,
                 d,
@@ -101,7 +101,7 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
                 ag_args=ag_args,
             )
 
-    def run_quack_ag():
+    def run_dlkernel_ag():
         ag_gemm(a_shard)
 
     # Zero-copy variant: the producer wrote A directly into the symmetric
@@ -112,7 +112,7 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
         ag.last_parity ^= 1  # two flips = restored; visits both slots
     torch.cuda.synchronize(device)
 
-    def run_quack_ag_zc():
+    def run_dlkernel_ag_zc():
         ag_gemm(ag.next_local_slot())
 
     def run_nccl_seq():
@@ -126,8 +126,8 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
     # always satisfied.
     pre_epoch = torch.ones(1, dtype=torch.int32, device=device)
 
-    def run_quack_ag_noflags():
-        quack_gemm(
+    def run_dlkernel_ag_noflags():
+        dlkernel_gemm(
             a_full,
             b,
             d,
@@ -145,9 +145,9 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
 
     methods = {
         "gemm_only": run_gemm_only,
-        "quack_ag_noflags": run_quack_ag_noflags,
-        "quack_ag": run_quack_ag,
-        "quack_ag_zc": run_quack_ag_zc,
+        "dlkernel_ag_noflags": run_dlkernel_ag_noflags,
+        "dlkernel_ag": run_dlkernel_ag,
+        "dlkernel_ag_zc": run_dlkernel_ag_zc,
         "nccl_seq": run_nccl_seq,
     }
 
@@ -164,11 +164,11 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
 
     # correctness spot-check before timing
     ref = a_full.to(dtype).float() @ b.float().T
-    run_quack_ag()
+    run_dlkernel_ag()
     torch.cuda.synchronize(device)
     err = (d.float() - ref).abs().max().item()
     d2 = torch.empty_like(d)
-    quack_gemm(
+    dlkernel_gemm(
         a_full,
         b,
         d2,
@@ -182,7 +182,7 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
     )
     torch.cuda.synchronize(device)
     tol = (d2.float() - ref).abs().max().item() + 1e-4
-    assert err <= 2 * tol, f"rank{rank} quack_ag mismatch: {err} vs tol {tol}"
+    assert err <= 2 * tol, f"rank{rank} dlkernel_ag mismatch: {err} vs tol {tol}"
 
     # warmup (compiles, symm rendezvous, clock ramp)
     for fn in methods.values():
@@ -191,11 +191,11 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
     torch.cuda.synchronize(device)
 
     # --- CUDA-graph modes: capture GRAPH_CALLS calls (even count), replay.
-    # quack_ag_graph: current design — gather()'s capture join restores the
+    # dlkernel_ag_graph: current design — gather()'s capture join restores the
     #   dep set, so side branches are graph LEAVES; interior calls keep the
     #   full 2-buffer slack and the barrier hits the critical path only at
     #   the replay boundary (whole-graph completion).
-    # quack_ag_graph_lockstep: emulates a plain per-call join (barrier_i ->
+    # dlkernel_ag_graph_lockstep: emulates a plain per-call join (barrier_i ->
     #   compute_{i+1} edges after every captured call) — the 1-buffer
     #   schedule a naive capture join produces. A/B for the dep-restore.
     GRAPH_CALLS = 4
@@ -215,11 +215,11 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
     torch.cuda.synchronize(device)
     g_leaf = _capture(lockstep=False)
     g_lockstep = _capture(lockstep=True)
-    methods["quack_ag_graph"] = g_leaf.replay
-    methods["quack_ag_graph_lockstep"] = g_lockstep.replay
+    methods["dlkernel_ag_graph"] = g_leaf.replay
+    methods["dlkernel_ag_graph_lockstep"] = g_lockstep.replay
     calls_per_inv = {name: 1 for name in methods}
-    calls_per_inv["quack_ag_graph"] = GRAPH_CALLS
-    calls_per_inv["quack_ag_graph_lockstep"] = GRAPH_CALLS
+    calls_per_inv["dlkernel_ag_graph"] = GRAPH_CALLS
+    calls_per_inv["dlkernel_ag_graph_lockstep"] = GRAPH_CALLS
     for _ in range(3):
         g_leaf.replay()
         g_lockstep.replay()

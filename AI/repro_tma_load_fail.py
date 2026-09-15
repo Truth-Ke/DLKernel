@@ -11,7 +11,7 @@ import math
 import torch
 
 # Monkey-patch to force ptr_shift=True for loads
-import quack.copy_utils as cu
+import DLKernel.copy_utils as cu
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.cute as cute
 
@@ -24,8 +24,8 @@ def create_ragged_ptr_shift_true(T, ragged_dim=0, ptr_shift=True, *, loc=None, i
 
 cu.create_ragged_tensor_for_tma = create_ragged_ptr_shift_true
 
-from quack.gemm import gemm
-from quack.gemm_interface import gemm_ref
+from DLKernel.gemm import gemm
+from DLKernel.gemm_interface import gemm_ref
 
 torch.random.manual_seed(42)
 device = "cuda"

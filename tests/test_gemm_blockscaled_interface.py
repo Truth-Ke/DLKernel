@@ -5,7 +5,7 @@ Operands are BlockScaledOperand containers - the only accepted blockscaled
 operand form ((data, scale_factor) tuples are rejected, see
 test_tuple_operand_rejected).
 
-Layout contract (see quack/gemm_interface.py and AI/blockscaled_api.md):
+Layout contract (see DLKernel/gemm_interface.py and AI/blockscaled_api.md):
   A:   (M, K) or (L, M, K)   fp8 e4m3/e5m2, packed fp4x2 (K/2 bytes), or packed fp6 (3K/4 bytes)
   B:   (K, N) or (L, K, N)   K-contiguous (pass W.mT of an (N, K) weight); A/B formats are
        independent under kind::mxf8f6f4 (nvfp4 pairs only with itself)
@@ -20,11 +20,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quack.blockscaled.quantize import nvfp4_per_tensor_scale
-from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
-from quack.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
-from quack.blockscaled.utils import blockscaled_quantize_dim0
-from quack.gemm_interface import (
+from DLKernel.blockscaled.quantize import nvfp4_per_tensor_scale
+from DLKernel.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
+from DLKernel.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
+from DLKernel.blockscaled.utils import blockscaled_quantize_dim0
+from DLKernel.gemm_interface import (
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
     gemm,
@@ -166,7 +166,7 @@ def test_blockscaled_gemm_varlen_m(seqlens_m, fmt):
     _skip_if_not_sm100()
     import cutlass
 
-    from quack.blockscaled.utils import create_blockscaled_varlen_m_operands
+    from DLKernel.blockscaled.utils import create_blockscaled_varlen_m_operands
 
     fmt_map = {
         "mxfp8": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, 32),
@@ -201,7 +201,7 @@ def test_blockscaled_gemm_varlen_k(seqlens_k):
     are single K-padded buffers (tile-aligned per-batch padding, batch dim 1).
     Per-expert k_i is arbitrary — not even sf_vec(32)-aligned."""
     _skip_if_not_sm100()
-    from quack.blockscaled.utils import create_blockscaled_varlen_k_operands
+    from DLKernel.blockscaled.utils import create_blockscaled_varlen_k_operands
 
     num_experts = len(seqlens_k)
     m, n, sf_vec = 256, 256, 32
@@ -233,7 +233,7 @@ def test_blockscaled_gemm_vs_cublas():
         A.qdata, B.qdata, scale_a=sfa_flat, scale_b=sfw_flat, out_dtype=torch.bfloat16
     )
     assert torch.equal(out, out_cublas), (
-        f"quack != cuBLAS: max_err={(out.float() - out_cublas.float()).abs().max().item()}"
+        f"DLKernel != cuBLAS: max_err={(out.float() - out_cublas.float()).abs().max().item()}"
     )
 
 
@@ -840,7 +840,7 @@ def test_mixed_format_pairs():
     with pytest.raises(ValueError, match="cannot pair"):
         gemm(A4, B8, tuned=False)
     # mixed packed-fp4 pairs are legal: pair legality maps to kind::mxf8f6f4
-    from quack.blockscaled.operand import (
+    from DLKernel.blockscaled.operand import (
         MXFP4,
         MXFP6_E2M3_PACKED,
         MXFP8_E4M3,
@@ -861,7 +861,7 @@ def test_sm100_dtype_gate():
     byte-container (one code per uint8) sub-byte storage has no kernel path."""
     import cutlass
 
-    from quack.gemm_sm100 import GemmSm100
+    from DLKernel.gemm_sm100 import GemmSm100
 
     ok = GemmSm100.is_valid_dtypes_and_scale_factor_vec_size
     e8m0, e4m3, bf16 = cutlass.Float8E8M0FNU, cutlass.Float8E4M3FN, cutlass.BFloat16
@@ -913,12 +913,12 @@ def test_blockscaled_out_dtype_reserved():
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
-    from quack.blockscaled.operand import MXFP8_E4M3
+    from DLKernel.blockscaled.operand import MXFP8_E4M3
 
     for out_dtype in (MXFP8_E4M3, "mxfp8_e4m3"):
         res = gemm(A, B, out_dtype=out_dtype, tuned=False)
         assert isinstance(res, BlockScaledOperand) and res.format.name == "mxfp8_e4m3"
-    with pytest.raises(NotImplementedError, match="only supported by quack.gemm"):
+    with pytest.raises(NotImplementedError, match="only supported by DLKernel.gemm"):
         gemm_act(A, B, activation="relu", postact_dtype="mxfp8_e4m3", tuned=False)
     with pytest.raises(ValueError, match="unknown blockscaled format"):
         gemm(A, B, out_dtype="fp8", tuned=False)
@@ -933,7 +933,7 @@ def test_e5m2_from_parts_kernel():
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
-    from quack.blockscaled.quantize import pack_scale_2d_to_blocked_contig
+    from DLKernel.blockscaled.quantize import pack_scale_2d_to_blocked_contig
 
     # e8m0 biased exponent 127 == 1.0; from_parts canonicalizes the uint8 view
     unit_sf = lambda rows: pack_scale_2d_to_blocked_contig(

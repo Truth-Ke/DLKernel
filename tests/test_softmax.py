@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 
-from quack.softmax import softmax, softmax_fwd, softmax_bwd
+from DLKernel.softmax import softmax, softmax_fwd, softmax_bwd
 
 
 torch._dynamo.config.cache_size_limit = 1024

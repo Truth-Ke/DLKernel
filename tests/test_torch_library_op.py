@@ -1,5 +1,5 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
-"""Unit tests for ``quack.dsl.torch_library_op.cute_op``.
+"""Unit tests for ``DLKernel.dsl.torch_library_op.cute_op``.
 
 The decorator registers the backend ``fn`` as the CUDA impl and a pure
 no-op as the fake/meta impl: our ops only mutate their inputs, so tracing
@@ -21,12 +21,12 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from quack.dsl.torch_library_op import cute_op
+from DLKernel.dsl.torch_library_op import cute_op
 
 
 # Use a unique op namespace per test module to avoid cross-test collisions
 # in the global torch.library registry.
-_NS = "quack_test_cute_op"
+_NS = "dlkernel_test_cute_op"
 
 
 def _make_op(op_name: str, *, unsupported_n: int | None = None):

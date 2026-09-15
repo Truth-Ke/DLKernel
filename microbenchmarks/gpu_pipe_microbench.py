@@ -61,7 +61,7 @@ from cutlass.base_dsl.arch import Arch
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from quack.compile_utils import make_fake_tensor as fake_tensor
+from DLKernel.compile_utils import make_fake_tensor as fake_tensor
 
 
 WARP_SIZE = 32

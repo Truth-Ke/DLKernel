@@ -6,8 +6,8 @@ os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
 import torch
 from triton.testing import Benchmark, do_bench, perf_report
 
-from quack.bench.bench_utils import run_and_print
-from quack.rmsnorm import layernorm_fwd, layernorm_ref
+from DLKernel.bench.bench_utils import run_and_print
+from DLKernel.rmsnorm import layernorm_fwd, layernorm_ref
 
 
 MN_PAIRS = [
@@ -37,7 +37,7 @@ def _result(num_bytes: int, ms: float) -> dict:
 
 
 def _providers():
-    return [("quack", "quack"), ("torch_compile", "torch.compile")]
+    return [("DLKernel", "DLKernel"), ("torch_compile", "torch.compile")]
 
 
 def make_fwd_benchmark(dtype_name: str, x_vals=None) -> Benchmark:
@@ -62,7 +62,7 @@ def layernorm_fwd_runner(M, N, provider, dtype_name):
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w = torch.randn(N, device="cuda", dtype=torch.float32)
 
-    if provider == "quack":
+    if provider == "DLKernel":
         fn = lambda: layernorm_fwd(x, w, eps=eps)
     elif provider == "torch_compile":
         compiled = torch.compile(layernorm_ref)

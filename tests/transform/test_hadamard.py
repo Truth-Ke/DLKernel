@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from quack.transform.hadamard import (
+from DLKernel.transform.hadamard import (
     hadamard_transform,
     hadamard_transform_fwd,
     hadamard_transform_ref,

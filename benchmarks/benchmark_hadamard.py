@@ -7,8 +7,8 @@ os.environ.setdefault("TORCH_COMPILE_DYNAMIC", "0")
 import torch
 from triton.testing import Benchmark, do_bench, perf_report
 
-from quack.bench.bench_utils import run_and_print
-from quack.transform.hadamard import hadamard_transform, hadamard_transform_ref
+from DLKernel.bench.bench_utils import run_and_print
+from DLKernel.transform.hadamard import hadamard_transform, hadamard_transform_ref
 
 try:
     from fast_hadamard_transform import hadamard_transform as fast_hadamard_transform
@@ -58,7 +58,7 @@ def _result(num_bytes: int, ms: float) -> dict:
 
 
 def _providers(include_torch_ref: bool):
-    providers = [("quack", "quack")]
+    providers = [("DLKernel", "DLKernel")]
     if fast_hadamard_transform is not None:
         providers.append(("fast_hadamard", "fast-hadamard"))
     providers.append(("torch_clone", "torch.clone (lower bound)"))
@@ -88,7 +88,7 @@ def hadamard_runner(M, N, provider, dtype_name):
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
 
-    if provider == "quack":
+    if provider == "DLKernel":
         fn = lambda: hadamard_transform(x, scale=scale)
     elif provider == "fast_hadamard":
         fn = lambda: fast_hadamard_transform(x, scale)

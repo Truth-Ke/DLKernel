@@ -6,25 +6,25 @@ fn frontend must produce the same math the mixin produces.
 """
 
 import pytest
-from quack.epilogue.ops import ColVecReduce, OnlineLSEReduce, RowVecReduce, Scalar, TileLoad
-from quack.epilogue.frontend import gemm_epilogue, pack, unpack
-from quack.gemm_config import cta_tile_shape_m
-from quack.gemm_runtime.host import resolve_gemm_class
+from DLKernel.epilogue.ops import ColVecReduce, OnlineLSEReduce, RowVecReduce, Scalar, TileLoad
+from DLKernel.epilogue.frontend import gemm_epilogue, pack, unpack
+from DLKernel.gemm_config import cta_tile_shape_m
+from DLKernel.gemm_runtime.host import resolve_gemm_class
 import math
 import pickle
 import torch
 import cutlass.cute as cute
 from cutlass import Float32, Int32
-from quack.epilogue.library import (
+from DLKernel.epilogue.library import (
     dact_mod,
     dgated_mod,
     linear_act_mod,
     norm_act_mod,
     sq_reduce_mod,
 )
-from quack.epilogue.head_rmsnorm import HeadRstd  # noqa: F401
-from quack.epilogue.scaled_exp import LOG2E, scaled_exp_epi
-from quack.epilogue.rotary import (
+from DLKernel.epilogue.head_rmsnorm import HeadRstd  # noqa: F401
+from DLKernel.epilogue.scaled_exp import LOG2E, scaled_exp_epi
+from DLKernel.epilogue.rotary import (
     make_interleaved_inv_freq,
     make_mrope_inv_freq,
     make_xpos_log_scale,
@@ -36,8 +36,8 @@ from quack.epilogue.rotary import (
     rope_table_ldg_epi,
     xpos_posfreq_epi,
 )
-from quack.activation import dswiglu_oai_tanh
-from quack.epilogue.library import (
+from DLKernel.activation import dswiglu_oai_tanh
+from DLKernel.epilogue.library import (
     amax_epi,
     dgelu_dbias_mod,
     dgelu_mod,
@@ -89,7 +89,7 @@ _cache_max_mod = gemm_epilogue(reduces={"stat": ColVecReduce("stat", combine="ma
 
 def test_epi_mod_semantic_cache_key_and_resolver():
     """Static op config changes identity; a pickled class recipe remints locally."""
-    from quack.rounding import RoundingMode
+    from DLKernel.rounding import RoundingMode
 
     assert _cache_add_mod.semantic_digest != _cache_max_mod.semantic_digest
     # trailing (): arg_forms; trailing False: add_to_output
@@ -101,9 +101,9 @@ def test_epi_mod_semantic_cache_key_and_resolver():
 
 def test_epi_mod_local_payload_identity_and_consumption():
     cloudpickle = pytest.importorskip("cloudpickle")  # noqa: F841
-    from quack.cache.async_compile import PoolPayload
-    from quack.gemm_runtime.identity import LOCAL_EPI_MODS, install_epi_mod_payload
-    from quack.rounding import RoundingMode
+    from DLKernel.cache.async_compile import PoolPayload
+    from DLKernel.gemm_runtime.identity import LOCAL_EPI_MODS, install_epi_mod_payload
+    from DLKernel.rounding import RoundingMode
 
     def build():
         @gemm_epilogue()
@@ -115,7 +115,7 @@ def test_epi_mod_local_payload_identity_and_consumption():
     mod = build()
     mint_key = ((), 10, False, False, (), RoundingMode.RN, (), False)
     ref = mod._class_ref(mint_key)
-    payload = ref.__quack_pool_payload__()
+    payload = ref.__dlkernel_pool_payload__()
     assert isinstance(payload, PoolPayload)
     assert payload.identity == mod.semantic_digest
 
@@ -265,8 +265,8 @@ def test_epi_mod_async_compile(tmp_path, monkeypatch):
     import time
     import warnings
 
-    import quack.cache as cache_state
-    from quack.cache import async_compile
+    import DLKernel.cache as cache_state
+    from DLKernel.cache import async_compile
 
     pytest.importorskip("cloudpickle")
     device = "cuda"
@@ -1140,7 +1140,7 @@ def test_epi_mod_max_reduce_ragged_oob():
 
 
 class RopeOp(TileLoad):
-    """User-defined apply-port op (defined here, not in quack — that's the
+    """User-defined apply-port op (defined here, not in DLKernel — that's the
     point): loads an interleaved cos/sin table through TileLoad's staged
     pipeline and rotates adjacent-N pairs wherever the fn calls it."""
 
@@ -1305,7 +1305,7 @@ def test_epi_mod_stochastic_rounding():
     """RS through the fn frontend: hw cvt.rs on SM100/SM103, sw emulation on
     SM90/SM120. Checks RS engages (differs from RN), stays within the usual
     SR error envelope, and is reproducible per seed."""
-    from quack.rounding import RoundingMode
+    from DLKernel.rounding import RoundingMode
 
     device = "cuda"
     torch.random.manual_seed(19)
@@ -1345,7 +1345,7 @@ def test_epi_mod_lse_target(n, target_dtype):
     the never-matching f16 NaN / -0 bit ranges, not alias.
     (An impl="onehot" R2P variant was tested here and removed — see the
     ColVecSelect tombstones for the measured ladder.)"""
-    from quack.epilogue.library import lse_target_epi
+    from DLKernel.epilogue.library import lse_target_epi
 
     device = "cuda"
     torch.random.manual_seed(16)
@@ -1764,16 +1764,16 @@ def _qknorm_ref(x, w, eps):
     return (xh * rstd * w).reshape(x.shape)
 
 
-def _quack_capability():
-    # QUACK_ARCH-aware (CI runs e.g. SM120 dispatch on H100 runners); the
+def _dlkernel_capability():
+    # DLKERNEL_ARCH-aware (CI runs e.g. SM120 dispatch on H100 runners); the
     # torch capability would report the physical GPU and mis-skip.
-    from quack.cute_dsl_utils import get_device_capacity
+    from DLKernel.cute_dsl_utils import get_device_capacity
 
     return get_device_capacity(torch.device("cuda"))[0]
 
 
 def _skip_unless_acc_prepass():
-    if _quack_capability() not in (9, 10, 11, 12):
+    if _dlkernel_capability() not in (9, 10, 11, 12):
         pytest.skip("acc prepass needs a re-readable accumulator (SM90/SM100/SM110/SM120)")
 
 
@@ -1788,7 +1788,7 @@ def _skip_unless_acc_prepass():
 )
 def test_epi_mod_qknorm_prepass(tile_N, head_dim, pingpong):
     _skip_unless_acc_prepass()
-    if pingpong and _quack_capability() not in (9, 12):
+    if pingpong and _dlkernel_capability() not in (9, 12):
         pytest.skip("pingpong is an SM90/SM120 schedule")
     device = "cuda"
     torch.random.manual_seed(17)
@@ -1899,7 +1899,7 @@ def test_epi_mod_scaled_exp_target():
     the target-logit ColVecSelect — the raw f32 accumulator at each row's
     target column (the linear-CE glue's exact Zy, no per-row dot recompute)
     alongside E / sum_exp / max_log2_out."""
-    from quack.epilogue.scaled_exp import scaled_exp_target_epi
+    from DLKernel.epilogue.scaled_exp import scaled_exp_target_epi
 
     _skip_unless_acc_prepass()
     device = "cuda"
@@ -1952,7 +1952,7 @@ def test_epi_mod_scaled_exp_target():
 @pytest.mark.parametrize("pingpong", [False, True])
 def test_epi_mod_qknorm_rope_prepass(pingpong, tma):
     _skip_unless_acc_prepass()
-    if pingpong and _quack_capability() not in (9, 12):
+    if pingpong and _dlkernel_capability() not in (9, 12):
         pytest.skip("pingpong is an SM90/SM120 schedule")
     device = "cuda"
     torch.random.manual_seed(18)
@@ -1998,7 +1998,7 @@ def test_epi_mod_qknorm_rope_prepass(pingpong, tma):
 def test_epi_mod_split_k_norm_gelu(split_k, split_k_mode):
     """Plain (non-prepass) epi mod under fused split-K: row/col operands and an
     aux output must ride the finalizing split's epilogue only."""
-    from quack.gemm_config import SplitKMode
+    from DLKernel.gemm_config import SplitKMode
 
     device = "cuda"
     torch.random.manual_seed(23)
@@ -2037,7 +2037,7 @@ def test_epi_mod_qknorm_prepass_split_k(split_k, split_k_mode):
     per-head RMS stats must match the full-K reference (this is the lifted
     'acc prepass reads the raw accumulator' restriction)."""
     _skip_unless_acc_prepass()
-    from quack.gemm_config import SplitKMode
+    from DLKernel.gemm_config import SplitKMode
 
     device = "cuda"
     torch.random.manual_seed(29)
@@ -2075,7 +2075,7 @@ def test_epi_mod_qknorm_prepass_split_k(split_k, split_k_mode):
 def test_epi_mod_qknorm_rope_prepass_split_k():
     """Prepass + TMA-staged rope table + fused serial split-K in one kernel."""
     _skip_unless_acc_prepass()
-    from quack.gemm_config import SplitKMode
+    from DLKernel.gemm_config import SplitKMode
 
     device = "cuda"
     torch.random.manual_seed(31)
@@ -2117,7 +2117,7 @@ def test_epi_mod_qknorm_rope_prepass_split_k():
 
 
 def test_epi_mod_split_k_separate_rejected():
-    from quack.gemm_config import SplitKMode
+    from DLKernel.gemm_config import SplitKMode
 
     device = "cuda"
     A = torch.empty((1, 128, 512), device=device, dtype=torch.bfloat16)
@@ -2371,7 +2371,7 @@ def test_epi_mod_varlen_rope():
 
 
 def test_semantic_key_fail_closed_and_protocol():
-    """Unsupported captures are rejected loudly; __quack_semantic_key__ opts
+    """Unsupported captures are rejected loudly; __dlkernel_semantic_key__ opts
     types in; partials/dataclasses key by content (the old best-effort walk
     keyed all partials identically — a silent-collision bug)."""
     import dataclasses
@@ -2386,7 +2386,7 @@ def test_semantic_key_fail_closed_and_protocol():
         return epi
 
     # 1. Reject: a bare object has no stable semantic representation.
-    with pytest.raises(TypeError, match="__quack_semantic_key__"):
+    with pytest.raises(TypeError, match="__dlkernel_semantic_key__"):
         mint(object())
 
     # 2. Protocol: key changes with the returned value, not object identity.
@@ -2394,7 +2394,7 @@ def test_semantic_key_fail_closed_and_protocol():
         def __init__(self, base):
             self.base = base
 
-        def __quack_semantic_key__(self):
+        def __dlkernel_semantic_key__(self):
             return ("tablecfg", self.base)
 
     d1 = mint(TableCfg(10000.0)).semantic_digest
@@ -2416,7 +2416,7 @@ def test_semantic_key_fail_closed_and_protocol():
 
     # 5. EpiOps implement the protocol as their cache identity.
     op = ColVecReduce("s", combine="max")
-    assert op.__quack_semantic_key__() == op.cache_key()
+    assert op.__dlkernel_semantic_key__() == op.cache_key()
 
 
 def test_semantic_digest_ignores_extern_library_state():
@@ -2425,12 +2425,12 @@ def test_semantic_digest_ignores_extern_library_state():
     on the first traced op, so a digest that recursed into cutlass function
     globals differed between "before any compile" and "after a compile" in the
     same process: async-compile workers (which typically compile other keys
-    before their lazy first import of quack.epilogue.library) then rejected every
+    before their lazy first import of DLKernel.epilogue.library) then rejected every
     module-global epilogue ref as "changed while resolving" and every one of
     those keys fell back to an in-process compile."""
     import cutlass._mlir_helpers.op as _op
 
-    from quack.activation import gelu_tanh_approx
+    from DLKernel.activation import gelu_tanh_approx
 
     def mint():
         @gemm_epilogue()
@@ -2458,7 +2458,7 @@ def test_semantic_digest_ignores_extern_library_state():
 def test_epi_mod_multi_output_mixed_dtype():
     """Tier-1 unlock: several TileStores from one epilogue, mixed dtypes —
     each op derives its own dtype/copy-atom (no singular aux_out_dtype)."""
-    from quack.activation import gelu_tanh_approx, relu
+    from DLKernel.activation import gelu_tanh_approx, relu
 
     device = "cuda"
     torch.random.manual_seed(11)
@@ -2502,7 +2502,7 @@ _rowsum_mod = gemm_epilogue(reduces={"colsum": RowVecReduce("colsum", scaled=Tru
 def test_epi_mod_rowvec_reduce(batched, m, tile_M, tile_N, pingpong):
     """First RowVecReduce consumer: per-column partials (l, m_tiles, n) of a
     scaled (acc, y) fold — the dgamma building block."""
-    if tile_M == 192 and _quack_capability() in (10, 11):
+    if tile_M == 192 and _dlkernel_capability() in (10, 11):
         pytest.skip("tile_M=192 has no SM100/SM110 tcgen05 MMA M-mode (64/128 only)")
     device = "cuda"
     torch.random.manual_seed(21)
@@ -2638,7 +2638,7 @@ def test_epi_mod_rstd_rope_posfreq(with_rstd, tile_N):
     = exactly rstd*acc via zero-freq columns."""
     device = "cuda"
     torch.random.manual_seed(24)
-    from quack.epilogue.rotary import rstd_rope_posfreq_epi
+    from DLKernel.epilogue.rotary import rstd_rope_posfreq_epi
 
     l, m, k, head_dim = 2, 384, 512, 64
     q_heads, kv_heads = 4, 2
@@ -2691,7 +2691,7 @@ def test_epi_mod_rstd_gated_preact(activation):
     unscaled preact pairs, postact = gate(rstd * pairs)."""
     device = "cuda"
     torch.random.manual_seed(25)
-    from quack.epilogue.library import rstd_gated_preact_mod
+    from DLKernel.epilogue.library import rstd_gated_preact_mod
 
     l, m, k, pairs = 2, 384, 512, 512
     n = 2 * pairs
@@ -2728,7 +2728,7 @@ def test_epi_mod_dgated_rstd_preact(tile_N, activation):
     partials -> drstd. All three checked against torch autograd."""
     device = "cuda"
     torch.random.manual_seed(26)
-    from quack.epilogue.library import dgated_rstd_preact_mod
+    from DLKernel.epilogue.library import dgated_rstd_preact_mod
 
     l, m, n, k = 2, 384, 1536, 512
     ds_in = torch.randn((l, m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
@@ -2771,7 +2771,7 @@ def test_epi_mod_rstd_lse(regime):
     sharp OOB-predication regression (see test_epi_mod_online_lse)."""
     device = "cuda"
     torch.random.manual_seed(27)
-    from quack.epilogue.library import rstd_lse_epi
+    from DLKernel.epilogue.library import rstd_lse_epi
 
     l, m, n, k = 2, 384, 1160, 512  # ragged last N tile (1160 = 4*256 + 136)
     tile_N = 256
@@ -2829,7 +2829,7 @@ def test_epi_mod_ln_affine(activation):
     t*wg + wb (+ activation postact for fc1)."""
     device = "cuda"
     torch.random.manual_seed(28)
-    from quack.epilogue.library import ln_affine_act_mod, ln_affine_epi
+    from DLKernel.epilogue.library import ln_affine_act_mod, ln_affine_epi
 
     m, n, k = 384, 1024, 512
     A = torch.randn((m, k), device=device, dtype=torch.bfloat16) / math.sqrt(k) * 4
@@ -2858,7 +2858,7 @@ def test_epi_mod_ln_partial():
     apply + DUAL colvec stats (sum and sqsum partials -> mu/sig)."""
     device = "cuda"
     torch.random.manual_seed(29)
-    from quack.epilogue.library import ln_partial_epi
+    from DLKernel.epilogue.library import ln_partial_epi
 
     m, n, k = 384, 1024, 512
     tile_N = 256
@@ -2900,7 +2900,7 @@ def test_epi_mod_dact_ln_stats(activation, sinks):
     the same references at bf16-recovery tolerance."""
     device = "cuda"
     torch.random.manual_seed(30)
-    from quack.epilogue.library import dact_ln_stats_mod
+    from DLKernel.epilogue.library import dact_ln_stats_mod
 
     m, n, k = 384, 1024, 512
     tile_M, tile_N = 128, 256
@@ -2955,7 +2955,7 @@ def test_epi_mod_dact_dbias(activation):
     column-sums (contrast the deferred-org dact_ln_stats_mod)."""
     device = "cuda"
     torch.random.manual_seed(32)
-    from quack.epilogue.library import dact_dbias_mod
+    from DLKernel.epilogue.library import dact_dbias_mod
 
     m, n, k = 384, 1024, 512
     tile_M, tile_N = 128, 256
@@ -2990,7 +2990,7 @@ def test_epi_mod_ln_bwd_apply(sinks):
     The "dw" variant drops the dbias sink; dbias recovered as colsum of D."""
     device = "cuda"
     torch.random.manual_seed(31)
-    from quack.epilogue.library import ln_bwd_apply_mod
+    from DLKernel.epilogue.library import ln_bwd_apply_mod
 
     m, n, k = 384, 1024, 512
     tile_M, tile_N = 128, 256
@@ -3035,9 +3035,9 @@ def test_epi_mod_varlen_rowvec_sink():
     sequence-local tile indices colliding in a global partial buffer."""
     device = "cuda"
     torch.random.manual_seed(33)
-    from quack.cute_dsl_utils import get_device_capacity
-    from quack.epilogue.library import dact_dbias_mod
-    from quack.gemm_config import cta_tile_shape_m
+    from DLKernel.cute_dsl_utils import get_device_capacity
+    from DLKernel.epilogue.library import dact_dbias_mod
+    from DLKernel.gemm_config import cta_tile_shape_m
 
     m, n, k = 384, 1024, 512
     tile_M, tile_N = 128, 256
@@ -3085,7 +3085,7 @@ def test_epi_mod_varlen_rowvec_sink():
 
     # Non-add M-fold combines are rejected under varlen (zero-filled OOB rows
     # are only an identity for add).
-    from quack.epilogue.library import identity_epi  # noqa: F401  (import check)
-    from quack.epilogue.ops import RowVecReduce
+    from DLKernel.epilogue.library import identity_epi  # noqa: F401  (import check)
+    from DLKernel.epilogue.ops import RowVecReduce
 
     assert RowVecReduce("x", combine="max_abs").combine != "add"

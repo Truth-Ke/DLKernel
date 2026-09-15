@@ -1,5 +1,5 @@
 # Copyright (c) 2025-2026, Tri Dao.
-"""Host-side tests for quack.pipeline_checks (no GPU required).
+"""Host-side tests for DLKernel.pipeline_checks (no GPU required).
 
 The rule functions encode mbarrier arrive-count protocol semantics; these tests pin the
 arithmetic against hand-derived counts for the real kernel configurations, and check
@@ -8,7 +8,7 @@ that violations raise with the facts in the message while dynamic legs are skipp
 
 import pytest
 
-from quack import pipeline_checks as pc
+from DLKernel import pipeline_checks as pc
 
 
 class FakeInt32:
