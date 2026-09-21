@@ -18,9 +18,11 @@ Mechanics that make the generic path work with the Autotuner:
   in-memory AND disk tuning caches; the wrapper ``__name__`` embeds it so the
   ``<fn>.autotune.json`` files stay human-attributable.
 * Reduce-sink buffers are tile-shaped ((l, m, n_tiles) / (l, m_tiles, n)):
-  callers allocate them at the sweep's worst case (``sink_arg_shapes``) and
-  the wrapper slices per config, so one buffer serves every tile size. The
-  winning slice is returned in ``TunedModGemm.sinks``.
+  the entry point allocates missing buffers at the sweep's worst case
+  (``sink_arg_shapes``), rejects undersized caller-owned buffers before the
+  shared tuner key is consulted, then slices the full buffer per config. One
+  buffer serves every tile size and the winning slice is returned in
+  ``TunedModGemm.sinks``.
 * mod.gemm validation errors (ValueError/TypeError) are rewrapped into
   RuntimeError: the bench loop only converts RuntimeError/MemoryError into an
   inf timing, and a config a prune rule missed must not abort the sweep.
@@ -44,7 +46,7 @@ candidate tiles). Not supported (yet): split_k.
 from __future__ import annotations
 
 import inspect
-from functools import partial
+
 from typing import NamedTuple
 
 import torch
@@ -80,7 +82,7 @@ def _config_space(mod, device):
         for c in get_all_configs(epilogue=hint)
         if c.device_capacity == cap
         # swap_ab rides swap-at-trace (2026-07-14): element-mode sink-less
-        # mods only, enforced in _prune_for_mod per call.
+        # mods only, enforced by GemmEpilogueTunePolicy host legality.
         and not (c.swap_ab and (mod.mode != "element" or mod.sinks))
         and not c.use_tma_gather  # gather_A untested through the fn frontend
         and (c.split_k is None or c.split_k == 1)  # split-K is default-epilogue-only
@@ -137,6 +139,45 @@ def sink_arg_shapes(mod, m, n_gemm, l=None, device="cuda", num_seqs=None):
     return shapes
 
 
+def _validate_full_sink_buffers(mod, epi_args, A, B, *, b_kn, A_idx, cu_seqlens_m, n_gemm):
+    """Enforce the shared-winner sink contract at the tuned-call boundary.
+
+    A policy key deliberately describes workload metadata, not the capacity of
+    a caller-owned scratch tensor. Every caller-supplied reduce sink therefore
+    has to cover the worst tile geometry in the candidate space. Missing sinks
+    are allocated here at that same worst-case shape; a larger caller
+    allocation is accepted and sliced per candidate. A partial allocation is
+    rejected before tuning or cache lookup so it can never poison a winner
+    shared by another call in the same key bucket.
+    """
+    if not mod.sinks:
+        return
+    m_gemm = A_idx.shape[0] if A_idx is not None else _gemm_mn(A, B, b_kn)[0]
+    l = A.shape[0] if A.ndim == 3 else None
+    num_seqs = None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1
+    required = sink_arg_shapes(
+        mod,
+        m_gemm,
+        n_gemm,
+        l=l,
+        device=A.device,
+        num_seqs=num_seqs,
+    )
+    for name, need in required.items():
+        value = epi_args.get(name)
+        if value is None:
+            epi_args[name] = torch.empty(tuple(need), dtype=torch.float32, device=A.device)
+            continue
+        if not hasattr(value, "shape"):
+            raise TypeError(f"sink '{name}' must be a tensor with shape at least {tuple(need)}")
+        actual = tuple(value.shape)
+        if len(actual) != len(need) or any(got < want for got, want in zip(actual, need)):
+            raise ValueError(
+                f"sink '{name}' is undersized for the tuned shared-winner contract: "
+                f"need at least {tuple(need)}, got {actual}; allocate sink_arg_shapes(...)"
+            )
+
+
 def _slice_sinks(mod, epi_args, config, lead, n_gemm, blockscaled=False, num_seqs=None):
     views = {}
     for name, op in mod.sinks.items():
@@ -157,62 +198,6 @@ def _slice_sinks(mod, epi_args, config, lead, n_gemm, blockscaled=False, num_seq
             ),
         )
     return views
-
-
-def _prune_for_mod(mod, transform_a, configs, named_args, **kwargs):
-    kwargs = named_args | kwargs
-    A, B = kwargs["A"], kwargs["B"]
-    n_full = transform_a.padded_n(B) if transform_a is not None else None
-    cap = get_device_capacity(A.device)[0]
-    A_idx = kwargs.get("A_idx")
-    m_gemm, n_gemm = _gemm_mn(A, B, kwargs.get("b_kn", False))
-    if A_idx is not None:
-        m_gemm = A_idx.shape[0]
-    has_out = bool(mod.outputs)
-    survivors = []
-    b_kn_call = kwargs.get("b_kn", False)
-    varlen_m = kwargs.get("cu_seqlens_m") is not None
-    varlen_or_gather = varlen_m or A_idx is not None
-    blockscaled = kwargs.get("SFA") is not None
-    has_concat = bool(kwargs.get("concat_layout"))
-    for conf in configs:
-        c = conf.kwargs["config"]
-        if c.device_capacity != cap:
-            continue
-        if not config_supports(c, gather_A=A_idx is not None, varlen_m=varlen_m):
-            continue
-        if transform_a is not None:
-            if not transform_a.config_ok(c):
-                continue
-            if n_full is not None and n_full % c.tile_m:
-                continue  # blob tiles kernel-M in whole CTA tiles
-        if blockscaled and not blockscaled_config_ok(c):
-            continue
-        if c.swap_ab and (
-            not b_kn_call or varlen_or_gather or has_concat or mod.mode != "element" or mod.sinks
-        ):
-            continue
-        if mod.mode == "acc_pair":
-            if c.tile_n % 2:
-                continue
-            if cap == 9 and has_out and c.tile_n % 32:
-                continue
-        ok = True
-        cta_tile_m = cta_tile_shape_m(c.tile_m, c.cluster_m, c.device_capacity, blockscaled)
-        for name, op in mod.sinks.items():
-            if getattr(op, "check_oob", True) is False:
-                ragged = n_gemm % c.tile_n if getattr(op, "dim", 0) == 0 else m_gemm % cta_tile_m
-                if ragged:
-                    ok = False
-            buf = kwargs.get(name)
-            alloc = getattr(op, "sink_alloc_shape", None)
-            if buf is not None and alloc is not None:
-                need = alloc(_lead(A, A_idx, m_gemm), n_gemm, cta_tile_m, c.tile_n)
-                if any(b < s for b, s in zip(buf.shape, need)):
-                    ok = False  # caller's partial buffer too small for this tiling
-        if ok:
-            survivors.append(conf)
-    return survivors
 
 
 def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
@@ -248,6 +233,7 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
             m_gemm = A_idx.shape[0]
         lead = _lead(A, A_idx, m_gemm)
         num_seqs = None if cu_seqlens_m is None else cu_seqlens_m.shape[0] - 1
+        cta_tile_m = cta_tile_shape_m(c.tile_m, c.cluster_m, c.device_capacity, SFA is not None)
         epi_args = {}
         for name in epi_names:
             v = epi_flat[name]
@@ -259,7 +245,7 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
                     alloc(
                         lead,
                         n_gemm,
-                        c.tile_m,
+                        cta_tile_m,
                         c.tile_n,
                         num_seqs=num_seqs if op_dim == 1 else None,
                     ),
@@ -360,8 +346,12 @@ def _get_tuner(mod, epi_names, has_c, device, transform_a=None, ta_names=()):
     )
     tuner = _MOD_TUNERS.get(key)
     if tuner is None:
+        from DLKernel.gemm_epilogue_tune_policy import GemmEpilogueTunePolicy
+
         tuner = Autotuner(
             _make_tuned_fn(mod, epi_names, transform_a, ta_names),
+            # key= stays the dense default key's only scalar channel; the
+            # policy's varlen bucket key carries them as named scalars.
             key=[
                 "mod_digest",
                 "b_kn",
@@ -372,7 +362,10 @@ def _get_tuner(mod, epi_names, has_c, device, transform_a=None, ta_names=()):
                 "transform_digest",
             ],
             configs=[AutotuneConfig(config=c) for c in _config_space(mod, device)],
-            prune_configs_by={"early_config_prune": partial(_prune_for_mod, mod, transform_a)},
+            policy=GemmEpilogueTunePolicy(
+                mod,
+                transform_a,
+            ),
             cache_results=True,
         )
         _MOD_TUNERS[key] = tuner
@@ -404,15 +397,35 @@ def tuned_mod_gemm(
     transform_sf=None,
     transform_operands=None,
 ):
-    """Autotuned ``mod.gemm``: sweep the arch's config space on the first call
-    per (mod, tensor metadata), then run the winner (warm calls replay through
-    mod.gemm's own plan cache). Reduce-sink buffers in ``epi_args`` must be
-    allocated at the sweep's worst case — see ``sink_arg_shapes``. Returns
-    TunedModGemm(plan, config, sinks) with the winning config's sink views."""
+    """Autotuned ``mod.gemm`` with a full-buffer sink contract.
+
+    The first call sweeps the arch's config space per (mod, tensor metadata),
+    then warm calls replay the winner through ``mod.gemm``'s plan cache.
+    Missing reduce sinks are allocated at the sweep's worst case (see
+    ``sink_arg_shapes``); undersized caller-owned buffers are rejected before
+    cache lookup.
+    Returns ``TunedModGemm(plan, config, sinks)`` with winning sink views.
+    """
+    # Keep caller-owned mappings immutable while allowing the tuner to fill in
+    # missing reduce sinks with its full worst-case scratch allocation.
+    epi_args = dict(epi_args)
     if transform_a is not None:
         from DLKernel.operand_transform.host import as_transform_mod
 
         transform_a = as_transform_mod(transform_a)
+    m_gemm, n_gemm = _gemm_mn(A, B, b_kn)
+    if transform_a is not None and transform_a.padded_n(B) is not None:
+        n_gemm = transform_a.padded_n(B)
+    _validate_full_sink_buffers(
+        mod,
+        epi_args,
+        A,
+        B,
+        b_kn=b_kn,
+        A_idx=A_idx,
+        cu_seqlens_m=cu_seqlens_m,
+        n_gemm=n_gemm,
+    )
     epi_names = tuple(sorted(epi_args))
     ta_names = tuple(sorted(transform_operands)) if transform_operands else ()
     assert not any(f"ta__{n}" in epi_args for n in ta_names)
@@ -438,9 +451,6 @@ def tuned_mod_gemm(
         **epi_args,
     )
     best = tuner.best_config.kwargs["config"]
-    m_gemm, n_gemm = _gemm_mn(A, B, b_kn)
-    if transform_a is not None and transform_a.padded_n(B) is not None:
-        n_gemm = transform_a.padded_n(B)
     if A_idx is not None:
         m_gemm = A_idx.shape[0]
     return TunedModGemm(

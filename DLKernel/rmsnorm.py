@@ -26,7 +26,7 @@ from DLKernel.reduce import row_reduce
 from DLKernel.reduction_base import ReductionBase
 from DLKernel.cache import jit_cache
 from DLKernel.cute_dsl_utils import torch2cute_dtype_map
-from DLKernel.autotuner import autotune, AutotuneConfig
+from DLKernel.autotuner import AutotuneConfig, TunePolicy, autotune
 from DLKernel.rmsnorm_config import (
     RmsNormBwdConfig,
     RmsNormFwdConfig,
@@ -506,10 +506,27 @@ def rmsnorm_fwd(
     return out, residual_out, rstd
 
 
+class RmsNormTunePolicy(TunePolicy):
+    """RMSNorm tune policy: deterministic config pruning only.
+
+    The TMA-fallback dedup in the prune callbacks removes configs whose
+    effective execution path is equivalent under the call's alignment/per_head
+    (see rmsnorm_config); that is legality/equivalence, not a performance
+    guess, so it overrides ``prepare_candidates`` and inherits the default
+    exact key and the full-candidate shortlist.
+    """
+
+    def __init__(self, early_config_prune):
+        self._early_config_prune = early_config_prune
+
+    def prepare_candidates(self, configs, named_args, kwargs):
+        return self._early_config_prune(configs, named_args, **kwargs)
+
+
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_fwd_configs()],
     key=["is_layernorm", "per_head"],
-    prune_configs_by={"early_config_prune": prune_invalid_rmsnorm_fwd_configs},
+    policy=RmsNormTunePolicy(prune_invalid_rmsnorm_fwd_configs),
 )
 def rmsnorm_fwd_tuned(
     x: Tensor,
@@ -1525,7 +1542,7 @@ def _(
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_bwd_configs()],
     key=["per_head", "has_dw_partial", "has_db_partial", "is_layernorm"],
-    prune_configs_by={"early_config_prune": prune_invalid_rmsnorm_bwd_configs},
+    policy=RmsNormTunePolicy(prune_invalid_rmsnorm_bwd_configs),
 )
 def rmsnorm_bwd_tuned(
     x: Tensor,

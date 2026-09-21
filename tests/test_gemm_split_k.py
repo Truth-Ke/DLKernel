@@ -262,7 +262,8 @@ def test_gemm_split_k_config_autotuner_surface():
     from dataclasses import replace
 
     from DLKernel.autotuner import AutotuneConfig
-    from DLKernel.gemm_interface import default_config, gemm_tuned, prune_invalid_gemm_configs
+    from DLKernel.gemm_interface import default_config, gemm_tuned
+    from DLKernel.gemm_tune_policy import prune_structural_gemm_configs
 
     m, n, k = 256, 512, 16384
     A, B = _make_inputs(m, n, k, None, torch.bfloat16)
@@ -285,12 +286,12 @@ def test_gemm_split_k_config_autotuner_surface():
 
     # Prune-hook expansion: split_k=None on a starved shape adds split-k variants...
     base = [AutotuneConfig(config=default_config(A.device))]
-    expanded = prune_invalid_gemm_configs(base, {"A": A, "B": B, "split_k": None})
+    expanded = prune_structural_gemm_configs(base, {"A": A, "B": B, "split_k": None})
     assert any(c.kwargs["config"].split_k > 1 for c in expanded), "no split-k variants expanded"
     # ...but a forced factor (or an unexposed knob) expands nothing.
-    forced = prune_invalid_gemm_configs(base, {"A": A, "B": B, "split_k": 2})
+    forced = prune_structural_gemm_configs(base, {"A": A, "B": B, "split_k": 2})
     assert all(c.kwargs["config"].split_k == 1 for c in forced)
-    no_knob = prune_invalid_gemm_configs(base, {"A": A, "B": B})
+    no_knob = prune_structural_gemm_configs(base, {"A": A, "B": B})
     assert all(c.kwargs["config"].split_k == 1 for c in no_knob)
 
 

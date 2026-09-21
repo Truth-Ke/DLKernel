@@ -174,6 +174,7 @@ from DLKernel.epilogue.ops import (
     VecLoad,
     VecReduce,
 )
+from DLKernel.epilogue.legality import validate_sink_config
 from DLKernel.epilogue.math import F2, F16Lanes, Pair, pack, unpack  # noqa: F401  (re-exports)
 from DLKernel.epilogue.visit import _EpiModMixinBase
 from DLKernel.gemm_runtime.host import (
@@ -975,14 +976,15 @@ class EpiMod:
                     varlen_m=varlen_m,
                     epi_args=epi_args,
                 )
-            if varlen_m and getattr(op, "dim", 0) == 1 and getattr(op, "combine", "add") != "add":
-                # Zero-filled OOB rows (the varlen ragged-load contract) are
-                # the identity for add only; a segment-max finalize would also
-                # break graph-safety.
-                raise ValueError(
-                    f"sink '{sink_name}': combine={op.combine!r} M-fold reduces are not "
-                    "supported under varlen_m"
-                )
+            validate_sink_config(
+                sink_name,
+                op,
+                m=m,
+                n=n_gemm,
+                tile_m=cta_tile_M,
+                tile_n=tile_N,
+                varlen_m=varlen_m,
+            )
             alloc = getattr(op, "sink_alloc_shape", None)
             if alloc is not None:
                 lead_k = (m,) if varlen_m or batch is None else (batch, m)
@@ -994,21 +996,6 @@ class EpiMod:
                     epi_args[sink_name],
                     alloc(lead_k, n_gemm, cta_tile_M, tile_N, num_seqs=num_seqs_k),
                 )
-            if getattr(op, "check_oob", True) is False:
-                # The reduce dim must be tile-divisible: dim 0 (colvec) reduces
-                # along N, dim 1 (rowvec) along M (varlen_m boundaries are
-                # always potentially ragged).
-                if getattr(op, "dim", 0) == 0:
-                    if n_gemm % tile_N:
-                        raise ValueError(
-                            f"sink '{sink_name}': check_oob=False requires N divisible by "
-                            f"tile_N (N={n_gemm}, tile_N={tile_N})"
-                        )
-                elif varlen_m or m % cta_tile_M:
-                    raise ValueError(
-                        f"sink '{sink_name}': check_oob=False requires M divisible by the "
-                        f"per-CTA tile and no varlen_m (M={m}, cta_tile_M={cta_tile_M})"
-                    )
             epi_values[sink_name] = epi_args[sink_name]
         for op in self.extra_ops:
             if op.name in epi_args:

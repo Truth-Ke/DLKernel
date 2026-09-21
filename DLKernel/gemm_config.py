@@ -160,6 +160,37 @@ def _get_sm90_configs(
     ]
 
 
+def get_sm90_dynamic_varlen_configs() -> List[GemmConfig]:
+    """Dynamic-persistent twins for the varlen K-group rule tree (SM90).
+
+    The SM90 dynamic tile scheduler claims one output tile at a time from a GMEM
+    semaphore (work-paced assignment).  On long-tail routed K the static
+    scheduler's cross-step interleaving lets K-skew widen the concurrent work-id
+    window past L2, tripling input read traffic; the dynamic claim keeps every
+    cluster's footprint at one tile.  On the production 768-expert wgrad shape
+    the two configs below measured -13.5% / -14.5% (up / down projection) with
+    bitwise-identical output, and they are the only dynamic configs that
+    evidence covers.  Appended to the varlen_k candidate pool by
+    ``gemm_interface.prune_invalid_gemm_configs``; the rule tree admits them on
+    the k-high leaf only (``varlen_selector.K_GROUP_TREE``), so dense and
+    varlen_m pools are unchanged.
+    """
+    return [
+        GemmConfig(
+            tile_m=256,
+            tile_n=128,
+            pingpong=False,
+            cluster_m=1,
+            cluster_n=2,
+            swap_ab=swap_ab,
+            device_capacity=9,
+            is_dynamic_persistent=True,
+            use_tma_gather=False,  # TMA gather not supported on SM90
+        )
+        for swap_ab in (False, True)
+    ]
+
+
 def _get_sm80_configs() -> List[GemmConfig]:
     tile_mn_warps_vals = [
         (128, 128, 4),

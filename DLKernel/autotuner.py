@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import math
 import os
 import sys
 import time
@@ -10,6 +11,7 @@ import inspect
 import base64
 import hashlib
 import json
+import fcntl
 from pathlib import Path
 from functools import cached_property, partial
 from typing import Dict, Tuple, List, Optional, Any
@@ -29,6 +31,68 @@ from . import __version__
 
 PACKAGE_NAME = "dlkernel"
 VERSION = __version__
+
+#: Historical L2-cold bench protocol, read off the helper so the two can never
+#: drift: dense calls always pass exactly these values.
+_BENCH_SIGNATURE = inspect.signature(_bench_cuda_graph_l2_rotate).parameters
+_DEFAULT_BENCH_WARMUP_MS = float(_BENCH_SIGNATURE["warmup_target_ms"].default)
+_DEFAULT_BENCH_TIMED_CALLS = int(_BENCH_SIGNATURE["n_timed_calls"].default)
+
+
+def _canonical_bench_budget() -> Tuple[float, int]:
+    """Parse and clamp the optional routed benchmark budget once per miss.
+
+    Invalid values fail closed with an actionable error instead of surfacing as
+    an unrelated ``ValueError`` from deep inside the benchmark loop.
+    """
+    warmup_name = f"{PACKAGE_NAME.upper()}_TUNE_WARMUP_MS"
+    calls_name = f"{PACKAGE_NAME.upper()}_TUNE_TIMED_CALLS"
+    raw_warmup = os.getenv(warmup_name)
+    raw_calls = os.getenv(calls_name)
+    if raw_warmup is None:
+        warmup = _DEFAULT_BENCH_WARMUP_MS
+    else:
+        try:
+            warmup = float(raw_warmup)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{warmup_name} must be a finite number in [10, 2000] ms") from exc
+        if not math.isfinite(warmup) or warmup < 0:
+            raise ValueError(f"{warmup_name} must be a finite number in [10, 2000] ms")
+    if raw_calls is None:
+        calls = _DEFAULT_BENCH_TIMED_CALLS
+    else:
+        try:
+            calls = int(raw_calls)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{calls_name} must be an integer in [16, 2000]") from exc
+        if calls < 0:
+            raise ValueError(f"{calls_name} must be an integer in [16, 2000]")
+    return min(max(warmup, 10.0), 2000.0), min(max(calls, 16), 2000)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment switch without treating ``"0"`` as true."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _tune_trace(message: str) -> None:
+    """Emit one line of opt-in tuning diagnostics (``DLKERNEL_DEBUG_TUNE=1``).
+
+    Cold-start tuning happens once per key and is otherwise silent, so a trace
+    hook is the only way to tell "tuned once" from "retuned on every call" or
+    "read the disk cache".  It is one ``getenv`` on the bench path, which runs
+    once per candidate, not per call.
+    """
+    if os.environ.get(f"{PACKAGE_NAME.upper()}_DEBUG_TUNE") == "1":
+        print(message, flush=True)
+
+
+def _key_digest(value: object) -> str:
+    """Stable short identifier for a tuning key, for cross-process diagnostics."""
+    return hashlib.sha256(repr(value).encode("utf-8")).hexdigest()[:16]
 
 
 def get_home_dir():
@@ -97,6 +161,63 @@ def _gpu_warmup(duration_ms=200):
 # ---------------------------------------------------------------------------
 
 
+class TunePolicy:
+    """Variation points for autotune semantics.
+
+    The tuner owns the execution lifecycle; a policy only describes cache
+    identity and candidate selection.  Methods intentionally receive plain
+    arguments so the cache-hit path does not need to allocate a rich context.
+
+    Onboarding a new operator family: subclass this, override only the hooks
+    that genuinely differ, and leave the rest inherited.
+
+    * ``make_key``       -- winner equivalence class / dynamic-shape bucketing.
+    * ``prepare_candidates`` -- deterministic candidate generation and
+      provably-safe legality pruning (may ADD configs, e.g. split-K variants).
+    * ``shortlist``      -- heuristic reduction allowed to lose performance,
+      never correctness; must return a non-empty subset of its input.
+    ``make_key``, ``prepare_candidates`` and ``shortlist`` are the three
+    candidate-policy hooks.  ``budget_override`` is deliberately only an
+    internal benchmark-protocol coordination point; it does not participate in
+    candidate correctness.
+
+    ``make_key`` must never synchronize (no ``.item()``/``.tolist()``/
+    ``.cpu()`` on device data): it runs on every cache-hit.  Policies do not
+    retain per-call state; the tuner hands the decorated signature to ``bind_signature``
+    once at construction.  See ``DLKernel/gemm_tune_policy.py`` (GEMM,
+    epilogue GEMM) and ``DLKernel/rmsnorm.py`` (RMSNorm) for the three
+    existing specialization levels.
+    """
+
+    def make_key(self, args, kwargs, default_key):
+        return default_key()
+
+    def bind_signature(self, arg_names, arg_defaults):
+        """Receive the decorated function signature when the tuner is built.
+
+        Policies are commonly constructed next to a decorator, before the
+        wrapped function is available.  This hook keeps that API ergonomic
+        while allowing policies that need canonical argument binding (for
+        example GEMM's varlen key) to receive the signature once.
+        """
+        signature = (tuple(arg_names), tuple(arg_defaults))
+        bound = getattr(self, "_bound_signature", None)
+        if bound is not None and bound != signature:
+            raise ValueError("TunePolicy signature is already bound to a different function")
+        self._bound_signature = signature
+
+    def budget_override(self, key):
+        """Whether this key opts into the routed/varlen bench budget."""
+        del key
+        return False
+
+    def prepare_candidates(self, configs, named_args, kwargs):
+        return configs
+
+    def shortlist(self, configs, named_args, kwargs):
+        return configs
+
+
 class Autotuner:
     def __init__(
         self,
@@ -104,15 +225,17 @@ class Autotuner:
         key,
         configs,
         restore_value=None,
-        prune_configs_by: Optional[Dict] = None,
         do_bench=None,
         cache_results=False,
+        policy=None,
     ):
         """
-        :param prune_configs_by: a dict of functions that are used to prune configs, fields:
-            'perf_model': performance model used to predicate running time with different configs, returns running time
-            'top_k': number of configs to bench
-            'prune_num_stages_by'(optional): a function used to prune num_stages. It takes configs:List[Config] as its input, and returns pruned configs.
+        :param policy: optional :class:`TunePolicy` describing this operator
+            family's tune semantics (winner key, deterministic candidate
+            preparation, heuristic shortlist).  ``None`` uses the base policy:
+            the default exact key and the full config list.  Operators with
+            varlen bucketing, legality pruning, or measured shortlists
+            subclass :class:`TunePolicy` and pass the instance here.
         """
         if not configs:
             self.configs = [AutotuneConfig()]
@@ -122,6 +245,10 @@ class Autotuner:
         self.keys = key
         self.cache: Dict[Tuple, AutotuneConfig] = {}
         self.arg_names = list(signature.parameters.keys())
+        self._arg_positions = {name: index for index, name in enumerate(self.arg_names)}
+        self.arg_defaults = tuple(
+            parameter.default for parameter in signature.parameters.values()
+        )
         self._arg_name_set = frozenset(self.arg_names)
         self.cache_results = (
             cache_results or os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_AUTOTUNING", None) == "1"
@@ -151,18 +278,36 @@ class Autotuner:
         else:
             self.post_hook = None
 
-        self.perf_model = None
-        self.configs_top_k = 1.0
-        self.early_config_prune = None
-        if prune_configs_by:
-            self.perf_model = prune_configs_by.get("perf_model", self.perf_model)
-            self.configs_top_k = prune_configs_by.get("top_k", self.configs_top_k)
-            self.early_config_prune = prune_configs_by.get(
-                "early_config_prune", self.early_config_prune
-            )
-
         self.fn = fn
         self._do_bench = do_bench
+        self.policy = policy or TunePolicy()
+        self.policy.bind_signature(tuple(self.arg_names), self.arg_defaults)
+        # Cache-hit hot path: the exact base policy contributes nothing (its
+        # make_key IS the default key and it never overrides the budget), so
+        # plain operators keep the historical inline path with zero extra
+        # indirection; custom policies pay one call per hook they use.
+        self._base_policy = type(self.policy) is TunePolicy
+        self._policy_make_key = self.policy.make_key
+        self._policy_budget_override = self.policy.budget_override
+        #: Set per call from ``policy.budget_override(key)``: True only when the
+        #: policy tuned this call under its own routed/varlen key.  The
+        #: environment bench-budget overrides are documented varlen-only and
+        #: hang off exactly this signal.
+        self._budget_override = False
+
+    def _bench_budget(self) -> Tuple[float, int]:
+        """``(warmup_ms, timed_calls)`` for the L2-cold protocol.
+
+        Dense calls always get the historical protocol.  Only a call whose
+        policy opted in via ``budget_override`` (a routed/varlen GEMM here)
+        may read a different budget, and only when the operator asked for one
+        through the environment; the values are clamped so a typo cannot turn tuning into a
+        no-op or an hour.  The varlen key includes the budget environment
+        settings, so changing the protocol does not reuse its old winner.
+        """
+        if not self._budget_override:
+            return _DEFAULT_BENCH_WARMUP_MS, _DEFAULT_BENCH_TIMED_CALLS
+        return _canonical_bench_budget()
 
     @cached_property
     def do_bench(self):
@@ -206,13 +351,24 @@ class Autotuner:
 
         if use_l2_cold:
             try:
-                return _bench_cuda_graph_l2_rotate(
+                # Cold-start tuning can be bounded independently of the
+                # steady-state benchmark protocol.  A shorter budget is only
+                # ever used when explicitly requested through the environment,
+                # so the historical 200 ms / 200-call protocol stays the
+                # default for every caller.  The varlen key separates budget
+                # settings: a 200-call and a 64-call sweep are not the same
+                # measurement.
+                warmup_target_ms, n_timed_calls = self._bench_budget()
+                timings = _bench_cuda_graph_l2_rotate(
                     self.fn,
                     l2_cold_arg_sets,
                     l2_cold_kwarg_sets,
                     extra_kwargs=config.all_kwargs(),
+                    warmup_target_ms=warmup_target_ms,
+                    n_timed_calls=n_timed_calls,
                     quantiles=(0.5, 0.2, 0.8),
                 )
+                return timings
             except (RuntimeError, MemoryError) as e:
                 # Narrow catch: only swallow GPU-side failures (smem
                 # overflow, kernel launch errors, OOM). Programming errors
@@ -246,7 +402,8 @@ class Autotuner:
                 self.post_hook(full_nargs, exception=None)
 
         try:
-            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            timings = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            return timings
         except Exception as e:
             if verbose:
                 print(f"Autotuning failed with {e}")
@@ -266,8 +423,8 @@ class Autotuner:
         cache = FileCacheManager(_base32(cache_key))
         file_name = f"{fn.__name__[:150]}.autotune.json"
         path = cache.get_file(file_name)
-        # There's an environment variable to force cache update
-        if path and not os.environ.get(f"{PACKAGE_NAME.upper()}_FORCE_CACHE_UPDATE", False):
+
+        def load_cached(path):
             str2config = {s: c for s, c in zip(config_str_list, configs)}
             with open(path, "r") as cached_configs:
                 timings = json.load(cached_configs)["configs_timings"]
@@ -275,53 +432,104 @@ class Autotuner:
                 self.cache[tuning_key] = builtins.min(timings, key=timings.get)
                 self.configs_timings = timings
                 self.bench_time = 0
+
+        # There's an environment variable to force cache update
+        force_update = _env_flag(f"{PACKAGE_NAME.upper()}_FORCE_CACHE_UPDATE")
+        if path and not force_update:
+            _tune_trace(
+                f"DLKERNEL_TUNE_DISK_HIT fn={fn.__name__} "
+                f"key={_key_digest(tuning_key)} path={path}"
+            )
+            load_cached(path)
             return
 
-        bench_fn()
-        cache.put(
-            json.dumps(
-                {
-                    # str(): the key tuple holds torch dtypes/shape tuples, and
-                    # this field is informational (only configs_timings is read back)
-                    "key": str(tuning_key),
-                    "configs_timings": [
-                        (str(config), timings) for config, timings in self.configs_timings.items()
-                    ],
-                }
-            ),
-            file_name,
-            binary=False,
+        # ``DLKERNEL_REQUIRE_TUNE_CACHE=1`` turns a cold key into an error
+        # instead of a bench: it is how a caller asserts "this shape was warmed
+        # before the run started" and refuses to pay tuning inside a step.
+        if os.environ.get(f"{PACKAGE_NAME.upper()}_REQUIRE_TUNE_CACHE") == "1":
+            raise RuntimeError(
+                f"Missing autotune cache for {fn.__name__}; prewarm this shape "
+                f"before the run starts (key={_key_digest(tuning_key)})"
+            )
+
+        # Multiple ranks commonly discover the same cold key concurrently.
+        # Serialize the expensive benchmark and re-check after acquiring the
+        # lock so only one rank searches the candidate set.
+        lock_path = os.path.join(cache.cache_dir, f"{file_name}.lock")
+        _tune_trace(
+            f"DLKERNEL_TUNE_DISK_MISS fn={fn.__name__} key={_key_digest(tuning_key)}"
         )
+        with open(lock_path, "a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            path = cache.get_file(file_name)
+            if path and not force_update:
+                load_cached(path)
+                return
+            bench_fn()
+            cache.put(
+                json.dumps(
+                    {
+                        "key": str(tuning_key),
+                        "configs_timings": [
+                            (str(config), timings) for config, timings in self.configs_timings.items()
+                        ],
+                    }
+                ),
+                file_name,
+                binary=False,
+                )
+
+    @staticmethod
+    def _validate_candidate_pipeline(prepared, shortlisted):
+        """Validate the policy contract before any compilation or benchmark."""
+        prepared = list(prepared)
+        shortlisted = list(shortlisted)
+        if not prepared:
+            raise RuntimeError("policy produced an empty candidate set during preparation")
+        if not shortlisted:
+            raise RuntimeError("policy produced an empty candidate set")
+        for index, candidate in enumerate(shortlisted):
+            if candidate not in prepared:
+                raise RuntimeError(
+                    f"policy shortlist candidate at index {index} is not in prepared candidates"
+                )
+            if candidate in shortlisted[:index]:
+                raise RuntimeError("policy shortlist contains duplicate candidates")
+        return prepared, shortlisted
 
     def __call__(self, *args, **kwargs):
         used_cached_result = True
         if len(self.configs) > 1:
-            # Cache-hit fast path: build the key straight from args/kwargs —
-            # this runs on EVERY tuned call, so no dict merges and no str()
-            # formatting (together measured ~26us/call for a medium GEMM's arg
-            # list). Plain-value tuples; stringified only when persisted to
-            # the disk cache (see check_disk_cache / cache.put). The merged
-            # named-args view is materialized only on a miss, for pruning.
-            key = [kwargs[k] for k in self.keys if k in kwargs]
-            arg_name_set = self._arg_name_set
-            for arg in args:
-                if isinstance(arg, Tensor):
-                    # tuple(arg.shape), not arg.shape: torch.Size would change the
-                    # str() of the key and invalidate on-disk autotune caches.
-                    key.append(tuple(arg.shape))
-                    # If stride != 0, 1, we just cache it as 2 (strides are never negative)
-                    key.append(tuple([s if s < 2 else 2 for s in arg.stride()]))
-                    key.append(arg.dtype)
-            for name, arg in kwargs.items():
-                if isinstance(arg, Tensor) and name in arg_name_set:
-                    key.append(tuple(arg.shape))
-                    key.append(tuple([s if s < 2 else 2 for s in arg.stride()]))
-                    key.append(arg.dtype)
-            key = tuple(key)
+            if self._base_policy:
+                key = None
+                self._budget_override = False
+            else:
+                key = self._policy_make_key(
+                    args,
+                    kwargs,
+                    lambda: self._default_key(args, kwargs),
+                )
+                self._budget_override = self._policy_budget_override(key)
+            if key is None:
+                # Cache-hit fast path: build the key straight from args/kwargs.
+                # This runs on every tuned call, so avoid dict merges and str()
+                # formatting. The merged named-args view is materialized only
+                # on a miss, for pruning.
+                key = self._default_key(args, kwargs)
+            named_args = dict(zip(self.arg_names, args))
             if key not in self.cache:
-                self.nargs = dict(zip(self.arg_names, args))
+                self.nargs = named_args
                 used_cached_result = False
-                pruned_configs = self.prune_configs(kwargs)
+                prepared_configs = self.policy.prepare_candidates(self.configs, self.nargs, kwargs)
+                prepared_input = list(prepared_configs)
+                prepared_snapshot = list(prepared_input)
+                shortlisted = self.policy.shortlist(prepared_input, self.nargs, kwargs)
+                if prepared_input != prepared_snapshot:
+                    raise RuntimeError("policy shortlist mutated the prepared candidate list")
+                prepared_configs, pruned_configs = self._validate_candidate_pipeline(
+                    prepared_input,
+                    shortlisted,
+                )
 
                 @torch.compiler.disable  # Don't want any tracing here
                 def benchmark():
@@ -349,6 +557,10 @@ class Autotuner:
                     )
 
                     bench_start = time.time()
+                    _tune_trace(
+                        f"DLKERNEL_TUNE_START fn={self.fn.__name__} "
+                        f"key={_key_digest(key)} configs={len(pruned_configs)}"
+                    )
                     verbose = os.getenv(f"{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING", None) == "1"
                     has_hooks = self.pre_hook is not None or self.post_hook is not None
                     timings = {}
@@ -371,8 +583,14 @@ class Autotuner:
                             except (RuntimeError, MemoryError):
                                 # Cloning failed (likely OOM at extreme N);
                                 # legacy do_bench path will be used by _bench.
+                                # The two protocols rank configs differently,
+                                # so say so instead of degrading silently.
                                 self._l2_cold_arg_sets = None
                                 self._l2_cold_kwarg_sets = None
+                                _tune_trace(
+                                    "DLKERNEL_TUNE_L2_CLONE_UNAVAILABLE "
+                                    f"fn={self.fn.__name__} falling back to legacy do_bench"
+                                )
                         else:
                             self._l2_cold_arg_sets = None
                             self._l2_cold_kwarg_sets = None
@@ -429,7 +647,7 @@ class Autotuner:
                             print(f"[{config}] -> {time_[0]:.3f}ms")
                     # Surface bench failures (configs returning inf timings)
                     # so smem-overflow / launch errors aren't silently masked.
-                    n_failed = sum(1 for t in timings.values() if t[0] == float("inf"))
+                    n_failed = sum(1 for t in timings.values() if not math.isfinite(float(t[0])))
                     if n_failed:
                         print(
                             f"DLKernel autotune: {n_failed}/{len(timings)} configs "
@@ -438,8 +656,21 @@ class Autotuner:
                             file=sys.stderr,
                         )
                     self.bench_time = bench_end - bench_start
-                    self.cache[key] = builtins.min(timings, key=timings.get)
+                    _tune_trace(
+                        f"DLKERNEL_TUNE_END fn={self.fn.__name__} "
+                        f"key={_key_digest(key)} seconds={self.bench_time:.3f}"
+                    )
                     self.configs_timings = timings
+                    finite_timings = {
+                        config: timing
+                        for config, timing in timings.items()
+                        if math.isfinite(float(timing[0]))
+                    }
+                    if not finite_timings:
+                        raise RuntimeError(
+                            f"all {len(timings)} candidates failed for {self.fn.__name__}{key}"
+                        )
+                    self.cache[key] = builtins.min(finite_timings, key=finite_timings.get)
 
                 if self.cache_results:
                     self.check_disk_cache(key, pruned_configs, benchmark)
@@ -463,31 +694,31 @@ class Autotuner:
         self.nargs = None
         return ret
 
-    def prune_configs(self, kwargs: Dict) -> List[Any]:
-        pruned_configs = self.configs
-        if self.early_config_prune:
-            pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)
-        if self.perf_model:
-            top_k = self.configs_top_k
-            if isinstance(top_k, float) and top_k <= 1.0:
-                top_k = int(len(self.configs) * top_k)
-            elif not isinstance(top_k, int):
-                # Slice index must be an integer
-                raise TypeError(
-                    "Error while pruning configs, top_k must be either 1) a float <= 1.0 or 2) an int"
-                )
-
-            if len(pruned_configs) > top_k:
-                est_timing = {
-                    config: self.perf_model(
-                        **self.nargs,
-                        **kwargs,
-                        **config.all_kwargs(),
-                    )
-                    for config in pruned_configs
-                }
-                pruned_configs = sorted(est_timing.keys(), key=lambda x: est_timing[x])[:top_k]
-        return pruned_configs
+    def _default_key(self, args, kwargs):
+        """Build the legacy exact metadata key with canonical named scalars."""
+        key = []
+        for name in self.keys:
+            if name in kwargs:
+                key.append(kwargs[name])
+                continue
+            position = self._arg_positions.get(name)
+            if position is not None and position < len(args):
+                key.append(args[position])
+                continue
+            default = self.arg_defaults[position] if position is not None else inspect.Parameter.empty
+            if default is not inspect.Parameter.empty:
+                key.append(default)
+        for arg in args:
+            if isinstance(arg, Tensor):
+                key.append(tuple(arg.shape))
+                key.append(tuple([s if s < 2 else 2 for s in arg.stride()]))
+                key.append(arg.dtype)
+        for name, arg in kwargs.items():
+            if isinstance(arg, Tensor) and name in self._arg_name_set:
+                key.append(tuple(arg.shape))
+                key.append(tuple([s if s < 2 else 2 for s in arg.stride()]))
+                key.append(arg.dtype)
+        return tuple(key)
 
 
 class AutotuneConfig:
@@ -523,7 +754,7 @@ class AutotuneConfig:
 
 
 def autotune(
-    configs, key=None, prune_configs_by=None, restore_value=None, do_bench=None, cache_results=True
+    configs, key=None, restore_value=None, do_bench=None, cache_results=True, policy=None,
 ):
     f"""
     Decorator for auto-tuning a function function.
@@ -538,10 +769,7 @@ def autotune(
     :type configs: list[AutotuneConfig]
     :param key: a list of argument names whose change in value will trigger the evaluation of all provided configs.
     :type key: list[str]
-    :param prune_configs_by: a dict of functions that are used to prune configs, fields:
-        'perf_model': performance model used to predicate running time with different configs, returns running time
-        'top_k': number of configs to bench
-        'early_config_prune'(optional): a function used to do early prune (eg, num_stages). It takes configs:List[Config] as its input, and returns pruned configs.
+    :param policy: optional TunePolicy for this operator family, see :class:`Autotuner`.
     :param restore_value: a list of argument names whose value will be restored after evaluating any configs.
     :type restore_value: list[str]
     :param do_bench: a benchmark function to measure the time of each run.
@@ -559,9 +787,9 @@ def autotune(
             key,
             configs,
             restore_value=restore_value,
-            prune_configs_by=prune_configs_by,
             do_bench=do_bench,
             cache_results=cache_results,
+            policy=policy,
         )
 
     return decorator

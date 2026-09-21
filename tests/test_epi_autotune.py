@@ -106,8 +106,11 @@ def test_tuned_mod_gemm_cache_hit(small_space):
 
 
 def test_prune_rules(small_space):
-    """acc_pair mods on SM90 with aux outputs only keep tile_N % 32 == 0; a
-    too-small caller sink buffer prunes the finer-tile configs."""
+    """Host legality is independent of caller sink capacity.
+
+    Sink buffers are validated once at the tuned-call boundary; capacity must
+    not change the candidate set or therefore the shared cache winner.
+    """
     if _cap() != 9:
         pytest.skip("prune-rule assertions are written for SM90")
     named = dict(
@@ -118,15 +121,152 @@ def test_prune_rules(small_space):
     from DLKernel.autotuner import AutotuneConfig
 
     confs = [AutotuneConfig(config=c) for c in small_space + [_cfg(128, 208)]]
-    surv = epi_autotune._prune_for_mod(rstd_swiglu_epi, None, confs, named)
+    from DLKernel.epilogue.legality import prune_epilogue_configs
+
+    surv = prune_epilogue_configs(rstd_swiglu_epi, None, confs, named)
     assert all(c.kwargs["config"].tile_n % 32 == 0 for c in surv), [
         c.kwargs["config"].tile_n for c in surv
     ]
-    # sink-buffer capacity rule: a buffer sized for tile_N=256 (4 tiles) drops
-    # the 128/192-tile configs.
+    # A partial buffer no longer prunes candidates. The tuned entry point
+    # rejects it before the policy/cache path is reached.
     small_buf = torch.empty((384, 4), device="cuda", dtype=torch.float32)
-    surv2 = epi_autotune._prune_for_mod(rms_fused, None, confs, named | dict(sqsum=small_buf))
-    assert {c.kwargs["config"].tile_n for c in surv2} == {256}
+    surv2 = prune_epilogue_configs(rms_fused, None, confs, named | dict(sqsum=small_buf))
+    assert surv2 == prune_epilogue_configs(rms_fused, None, confs, named)
+
+
+def test_full_sink_contract_rejects_partial_buffer(monkeypatch):
+    """Undersized caller-owned sinks fail before tuning/cache lookup."""
+
+    class Sink:
+        dim = 0
+
+        @staticmethod
+        def sink_alloc_shape(lead, n, tile_m, tile_n, num_seqs=None):
+            del tile_m, num_seqs
+            return (lead[-1], (n + tile_n - 1) // tile_n)
+
+    class Mod:
+        sinks = {"stats": Sink()}
+
+    config = GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        cluster_m=1,
+        cluster_n=1,
+        device_capacity=9,
+        is_dynamic_persistent=False,
+    )
+    monkeypatch.setattr(epi_autotune, "_config_space", lambda mod, device: [config])
+    A = torch.empty((256, 16))
+    B = torch.empty((128, 16))
+    with pytest.raises(ValueError, match="undersized.*shared-winner"):
+        epi_autotune._validate_full_sink_buffers(
+            Mod(),
+            {"stats": torch.empty((128, 1))},
+            A,
+            B,
+            b_kn=False,
+            A_idx=None,
+            cu_seqlens_m=None,
+            n_gemm=128,
+        )
+    allocated = {}
+    epi_autotune._validate_full_sink_buffers(
+        Mod(),
+        allocated,
+        A,
+        B,
+        b_kn=False,
+        A_idx=None,
+        cu_seqlens_m=None,
+        n_gemm=128,
+    )
+    assert tuple(allocated["stats"].shape) == (256, 1)
+
+
+def test_tuned_wrapper_slices_sink_with_per_cta_tile_m():
+    """SM100 2-CTA configs expose half of config.tile_m to each CTA sink."""
+
+    class Sink:
+        dim = 1
+
+        @staticmethod
+        def sink_alloc_shape(lead, n, tile_m, tile_n, num_seqs=None):
+            return (tile_m,)
+
+    class Mod:
+        _ident = "sink_tile_probe"
+        sinks = {"sink": Sink()}
+
+        def __init__(self):
+            self.seen_shape = None
+
+        def gemm(self, A, B, D, C, *, epi_args, **kwargs):
+            self.seen_shape = tuple(epi_args["sink"].shape)
+            return "plan"
+
+    mod = Mod()
+    fn = epi_autotune._make_tuned_fn(mod, ("sink",))
+    config = GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        cluster_m=2,
+        cluster_n=1,
+        device_capacity=10,
+        is_dynamic_persistent=False,
+    )
+
+    result = fn(
+        A=torch.empty((16, 4)),
+        B=torch.empty((8, 4)),
+        D=torch.empty((16, 8)),
+        sink=torch.empty((128,)),
+        config=config,
+    )
+
+    assert result == "plan"
+    assert mod.seen_shape == (64,)
+
+
+def test_epilogue_prune_sizes_varlen_m_sink_with_num_sequences(monkeypatch):
+    """The pruning capacity check must use the same varlen allocation contract
+    as frontend validation and the actual tuned wrapper."""
+
+    class Sink:
+        dim = 1
+        check_oob = True
+
+        @staticmethod
+        def sink_alloc_shape(lead, n, tile_m, tile_n, num_seqs=None):
+            assert num_seqs == 4
+            return (lead[-1] // tile_m + num_seqs, n)
+
+    class Mod:
+        mode = "element"
+        outputs = ()
+        sinks = {"sink": Sink()}
+
+    monkeypatch.setattr(epi_autotune, "get_device_capacity", lambda device: (10, 0))
+    config = GemmConfig(
+        tile_m=128,
+        tile_n=128,
+        cluster_m=2,
+        cluster_n=1,
+        device_capacity=10,
+        is_dynamic_persistent=False,
+    )
+    conf = epi_autotune.AutotuneConfig(config=config)
+    named = {
+        "A": torch.empty((128, 16)),
+        "B": torch.empty((32, 16)),
+        "b_kn": False,
+        "cu_seqlens_m": torch.zeros((5,), dtype=torch.int32),
+        "sink": torch.empty((6, 32)),
+    }
+
+    from DLKernel.epilogue.legality import prune_epilogue_configs
+
+    assert prune_epilogue_configs(Mod(), None, [conf], named, device_capacity=(10, 0)) == [conf]
 
 
 def test_mod_digest_in_disk_key(small_space):
@@ -197,3 +337,58 @@ def test_tuned_w4_transform(small_space):
     assert not res.config.pingpong  # config_ok pruned the pingpong candidate
     ref = act.float() @ wd.float().t()
     assert (D.float() - ref).abs().max().item() < 2e-2 * ref.abs().max().item()
+
+
+def test_varlen_epilogue_reuses_winner_within_bucket(small_space):
+    """E1 end-to-end: two varlen_m calls in the same average-rows bucket share
+    one tuned winner (exact shapes of D/sink buffers differ); a dense call on
+    the same tuner stays on the default exact key."""
+    device = "cuda"
+    torch.random.manual_seed(43)
+    l, n, k = 2, 512, 256
+    B = torch.randn((l, n, k), device=device, dtype=torch.bfloat16) / 16
+    weight = torch.randn((l, n), device=device, dtype=torch.float32)
+
+    def run(total_m):
+        # avg rows/expert = 1300 / 1350 -> both bucket 2048, same leaf.
+        A = torch.randn((total_m, k), device=device, dtype=torch.bfloat16) / 16
+        D = torch.empty((total_m, n), device=device, dtype=torch.bfloat16)
+        premult = torch.empty_like(D)
+        # Packed 2D varlen layout: no batch lead, sinks follow (m, n_tiles).
+        shapes = sink_arg_shapes(rms_fused, total_m, n, num_seqs=l)
+        sqsum = torch.empty(shapes["sqsum"], device=device, dtype=torch.float32)
+        cu = torch.zeros(l + 1, device=device, dtype=torch.int32)
+        for i in range(1, l + 1):
+            cu[i] = total_m * i // l
+        res = tuned_mod_gemm(
+            rms_fused,
+            A,
+            B,
+            D,
+            epi_args=dict(weight=weight, premult=premult, sqsum=sqsum),
+            cu_seqlens_m=cu,
+        )
+        return res, D, premult, sqsum
+
+    res1, D1, premult1, sqsum1 = run(2 * 1300)
+    tuner = next(iter(epi_autotune._MOD_TUNERS.values()))
+    assert tuner._budget_override is True  # varlen epilogue opts into budget env
+    assert len(tuner.cache) == 1
+    bench_time = tuner.bench_time
+
+    res2, _, _, _ = run(2 * 1350)
+    assert len(tuner.cache) == 1, "same bucket must reuse the tuned winner"
+    assert tuner.bench_time == bench_time  # no re-bench
+    assert res2.config == res1.config
+
+    # A dense call on the same tuner stays on the exact default key (m != n:
+    # m == n would make the 'weight' operand's row/col inference ambiguous).
+    m_dense = 384
+    A = torch.randn((l, m_dense, k), device=device, dtype=torch.bfloat16) / 16
+    D = torch.empty((l, m_dense, n), device=device, dtype=torch.bfloat16)
+    premult = torch.empty_like(D)
+    shapes = sink_arg_shapes(rms_fused, m_dense, n, l=l)
+    sqsum = torch.empty(shapes["sqsum"], device=device, dtype=torch.float32)
+    tuned_mod_gemm(rms_fused, A, B, D, epi_args=dict(weight=weight, premult=premult, sqsum=sqsum))
+    assert len(tuner.cache) == 2  # dense keyed separately, budget not overridden
+    assert tuner._budget_override is False

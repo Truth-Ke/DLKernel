@@ -1,12 +1,13 @@
 # Copyright (c) 2025, Tri Dao
-from dataclasses import replace
-from typing import NamedTuple, Optional, Tuple, Literal
+import os
 from functools import partial
+from typing import NamedTuple, Optional, Tuple, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from DLKernel.varlen_selector import VarlenGemmTunePolicy
 from DLKernel.blockscaled.operand import (
     BlockScaledFormat,
     BlockScaledOperand,
@@ -19,10 +20,7 @@ from DLKernel.blockscaled.operand import (
 from DLKernel.gemm_config import (
     GemmConfig,
     SplitKMode,
-    blockscaled_config_ok,
     blockscaled_default_config,
-    config_supports,
-    cta_tile_shape_m,
     default_config,
     get_all_configs,
 )
@@ -38,7 +36,10 @@ from DLKernel.gemm_iface import (
     run_variant,
 )
 from DLKernel.gemm_tvm_ffi_utils import tensor_key, scalar_mode
-from DLKernel.gemm_symmetric import gemm_symmetric as gemm_symmetric_dispatch, run_gemm_symmetric_plan
+from DLKernel.gemm_symmetric import (
+    gemm_symmetric as gemm_symmetric_dispatch,
+    run_gemm_symmetric_plan,
+)
 from DLKernel.rms_final_reduce import rms_final_reduce
 from DLKernel.rounding import RoundingMode
 
@@ -368,104 +369,10 @@ def nvmmh_config(A, B, device_capacity):
         return None
 
 
-def _expand_split_k_configs(configs, A, B, device_capacity, blockscaled=False):
-    """Add split_k > 1 variants of each surviving config for occupancy-starved shapes.
-
-    Only called when the user passed split_k=None ("let the autotuner choose the
-    factor"). Candidates are powers of two that lift the CTA count toward saturation
-    without over-decomposing K; the autotuner then picks by measurement. The split
-    MODE is never expanded (serial/parallel/staged differ in determinism semantics).
-    """
-    if A.ndim == 3:
-        L, M, K = A.shape
-    else:
-        (M, K), L = A.shape, 1
-    N = B.shape[-1]
-    sm_count = torch.cuda.get_device_properties(A.device).multi_processor_count
-    expanded = list(configs)
-    for conf in configs:
-        c = conf.kwargs["config"]
-        cta_tile_m = cta_tile_shape_m(c.tile_m, c.cluster_m, device_capacity, blockscaled)
-        tile_m, tile_n = (cta_tile_m, c.tile_n) if not c.swap_ab else (c.tile_n, cta_tile_m)
-        ntiles = -(-M // tile_m) * -(-N // tile_n) * L
-        k_tiles = -(-K // (c.tile_k or 64))
-        for s in (2, 4, 8, 16):
-            starved = ntiles < sm_count and ntiles * s <= 4 * sm_count
-            if starved and 2 * s <= k_tiles:
-                expanded.append(AutotuneConfig(config=replace(c, split_k=s)))
-    return expanded
-
-
-def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
-    kwargs = named_args | kwargs
-    device_capacity = get_device_capacity(kwargs["A"].device)[0]
-    configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
-    gather_A = kwargs.get("A_idx", None) is not None
-    varlen_m = kwargs.get("cu_seqlens_m", None) is not None
-    varlen_k = kwargs.get("cu_seqlens_k", None) is not None
-    configs = [
-        conf
-        for conf in configs
-        if config_supports(conf.kwargs["config"], gather_A=gather_A, varlen_m=varlen_m)
-    ]
-    # use_tma_gather only valid when gather_A is active on SM100/SM110
-    if not gather_A or device_capacity not in [10, 11]:
-        configs = [conf for conf in configs if not conf.kwargs["config"].use_tma_gather]
-    if kwargs.get("SFA", None) is not None:  # blockscaled (SM100 tcgen05 MMA constraints)
-        configs = [conf for conf in configs if blockscaled_config_ok(conf.kwargs["config"])]
-    if (
-        kwargs.get("SFD", None) is not None or kwargs.get("SFDCol", None) is not None
-    ):  # quantized output (SM100 SFD epilogue)
-        col_only = kwargs.get("SFDCol", None) is not None
-
-        def _sfd_ok(c: GemmConfig) -> bool:
-            if c.swap_ab:  # SFD assumes N-major D and un-swapped N
-                return False
-            if c.device_capacity in (10, 11):
-                # tile_n % 64 keeps the epi tile N at 32/64, covering whole SF
-                # vectors for both vec sizes (32 for mx, 16 for nvfp4). The CTA
-                # tile M must be 128 (the (4,1) epilogue warp shape, one full epi
-                # row per thread): tile_m 128 with an even cluster_m selects the
-                # 2-CTA MMA whose 64-row CTA tile uses the (2,2) warp shape,
-                # splitting SF vectors across threads (and producing strided
-                # fixup epi tiles the SF atom layout cannot divide).
-                return (
-                    c.tile_n % 64 == 0
-                    and c.tile_m in (128, 256)
-                    and not (c.tile_m == 128 and c.cluster_m % 2 == 0)
-                )
-            if c.device_capacity == 12:
-                if col_only:
-                    # Col vectors run along M: the 64-row epi tile covers
-                    # whole 32-row vectors; the tile must divide into epi
-                    # subtiles for the per-subtile SF flush.
-                    return c.tile_m % 64 == 0
-                # SM90-style register epilogue: epi tile N = gcd(32|64, tile_n)
-                # must cover whole SF vectors (tile_n % 32 covers both vec
-                # sizes), and the epi tile M must divide the 128-row SF pad
-                # (excludes the 192-row epi tile of 192-multiple tile_m).
-                return c.tile_n % 32 == 0 and c.tile_m % 64 == 0 and c.tile_m % 192 != 0
-            return False
-
-        configs = [conf for conf in configs if _sfd_ok(conf.kwargs["config"])]
-    # Autotuned split-K: only the plain-gemm family exposes the knob; split_k=None means
-    # "tune the factor" (an explicit int is forced in gemm_tuned and needs no variants).
-    if (
-        "split_k" in kwargs
-        and kwargs["split_k"] is None
-        and not (varlen_m or varlen_k or gather_A)
-        and device_capacity in (9, 10, 11, 12)
-    ):
-        configs = _expand_split_k_configs(
-            configs, kwargs["A"], kwargs["B"], device_capacity, kwargs.get("SFA") is not None
-        )
-    return configs
-
-
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs()],
     key=["dynamic_scheduler", "split_k", "split_k_mode", "bs_format_a", "bs_format_b"],
-    prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
+    policy=VarlenGemmTunePolicy(),
 )
 def gemm_tuned(
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (M, total_K) if varlen_k or (whatever, K) if gather_A with varlen_m or (M, whatever) if gather_A with varlen_k
@@ -548,7 +455,7 @@ def gemm_tuned(
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
     if quant_out:
         # Explicit-config calls skip the autotune prune; re-assert the SFD
-        # constraint set (see _sfd_ok in prune_invalid_gemm_configs).
+        # constraint set (see prune_structural_gemm_configs in gemm_tune_policy).
         assert not config.swap_ab, "Quantized output (SFD) requires an un-swapped config"
         if config.device_capacity == 12:
             if SFDCol is not None:
