@@ -64,6 +64,118 @@ def test_jit_module_sees_live_flags():
     assert jit_module._state is DLKernel.cache
 
 
+def test_jit_cache_identity_separates_binary_targets_without_device_ordinal():
+    """The persistent object namespace must identify executable artifacts.
+
+    An autotune result can be correct while the compiled ``.o`` belongs to a
+    different CuTe target or dispatch architecture.  Conversely, two cards
+    with the same architecture must share artifacts even when
+    ``CUDA_VISIBLE_DEVICES`` remaps their ordinals.  This is deliberately a
+    pure-host test: it must not initialize CUDA or inspect tensor values.
+    """
+    from DLKernel.cache import jit as jit_module
+
+    base = jit_module._cache_environment_identity(
+        cute_dsl_arch="sm_90a",
+        dlkernel_arch="90",
+        physical_arch="sm_90a",
+        cuda_version="12.8",
+        torch_version="2.8.0",
+    )
+    target_changed = jit_module._cache_environment_identity(
+        cute_dsl_arch="sm_100a",
+        dlkernel_arch="90",
+        physical_arch="sm_90a",
+        cuda_version="12.8",
+        torch_version="2.8.0",
+    )
+    dispatch_changed = jit_module._cache_environment_identity(
+        cute_dsl_arch="sm_90a",
+        dlkernel_arch="100",
+        physical_arch="sm_90a",
+        cuda_version="12.8",
+        torch_version="2.8.0",
+    )
+    abi_changed = jit_module._cache_environment_identity(
+        cute_dsl_arch="sm_90a",
+        dlkernel_arch="90",
+        physical_arch="sm_90a",
+        cuda_version="13.0",
+        torch_version="2.8.0",
+    )
+
+    assert base != target_changed
+    assert base != dispatch_changed
+    assert base != abi_changed
+
+    # The helper has no GPU ordinal argument by design.  A CUDA_VISIBLE_DEVICES
+    # remap therefore cannot split artifacts that are executable on the same
+    # architecture.
+    assert base == jit_module._cache_environment_identity(
+        cute_dsl_arch="sm_90a",
+        dlkernel_arch="90",
+        physical_arch="sm_90a",
+        cuda_version="12.8",
+        torch_version="2.8.0",
+    )
+
+
+def test_jit_source_fingerprint_includes_cache_environment_identity(monkeypatch):
+    """Changing the effective target invalidates the source-fingerprint path."""
+    from DLKernel.cache import jit as jit_module
+
+    monkeypatch.setattr(jit_module, "_get_physical_arch", lambda: "sm_90a")
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_90a")
+    monkeypatch.setenv("DLKERNEL_ARCH", "90")
+    jit_module._compute_source_fingerprint.cache_clear()
+    first = jit_module._compute_source_fingerprint()
+
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+    jit_module._compute_source_fingerprint.cache_clear()
+    second = jit_module._compute_source_fingerprint()
+
+    assert first != second
+
+
+def test_jit_cache_identity_matches_gpu_blind_worker_defaults():
+    """A worker's derived ``90`` dispatch must match the parent's ``sm_90a``."""
+    from DLKernel.cache import jit as jit_module
+
+    parent = jit_module._cache_environment_identity(
+        physical_arch="sm_90a",
+        cuda_version="12.8",
+        torch_version="2.8.0",
+    )
+    worker = jit_module._cache_environment_identity(
+        cute_dsl_arch="sm_90a",
+        dlkernel_arch="90",
+        physical_arch=None,
+        cuda_version="12.8",
+        torch_version="2.8.0",
+    )
+    assert parent == worker
+
+
+def test_jit_cache_identity_matches_cpu_cross_compile_defaults():
+    """A dispatch-only CPU compile must derive the same target as its worker."""
+    from DLKernel.cache import jit as jit_module
+
+    parent = jit_module._cache_environment_identity(
+        dlkernel_arch="90",
+        physical_arch=None,
+        cuda_version="12.8",
+        torch_version="2.8.0",
+    )
+    worker = jit_module._cache_environment_identity(
+        cute_dsl_arch="sm_90a",
+        dlkernel_arch="90",
+        physical_arch=None,
+        cuda_version="12.8",
+        torch_version="2.8.0",
+    )
+    assert parent == worker
+
+
 # ---------------------------------------------------------------------------
 # Regression: lock-before-compile prevents the cold-cache convoy
 # ---------------------------------------------------------------------------

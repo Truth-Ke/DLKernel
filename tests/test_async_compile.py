@@ -436,3 +436,23 @@ def test_pool_arch_pin_survives_early_dsl_construction():
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
     assert result.returncode == 0 and "arch-pin-ok" in result.stdout, result.stderr
+
+
+def test_detect_arch_env_keeps_physical_dispatch_for_cross_target(monkeypatch):
+    """An explicit CuTe target must not replace physical dispatch metadata."""
+    import sys
+    import types
+
+    from DLKernel.cache.async_compile import _detect_arch_env
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda: (9, 0),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.delenv("DLKERNEL_ARCH", raising=False)
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")
+
+    assert _detect_arch_env() == ("90", "sm_100a")

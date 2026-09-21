@@ -144,16 +144,23 @@ def _detect_arch_env() -> tuple[Optional[str], Optional[str]]:
     """
     dlkernel_arch = os.environ.get("DLKERNEL_ARCH")
     cute_arch = os.environ.get("CUTE_DSL_ARCH")
-    if cute_arch is None:
-        try:
-            import torch
+    physical_arch = None
+    try:
+        import torch
 
-            if torch.cuda.is_available():
-                major, minor = torch.cuda.get_device_capability()
-                cc = f"{major}{minor}"
-                cute_arch = f"sm_{cc}a" if major >= 9 else f"sm_{cc}"
-        except Exception:
-            pass
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            cc = f"{major}{minor}"
+            physical_arch = f"sm_{cc}a" if major >= 9 else f"sm_{cc}"
+            if cute_arch is None:
+                cute_arch = physical_arch
+            if dlkernel_arch is None:
+                # CUTE_DSL_ARCH may intentionally cross-compile for a target
+                # different from the active device; dispatch still follows
+                # the physical capability unless explicitly overridden.
+                dlkernel_arch = cc
+    except Exception:
+        pass
     if cute_arch is None and dlkernel_arch is not None:
         # CPU-only box: the dispatch arch is the only target we have.
         from DLKernel.cute_dsl_utils import _parse_arch_str

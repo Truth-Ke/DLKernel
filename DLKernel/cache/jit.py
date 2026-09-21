@@ -21,6 +21,7 @@ import functools
 import hashlib
 import os
 import pickle
+import re
 import sys
 import tempfile
 import time
@@ -41,6 +42,10 @@ import DLKernel.cache as _state  # noqa: E402  (intentional partial-import; see 
 
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
+# Bump this when the object-loader/worker contract changes.  Old namespaces
+# remain on disk but are intentionally unreachable; deleting a user's cache is
+# neither necessary nor safe.
+_CACHE_FORMAT_VERSION = "jit-object-v2"
 CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 
@@ -64,6 +69,99 @@ def _hash_source_dir(h, root: Path) -> None:
         h.update(content)
 
 
+def _normalize_arch(arch: str | None) -> str:
+    """Canonicalize an architecture spelling without querying a device."""
+    if arch is None:
+        return "unknown"
+    text = arch.strip().lower()
+    match = re.fullmatch(r"(?:sm[_-]?)?(\d+)([af]?)", text)
+    if match is None:
+        # Keep an unexpected override visible in the namespace rather than
+        # silently mapping two distinct values to the same cache directory.
+        return text or "unknown"
+    return f"sm_{match.group(1)}{match.group(2)}"
+
+
+def _normalize_dispatch_arch(arch: str | None) -> str:
+    """Canonicalize dispatch capability spellings across parent and workers."""
+    normalized = _normalize_arch(arch)
+    match = re.fullmatch(r"sm_(\d+)([af]?)", normalized)
+    if match is not None and not match.group(2) and int(match.group(1)) >= 90:
+        # ``get_device_capability`` and DLKERNEL_ARCH expose only major/minor;
+        # the ``a`` suffix is a code-generation convention, not a dispatch
+        # distinction.  This makes a parent ``sm_90a`` and worker ``90`` share
+        # the same identity while keeping CUTE_DSL_ARCH target spelling exact.
+        return f"sm_{match.group(1)}a"
+    return normalized
+
+
+def _get_physical_arch() -> str | None:
+    """Return the active device capability as host metadata, if available.
+
+    This is intentionally a capability query only.  It does not inspect a
+    tensor, transfer data, allocate, or synchronize a stream.  Workers set
+    ``CUTE_DSL_ARCH`` before reaching this helper, so GPU-blind compilation
+    does not need a CUDA context.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return None
+    suffix = "a" if major >= 9 else ""
+    return f"sm_{major}{minor}{suffix}"
+
+
+def _get_torch_abi() -> tuple[str, str]:
+    """Return the PyTorch/CUDA ABI labels without touching tensor data."""
+    try:
+        import torch
+
+        return str(torch.version.cuda or "none"), str(torch.__version__)
+    except Exception:
+        return "unknown", "unknown"
+
+
+def _cache_environment_identity(
+    *,
+    cute_dsl_arch: str | None = None,
+    dlkernel_arch: str | None = None,
+    physical_arch: str | None = None,
+    cuda_version: str | None = None,
+    torch_version: str | None = None,
+) -> str:
+    """Describe only inputs that can change whether a cached object executes.
+
+    ``CUTE_DSL_ARCH`` is the code-generation target and ``DLKERNEL_ARCH`` is
+    the Python dispatch target.  A physical GPU ordinal is deliberately absent:
+    ``CUDA_VISIBLE_DEVICES`` may remap equivalent devices without changing the
+    generated code.  Optional arguments make this function deterministic and
+    easy to test without a CUDA runtime.
+    """
+    if cute_dsl_arch:
+        target = _normalize_arch(cute_dsl_arch)
+    elif physical_arch:
+        target = _normalize_arch(physical_arch)
+    else:
+        # CPU-only compilation derives its ptxas target from DLKERNEL_ARCH,
+        # matching async_compile._detect_arch_env's fallback.
+        target = _normalize_dispatch_arch(dlkernel_arch)
+    dispatch_source = dlkernel_arch or physical_arch or cute_dsl_arch
+    dispatch = _normalize_dispatch_arch(dispatch_source)
+    return ";".join(
+        (
+            f"format={_CACHE_FORMAT_VERSION}",
+            f"target={target}",
+            f"dispatch={dispatch}",
+            f"cuda={cuda_version or 'unknown'}",
+            f"torch={torch_version or 'unknown'}",
+        )
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def _compute_source_fingerprint() -> str:
     """Hash DLKernel + extra source dirs plus runtime ABI stamps into a fingerprint."""
@@ -71,6 +169,17 @@ def _compute_source_fingerprint() -> str:
     h.update(f"py{sys.version_info.major}.{sys.version_info.minor}".encode())
     h.update(f"cutlass={cutlass.__version__}".encode())
     h.update(f"tvm_ffi={tvm_ffi.__version__}".encode())
+    physical_arch = _get_physical_arch()
+    cuda_version, torch_version = _get_torch_abi()
+    h.update(
+        _cache_environment_identity(
+            cute_dsl_arch=os.environ.get("CUTE_DSL_ARCH"),
+            dlkernel_arch=os.environ.get("DLKERNEL_ARCH"),
+            physical_arch=physical_arch,
+            cuda_version=cuda_version,
+            torch_version=torch_version,
+        ).encode()
+    )
     # Hash the entire `DLKernel` package, not just `DLKernel/cache/`. Resolving via
     # the top-level package import keeps the fingerprint stable regardless of
     # where inside the package this file lives.
