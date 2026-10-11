@@ -15,7 +15,8 @@ dims may be symbolic (m, n, k, l, tile_m, tile_n, m_tiles, n_tiles). A
 plain-matmul baseline (same shapes, same output buffer) is timed alongside
 for the epilogue-overhead ratio.
 
-The production gemm_interface wrappers (gemm_rms, gemm_act, ...) are built
+The production gemm_interface wrappers (gemm_rms, gemm_with_activation,
+...) are built
 on these same mods; wrapper-level and autotuned benching lives in
 benchmark_gemm_epi.py / benchmark_gemm_autotuned.py.
 

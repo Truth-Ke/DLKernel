@@ -24,16 +24,14 @@ from DLKernel.blockscaled.quantize import nvfp4_per_tensor_scale
 from DLKernel.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
 from DLKernel.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
 from DLKernel.blockscaled.utils import blockscaled_quantize_dim0
+from DLKernel.gemm_base import GemmBase
 from DLKernel.gemm_interface import (
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
     gemm,
-    gemm_act,
     gemm_add,
     gemm_add_inplace,
     gemm_blockscaled_ref,
-    gemm_dact,
-    gemm_dgated,
     gemm_norm_act,
     gemm_rms,
     gemm_symmetric,
@@ -302,13 +300,13 @@ def test_blockscaled_gemm_add(fmt, batched):
 
 @pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("activation", ["relu_sq", "gelu_tanh_approx", "swiglu"])
-def test_blockscaled_gemm_act(fmt, activation):
-    """gemm_act / gemm_gated with blockscaled A/B, checked against the dequant reference."""
+def test_blockscaled_gemm_with_activation(fmt, activation):
+    """gemm_with_activation (act / gated) with blockscaled A/B, checked against the dequant reference."""
     _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
-    preact, postact = gemm_act(A, B, activation=activation, tuned=False)
+    preact, postact = GemmBase.gemm_with_activation(A, B, activation=activation, tuned=False)
     assert preact.dtype == torch.bfloat16 and postact.dtype == torch.bfloat16
     if activation == "swiglu":
         gate, up = ref_mm[..., ::2], ref_mm[..., 1::2]
@@ -328,14 +326,16 @@ def test_blockscaled_gemm_act(fmt, activation):
     assert rel_post < 1e-2, f"{fmt} {activation}: postact rel_err={rel_post}"
 
 
-def test_blockscaled_gemm_act_bias_no_preact():
+def test_blockscaled_gemm_with_activation_bias_no_preact():
     """Bias broadcast + store_preact=False on the blockscaled act path."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
     bias = torch.randn(n, dtype=torch.float32, device="cuda")
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
-    preact, postact = gemm_act(A, B, bias=bias, activation="relu", store_preact=False, tuned=False)
+    preact, postact = GemmBase.gemm_with_activation(
+        A, B, bias=bias, activation="relu", store_preact=False, tuned=False
+    )
     assert preact is None
     ref_post = F.relu(ref_mm + bias).to(torch.bfloat16)
     denom = ref_post.float().abs().max().item() + 1e-9
@@ -345,15 +345,17 @@ def test_blockscaled_gemm_act_bias_no_preact():
 
 @pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("activation", ["relu", "gelu_tanh_approx"])
-def test_blockscaled_gemm_dact(fmt, activation):
-    """gemm_dact with blockscaled A (dout) and B (weight): dout crosses the
-    mainloop quantized, PreAct rides the C slot in bf16."""
+def test_blockscaled_gemm_with_activation_grad(fmt, activation):
+    """gemm_with_activation_grad with blockscaled A (dout) and B (weight): dout
+    crosses the mainloop quantized, PreAct rides the C slot in bf16."""
     _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
     preact = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
     dout_ref = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
-    dx, postact = gemm_dact(A, B, preact, activation=activation, tuned=False)
+    dx, postact = GemmBase.gemm_with_activation_grad(
+        A, B, preact, activation=activation, tuned=False
+    )
     assert dx.dtype == torch.bfloat16 and postact.dtype == torch.bfloat16
     assert dx.shape == (m, n) and postact.shape == (m, n)
     preact_f = preact.float().requires_grad_(True)
@@ -365,10 +367,10 @@ def test_blockscaled_gemm_dact(fmt, activation):
 
 @pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
 @pytest.mark.parametrize("scale_reduce", [False, True])
-def test_blockscaled_gemm_dgated(fmt, scale_reduce):
-    """gemm_dgated with blockscaled A/B: the packed-C/D epilogue (interleaved
-    gate/up PreAct, 2*N-wide dx) on the blockscaled mainloop, optionally with
-    the colvec scale + reduce sinks."""
+def test_blockscaled_gemm_with_activation_grad_gated(fmt, scale_reduce):
+    """gemm_with_activation_grad (gated) with blockscaled A/B: the packed-C/D
+    epilogue (interleaved gate/up PreAct, 2*N-wide dx) on the blockscaled
+    mainloop, optionally with the colvec scale + reduce sinks."""
     _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     activation = "swiglu"
@@ -376,7 +378,7 @@ def test_blockscaled_gemm_dgated(fmt, scale_reduce):
     preact = torch.randn(m, 2 * n, device="cuda", dtype=torch.bfloat16)
     colvec_scale = torch.randn(m, device="cuda") if scale_reduce else None
     dout_ref = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
-    dx, postact, *rest = gemm_dgated(
+    dx, postact, *rest = GemmBase.gemm_with_activation_grad(
         A,
         B,
         preact,
@@ -919,7 +921,9 @@ def test_blockscaled_out_dtype_reserved():
         res = gemm(A, B, out_dtype=out_dtype, tuned=False)
         assert isinstance(res, BlockScaledOperand) and res.format.name == "mxfp8_e4m3"
     with pytest.raises(NotImplementedError, match="only supported by DLKernel.gemm"):
-        gemm_act(A, B, activation="relu", postact_dtype="mxfp8_e4m3", tuned=False)
+        GemmBase.gemm_with_activation(
+            A, B, activation="relu", postact_dtype="mxfp8_e4m3", tuned=False
+        )
     with pytest.raises(ValueError, match="unknown blockscaled format"):
         gemm(A, B, out_dtype="fp8", tuned=False)
 
@@ -948,7 +952,7 @@ def test_e5m2_from_parts_kernel():
 
 
 @pytest.mark.parametrize("activation", ["relu", "swiglu"])
-def test_gemm_act_per_tensor_scale_alpha(activation):
+def test_gemm_with_activation_per_tensor_scale_alpha(activation):
     """NVFP4 per-tensor scales compose with pre-activation alpha."""
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
@@ -971,7 +975,9 @@ def test_gemm_act_per_tensor_scale_alpha(activation):
     ).to(torch.bfloat16)
 
     def f(a, b):
-        return gemm_act(a, b, bias=bias, activation=activation, alpha=alpha, tuned=False)
+        return GemmBase.gemm_with_activation(
+            a, b, bias=bias, activation=activation, alpha=alpha, tuned=False
+        )
 
     for fn in (f, torch.compile(f, dynamic=False, fullgraph=True)):
         preact, postact = fn(xq, wq.mT)

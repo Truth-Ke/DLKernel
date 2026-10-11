@@ -24,13 +24,13 @@ import torch.nn.functional as F
 from DLKernel.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
 from DLKernel.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
 from DLKernel.cute_dsl_utils import get_device_capacity
+from DLKernel.gemm_base import GemmBase
 from DLKernel.gemm_config import GemmConfig
 from DLKernel.gemm_interface import (
     _prep_blockscaled,
     _sf_batch_canonicalize,
     _unpack_operand,
     gemm,
-    gemm_act,
     gemm_add,
     gemm_add_inplace,
     gemm_blockscaled_ref,
@@ -234,18 +234,18 @@ def test_sm120_mxfp8_gemm_add_tuned():
 
 @requires_sm120
 @pytest.mark.parametrize("activation", ["relu", "gelu_tanh_approx"])
-def test_sm120_mxfp8_gemm_act(activation):
-    """gemm_act with blockscaled A/B, checked against the dequant reference."""
+def test_sm120_mxfp8_gemm_with_activation(activation):
+    """gemm_with_activation with blockscaled A/B, checked against the dequant reference."""
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8_e4m3", m, n, k)
     act_fn = {
         "relu": F.relu,
         "gelu_tanh_approx": lambda x: F.gelu(x, approximate="tanh"),
     }[activation]
-    preact, postact = gemm_act(A, B, activation=activation, tuned=False)
+    preact, postact = GemmBase.gemm_with_activation(A, B, activation=activation, tuned=False)
     ref_post = act_fn(gemm_blockscaled_ref(A, B, out_dtype=torch.float32))
     rel = (postact.float() - ref_post).abs().max().item() / max(ref_post.abs().max().item(), 1e-6)
-    assert rel < 5e-3, f"gemm_act {activation}: rel_err={rel}"
+    assert rel < 5e-3, f"gemm_with_activation {activation}: rel_err={rel}"
 
 
 def _mixed_operand(fmt, rows, k, seed=0):

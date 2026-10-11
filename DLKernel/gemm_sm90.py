@@ -139,6 +139,10 @@ class GemmSm90(GemmTmaBase):
     """
 
     arch = 90
+    # Host-side class selection (GemmBase.select_gemm_class); SM120 must
+    # override this to its own set — applicability is never inherited from a
+    # mainloop-reuse subclass relation.
+    supported_sm_majors = (9,)
     # Base (pre-refinement) C-load stage depth in _compute_stages: SM90's TMA
     # epilogue dispatch policy StagesC = min(EpiTiles, 4). SM120 overrides to
     # 2 (its CUTLASS builder uses StagesC = StagesD = min(EpiTiles, 2) — the

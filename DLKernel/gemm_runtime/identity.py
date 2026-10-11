@@ -15,7 +15,11 @@ nothing from DLKernel at module level; anyone may import it):
   a traced call: Dynamo buffers global dict mutations as deferred side
   effects, so a trace-time write would be invisible to the fake-tensor pass);
 * :class:`GemmClassRef` / :class:`TransformARef` — picklable recipes that
-  cross the jit-cache boundary in place of dynamic classes / mod instances.
+  cross the jit-cache boundary in place of dynamic classes / mod instances;
+* ``KERNEL_VARIANT_CLASSES`` + :func:`register_kernel_variant_class` /
+  :func:`resolve_kernel_variant_class` — the neutral kernel_variant token ->
+  static Gemm class registry (built-in roles register at their module's
+  import; op bodies resolve at execution time; unknown tokens fail closed);
 """
 
 from __future__ import annotations
@@ -405,6 +409,50 @@ def resolve_gemm_class(ref: GemmClassRef):
             )
         obj = installed
     return obj._mint(*ref.mint_key)
+
+
+# kernel_variant token -> STATIC Gemm class, the wire side of
+# GemmBase.register_kernel_variant() / GemmBase.resolve_kernel_variant().
+# This module stays a leaf: it imports no Gemm class and nothing from
+# DLKernel at module level, so registering/resolving touches no CUDA state.
+# Registration happens ONLY through the explicit class-side entry at role
+# module import time — never via __init_subclass__, so type()-minted kernel
+# classes (which inherit the role) stay out of the table.
+KERNEL_VARIANT_CLASSES: dict[str, type] = {}
+
+
+def register_kernel_variant_class(token: str, cls: type) -> None:
+    """Map ``token`` to the static Gemm class ``cls``.
+
+    Same token + same class is idempotent (a role module re-imported, or an
+    eager re-registration). Same token + a different class is a registration
+    conflict — two roles sharing one wire token would make a compiled graph
+    run the wrong implementation — and leaves the table unchanged.
+    """
+    existing = KERNEL_VARIANT_CLASSES.get(token)
+    if existing is None:
+        KERNEL_VARIANT_CLASSES[token] = cls
+    elif existing is not cls:
+        raise ValueError(
+            f"kernel_variant {token!r} is already registered to "
+            f"{existing.__module__}.{existing.__qualname__}; "
+            f"{cls.__module__}.{cls.__qualname__} must declare its own token"
+        )
+
+
+def resolve_kernel_variant_class(token: str) -> type:
+    """The static Gemm class registered for ``token``.
+
+    Unknown tokens raise — resolution never falls back to a generic class: a
+    graph that crossed the op boundary carrying a token this process cannot
+    resolve must fail loudly, not run a different implementation.
+    """
+    try:
+        return KERNEL_VARIANT_CLASSES[token]
+    except KeyError:
+        raise ValueError(
+            f"unknown kernel_variant {token!r}; known: {sorted(KERNEL_VARIANT_CLASSES)}"
+        ) from None
 
 
 class TransformARef(NamedTuple):

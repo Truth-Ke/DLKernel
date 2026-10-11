@@ -476,7 +476,8 @@ def rms_bwd_entry_epi(acc, c, y, rstd, w):
 
 
 # --- Variant mod factories ----------------------------------------------------
-# The gemm_interface entry points (gemm_act / gemm_dact / gemm_norm_act /
+# The gemm_interface entry points (gemm_with_activation /
+# gemm_with_activation_grad / gemm_norm_act /
 # gemm_rms) ride these. The operand names (mAuxOut, mRowVecBroadcast,
 # mColVecBroadcast, mColVecReduce, sr_seed) are the wire names shared with
 # run_gemm_epi_plan epi_values and concat_layout keys.
@@ -525,7 +526,7 @@ _SR_OPS = (Scalar("sr_seed", dtype=Int32),)
 
 @functools.lru_cache(maxsize=None)
 def linear_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False, has_alpha=False):
-    """gemm_act/gemm_gated as a mod: D = alpha * acc (+ C + rowvec + colvec),
+    """``gemm_with_activation`` (gated via ``activation``) as a mod: D = alpha * acc (+ C + rowvec + colvec),
     aux = act(D). Math order matches apply_linear_epilogue: alpha scales the
     accumulator only (before C / rowvec / colvec), so ``act(alpha * A @ B)``
     is a pre-activation scale."""
@@ -631,7 +632,7 @@ def norm_act_mod(activation, *, gated, has_c, has_rowvec, has_colvec, sr=False, 
 
 @functools.lru_cache(maxsize=None)
 def dact_mod(activation, *, has_scale=False, has_reduce=False):
-    """gemm_dact as a mod: c is the preact, acc is dout; D = dx, aux = act(c).
+    """``gemm_with_activation_grad`` as a mod: c is the preact, acc is dout; D = dx, aux = act(c).
     Scale multiplies dout (dact is linear in it) and the postact; reduce
     accumulates postact * unscaled dout, matching dgated_mod."""
     dact = dact_fn_map[activation]
@@ -659,7 +660,7 @@ def dact_mod(activation, *, has_scale=False, has_reduce=False):
 
 @functools.lru_cache(maxsize=None)
 def dgated_mod(activation, *, has_scale, has_reduce):
-    """gemm_dgated as a mod: acc = dout (per pair), c = packed (x, y) preact.
+    """gated ``gemm_with_activation_grad`` as a mod: acc = dout (per pair), c = packed (x, y) preact.
     Reduce accumulates postact * unscaled dout; postact is scaled after."""
     dgate = dgate_fn_map[activation]
     params, body = ["c"], []

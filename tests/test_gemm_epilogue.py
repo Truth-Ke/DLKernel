@@ -99,99 +99,6 @@ def test_epi_mod_semantic_cache_key_and_resolver():
     assert cls._epi_mod_class_semantic_key == (_cache_add_mod.semantic_digest, mint_key)
 
 
-def test_epi_mod_local_payload_identity_and_consumption():
-    cloudpickle = pytest.importorskip("cloudpickle")  # noqa: F841
-    from DLKernel.cache.async_compile import PoolPayload
-    from DLKernel.gemm_runtime.identity import LOCAL_EPI_MODS, install_epi_mod_payload
-    from DLKernel.rounding import RoundingMode
-
-    def build():
-        @gemm_epilogue()
-        def local_epi(acc):
-            return {"D": acc}
-
-        return local_epi
-
-    mod = build()
-    mint_key = ((), 10, False, False, (), RoundingMode.RN, (), False)
-    ref = mod._class_ref(mint_key)
-    payload = ref.__dlkernel_pool_payload__()
-    assert isinstance(payload, PoolPayload)
-    assert payload.identity == mod.semantic_digest
-
-    # Model the separate worker: it starts without the submitter's registry.
-    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is mod  # consumes (pops)
-    with pytest.raises(ValueError, match="digest mismatch"):
-        install_epi_mod_payload("wrong-digest", payload.data)
-    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is None
-
-    install_epi_mod_payload(payload.identity, payload.data)
-    resolve_gemm_class(ref)  # consumes the installed payload
-    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is None
-
-
-def test_epi_scalar_fixed_abi():
-    f32 = Scalar("scale")
-    assert f32.host_arg_key(1.5) == ("immediate", Float32)
-    x = torch.ones(1, device="cuda", dtype=torch.float32)
-    assert f32.host_arg_key(x) == ("pointer", Float32)
-    with pytest.raises(TypeError, match="must have dtype"):
-        f32.host_arg_key(x.half())
-    with pytest.raises(ValueError, match="exactly one"):
-        f32.host_arg_key(torch.ones(2, device="cuda", dtype=torch.float32))
-    seed = Scalar("seed", dtype=Int32)
-    assert seed.host_arg_key(torch.ones(1, device="cuda", dtype=torch.int32)) == (
-        "pointer",
-        Int32,
-    )
-
-
-def test_epi_mode_validates_shapes_without_inference():
-    A = torch.empty((1, 8, 8), device="cuda", dtype=torch.bfloat16)
-    B = torch.empty((1, 16, 8), device="cuda", dtype=torch.bfloat16)
-    D = torch.empty((1, 8, 16), device="cuda", dtype=torch.bfloat16)
-    half_aux = torch.empty((1, 8, 8), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="must have shape"):
-        relu_mod.gemm(
-            A,
-            B,
-            D,
-            epi_args=dict(postact=half_aux),
-            tile_M=8,
-            tile_N=8,
-            cluster_M=1,
-            cluster_N=1,
-        )
-
-    B_odd = torch.empty((1, 15, 8), device="cuda", dtype=torch.bfloat16)
-    odd_aux = torch.empty((1, 8, 7), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="even GEMM N"):
-        swiglu_mod.gemm(
-            A,
-            B_odd,
-            None,
-            epi_args=dict(postact=odd_aux),
-            tile_M=8,
-            tile_N=8,
-            cluster_M=1,
-            cluster_N=1,
-        )
-
-    semaphore = torch.zeros(1, device="cuda", dtype=torch.int32)
-    with pytest.raises(ValueError, match="requires is_dynamic_persistent"):
-        relu_mod.gemm(
-            A,
-            B,
-            D,
-            epi_args=dict(postact=torch.empty_like(D)),
-            tile_M=8,
-            tile_N=8,
-            cluster_M=1,
-            cluster_N=1,
-            tile_count_semaphore=semaphore,
-        )
-
-
 @pytest.mark.parametrize("batched", [True, False])
 def test_epi_mod_norm_gelu(batched):
     device = "cuda"
@@ -3089,3 +2996,525 @@ def test_epi_mod_varlen_rowvec_sink():
     from DLKernel.epilogue.ops import RowVecReduce
 
     assert RowVecReduce("x", combine="max_abs").combine != "add"
+
+
+# ---------------------------------------------------------------------------
+# Task-2 binding & class-entry contracts (plan 2026-10-11-gemm-class-polymorphism
+# §5.1/§5.2): GemmBase.bind_epilogue, EpiMod._bound_epilogues, the __getstate__
+# payload and the gemm_with_activation / gemm_with_activation_grad entry points.
+# Written RED-first: every test below except the typed-op schema lock (last
+# one, the green no-regression baseline) targets APIs that do not exist yet.
+# ---------------------------------------------------------------------------
+
+
+def _bind_warm_epi(acc):
+    return {"D": acc}
+
+
+# Module-anchored so plain pickle ships the fn by reference: the payload and
+# digest tests round-trip these mods in-process.
+_bind_plain_mod = gemm_epilogue()(_bind_warm_epi)
+_bind_plain_mod_b = gemm_epilogue()(_bind_warm_epi)  # equal declaration, fresh state
+
+
+def _bind_owner_of(mod):
+    """The bound Gemm class of ``mod`` (``_gemm_cls`` since the §5.2 seam)."""
+    return mod._gemm_cls
+
+
+def _bind_declaration_snapshot(mod):
+    """The declaration facets binding must leave untouched on the math mod."""
+    return {
+        "fn": mod.fn,
+        "outputs": mod.outputs,
+        "mode": mod.mode,
+        "operand_names": mod.operand_names,
+        "vectorize": mod.vectorize,
+        "ops": tuple(sorted(mod.ops)),
+        "sinks": tuple(sorted(mod.sinks)),
+        "extra_ops": tuple((type(op), op.name) for op in mod.extra_ops),
+        "semantic_key": mod.semantic_key,
+        "semantic_digest": mod.semantic_digest,
+        "owner": _bind_owner_of(mod),
+    }
+
+
+def test_bind_contract_generic_root_returns_same_mod(monkeypatch):
+    """§5.2 identity fast path: the generic root binding a generic math mod
+    returns the SAME object — no second EpiMod, no binding memo allocated."""
+    import DLKernel.epilogue.frontend as epi_frontend
+    from DLKernel.gemm_base import GemmBase
+
+    @gemm_epilogue()
+    def epi(acc):
+        return {"D": acc}
+
+    inits = []
+    orig_init = epi_frontend.EpiMod.__init__
+
+    def counting_init(self, *args, **kwargs):
+        inits.append(1)
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(epi_frontend.EpiMod, "__init__", counting_init)
+    bound = GemmBase.bind_epilogue(epi)
+    assert bound is epi, "generic root must return the same EpiMod object"
+    assert not inits, "generic-root bind must not construct a new EpiMod"
+    assert not getattr(epi, "_bound_epilogues", {}), "generic bind allocates no memo"
+
+
+def test_bind_contract_same_class_rebind_is_idempotent():
+    """§7 binding-pollution row: rebinding the class a mod already belongs to
+    returns the same bound object (memo reuse), never a second one."""
+    from DLKernel.epilogue.frontend import EpiMod
+    from DLKernel.gemm_sm90 import GemmSm90
+
+    @gemm_epilogue()
+    def epi(acc):
+        return {"D": acc}
+
+    first = GemmSm90.bind_epilogue(epi)
+    assert isinstance(first, EpiMod)
+    assert first is not epi
+    assert GemmSm90.bind_epilogue(epi) is first, "rebind of the same class must reuse"
+
+
+def test_bind_contract_distinct_classes_isolated_caches():
+    """§7 binding-pollution row: the same math mod bound to two Gemm classes
+    yields two distinct objects with fresh runtime caches; the memo maps each
+    class to its own binding only (no cross-class leakage)."""
+    from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
+    from DLKernel.gemm_sm90 import GemmSm90
+
+    @gemm_epilogue()
+    def epi(acc):
+        return {"D": acc}
+
+    plain = GemmSm90.bind_epilogue(epi)
+    moe = GemmMoeSm90.bind_epilogue(epi)
+    assert plain is not moe, "distinct classes must not share one bound mod"
+    assert plain is not epi and moe is not epi
+    memo = epi._bound_epilogues
+    assert memo[GemmSm90] is plain
+    assert memo[GemmMoeSm90] is moe
+    # Bindings start from empty runtime caches: nothing copied from the math
+    # mod or from the sibling binding (hot-mod rebinding must not carry
+    # launch recipes across owners).
+    for bound in (plain, moe):
+        assert bound._minted == {}
+        assert bound._plan_cache == {}
+        assert bound._call_cache == {}
+    # A class never receives another class' binding.
+    assert GemmSm90.bind_epilogue(epi) is plain
+    assert GemmMoeSm90.bind_epilogue(epi) is moe
+
+
+def test_bind_contract_original_mod_unchanged():
+    """§7 binding-pollution row: binding rebuilds a NEW object through the
+    EpiMod constructor — the library-cached math mod keeps its declaration,
+    digest and owner untouched (no in-place rewrite of the shared mod)."""
+    from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
+
+    before = _bind_declaration_snapshot(_bind_plain_mod)
+    GemmMoeSm90.bind_epilogue(_bind_plain_mod)
+    assert _bind_declaration_snapshot(_bind_plain_mod) == before
+
+
+def test_bind_contract_quantizer_not_promoted_twice():
+    """§5.2: the binding rebuild passes the ORIGINAL declaration through the
+    EpiMod constructor — an output quantize codec lifted into extra_ops at
+    construction must not be lifted a second time by the rebuild."""
+    from DLKernel.epilogue.ops import TileStore
+    from DLKernel.epilogue.quantize_out import BlockScaleFactorStore
+    from DLKernel.gemm_sm90 import GemmSm90
+
+    def quant_epi(acc):
+        return {"D": acc, "mAuxOut": acc * 0.5}
+
+    mod = gemm_epilogue(
+        outputs=(TileStore("mAuxOut", quant=BlockScaleFactorStore("aux_sf", output="mAuxOut")),),
+        extra_ops=(Scalar("sfd_norm_const"),),
+    )(quant_epi)
+    declared = tuple(op.name for op in mod.extra_ops)
+    assert declared == ("sfd_norm_const", "aux_sf")  # codec lifted exactly once
+    bound = GemmSm90.bind_epilogue(mod)
+    assert tuple(op.name for op in bound.extra_ops) == declared, (
+        "binding rebuild re-promoted the output quantizer into extra ops"
+    )
+
+
+def test_bind_contract_getstate_clears_runtime_caches():
+    """§5.2/§2.4: the shipped payload clears ALL runtime caches — minted
+    classes, launch plans, the eager call-recipe cache AND the binding memo.
+    Verified on a warm mod (one real BF16 call) that actually holds all four."""
+    from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
+
+    mod = _bind_plain_mod_b
+    GemmMoeSm90.bind_epilogue(mod)  # creates the binding memo on the math mod
+    assert mod._bound_epilogues, "self-check: the memo exists before pickling"
+    device = "cuda"
+    torch.random.manual_seed(40)
+    A = torch.randn((128, 128), device=device, dtype=torch.bfloat16)
+    B = torch.randn((128, 128), device=device, dtype=torch.bfloat16)
+    mod(A, B, tuned=False)  # eager __call__: mints a class, plans, records a recipe
+    assert mod._minted and mod._plan_cache and mod._call_cache, "self-check: warm"
+    restored = pickle.loads(pickle.dumps(mod))
+    assert restored._minted == {}, "payload must not ship minted classes"
+    assert restored._plan_cache == {}, "payload must not ship launch plans"
+    assert restored._call_cache == {}, "payload must not ship eager call recipes"
+    assert not getattr(restored, "_bound_epilogues", {}), "payload must not ship the memo"
+
+
+def test_bind_contract_warm_rebind_no_reconstruction(monkeypatch):
+    """§7 hot-path row: a warm memo hit constructs nothing — no EpiMod.__init__
+    call — so repeated binds cannot churn objects (§11.3 rejection condition:
+    per-call EpiMod churn would defeat the plan/call caches)."""
+    import DLKernel.epilogue.frontend as epi_frontend
+    from DLKernel.gemm_sm90 import GemmSm90
+
+    @gemm_epilogue()
+    def epi(acc):
+        return {"D": acc}
+
+    GemmSm90.bind_epilogue(epi)  # cold bind: constructs once (or memo-hits)
+    inits = []
+    orig_init = epi_frontend.EpiMod.__init__
+
+    def counting_init(self, *args, **kwargs):
+        inits.append(1)
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(epi_frontend.EpiMod, "__init__", counting_init)
+    warm1 = GemmSm90.bind_epilogue(epi)
+    warm2 = GemmSm90.bind_epilogue(epi)
+    assert not inits, "warm class bind must not construct a new EpiMod"
+    assert warm1 is warm2
+
+
+def test_bind_contract_digest_binds_class_identity():
+    """§5.2 closing paragraphs: the binding digest is a function of the
+    original declaration AND the actual Gemm class — distinct per class (an
+    inherited pair included), distinct from the generic math mod, stable for
+    equal declarations, and preserved across the shipped payload."""
+    from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
+    from DLKernel.gemm_sm90 import GemmSm90
+    from DLKernel.gemm_sm120 import GemmSm120
+
+    sm90 = GemmSm90.bind_epilogue(_bind_plain_mod)
+    sm120 = GemmSm120.bind_epilogue(_bind_plain_mod)
+    moe = GemmMoeSm90.bind_epilogue(_bind_plain_mod)
+    digests = {sm90.semantic_digest, sm120.semantic_digest, moe.semantic_digest}
+    assert len(digests) == 3, "class identity (incl. inherited classes) enters the digest"
+    for bound in (sm90, sm120, moe):
+        assert bound.semantic_digest != _bind_plain_mod.semantic_digest, (
+            "a bound digest must differ from the generic math mod's"
+        )
+    # Stability: an equal declaration bound to the same class yields the same
+    # digest — the worker rebuild must reproduce the submitted one.
+    twin = GemmSm90.bind_epilogue(_bind_plain_mod_b)
+    assert twin.semantic_digest == sm90.semantic_digest
+    restored = pickle.loads(pickle.dumps(sm90))
+    assert restored.semantic_digest == sm90.semantic_digest
+
+
+def test_bind_contract_class_entry_signatures():
+    """§5.1: the two class entry points own the full public contract —
+    parameter names, order and defaults exactly as the plan spells them (no
+    legacy private role parameter, no ``**options``); MoE inherits them
+    unchanged (§5.3)."""
+    import inspect
+
+    from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
+    from DLKernel.gemm_base import GemmBase
+    from DLKernel.gemm_config import SplitKMode
+
+    req = inspect.Parameter.empty  # sentinel: required, no default
+
+    expected_act = [
+        ("A", req),
+        ("B", req),
+        ("C", None),
+        ("bias", None),
+        ("activation", None),
+        ("alpha", 1.0),
+        ("preact_out", None),
+        ("postact_out", None),
+        ("out_dtype", None),
+        ("postact_dtype", None),
+        ("cu_seqlens_m", None),
+        ("A_idx", None),
+        ("store_preact", True),
+        ("dynamic_scheduler", False),
+        ("tuned", True),
+        ("config", None),
+        ("concat_layout", None),
+        ("split_k", 1),
+        ("split_k_mode", SplitKMode.SERIAL),
+    ]
+    expected_grad = [
+        ("A", req),
+        ("B", req),
+        ("PreAct", req),
+        ("activation", None),
+        ("dx_out", None),
+        ("postact_out", None),
+        ("out_dtype", None),
+        ("postact_dtype", None),
+        ("colvec_scale", None),
+        ("colvec_reduce", False),
+        ("cu_seqlens_m", None),
+        ("A_idx", None),
+        ("dynamic_scheduler", True),
+        ("tuned", True),
+        ("config", None),
+        ("split_k", 1),
+        ("split_k_mode", SplitKMode.SERIAL),
+    ]
+
+    def check(func, expected, label):
+        params = list(inspect.signature(func).parameters.values())
+        for p in params:
+            assert p.kind not in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ), f"{label}.{p.name}: no *args/**kwargs in the public contract"
+        assert [p.name for p in params] == [n for n, _ in expected], (
+            f"{label}: parameter names/order diverge from the §5.1 contract"
+        )
+        for p, (_, want) in zip(params, expected):
+            if isinstance(want, bool) or isinstance(p.default, bool):
+                assert p.default is want, f"{label}.{p.name}: default {p.default!r} != {want!r}"
+            else:
+                assert p.default == want, f"{label}.{p.name}: default {p.default!r} != {want!r}"
+
+    check(GemmBase.gemm_with_activation, expected_act, "gemm_with_activation")
+    check(GemmBase.gemm_with_activation_grad, expected_grad, "gemm_with_activation_grad")
+    assert GemmMoeSm90.gemm_with_activation.__func__ is GemmBase.gemm_with_activation.__func__
+    assert (
+        GemmMoeSm90.gemm_with_activation_grad.__func__
+        is GemmBase.gemm_with_activation_grad.__func__
+    )
+
+
+def test_bind_contract_typed_ops_keep_kernel_variant():
+    """§5.3/Q2: the four typed out-ops keep their registered schema — the
+    ``kernel_variant`` field remains the wire for class identity across
+    torch.compile. Green today: this locks the do-not-break baseline."""
+    import DLKernel.gemm_interface  # noqa: F401  (registers the four ops)
+
+    for name in ("gemm_act_out", "gemm_gated_out", "gemm_dact_out", "gemm_dgated_out"):
+        schema = getattr(torch.ops.dlkernel, name).default._schema
+        arg_names = [a.name for a in schema.arguments]
+        assert "kernel_variant" in arg_names, f"dlkernel::{name} lost its kernel_variant field"
+
+
+def test_bind_contract_private_bind_seam_fast_paths():
+    """The EpiMod-internal half of §5.2 (``GemmBase.bind_epilogue`` is a thin
+    wrapper over ``_bind_gemm_class``): the two identity fast returns precede
+    memo allocation, the memo lives lazily on the math mod only, and a bound
+    mod re-binding its own owner never allocates one."""
+    from DLKernel.gemm_base import GemmBase
+    from DLKernel.gemm_sm90 import GemmSm90
+
+    @gemm_epilogue()
+    def epi(acc):
+        return {"D": acc}
+
+    # Generic math mod + generic root: identity return, memo never allocated.
+    assert epi._gemm_cls is None
+    assert epi._bind_gemm_class(GemmBase) is epi
+    assert "_bound_epilogues" not in epi.__dict__
+
+    # A concrete class constructs once and lands in the lazy memo.
+    bound = epi._bind_gemm_class(GemmSm90)
+    assert bound is not epi and bound._gemm_cls is GemmSm90
+    assert epi._bound_epilogues[GemmSm90] is bound
+
+    # Same-owner rebind of an ALREADY-bound mod: identity return — the fast
+    # path fires before the memo, and the bound mod stays memo-free.
+    assert bound._bind_gemm_class(GemmSm90) is bound
+    assert "_bound_epilogues" not in bound.__dict__
+
+    # Warm rebind of the math mod is a memo hit, not a second construction.
+    assert epi._bind_gemm_class(GemmSm90) is bound
+
+
+def test_bind_contract_role_without_token_refused():
+    """A role fork (subclass of a generic SM base) shipping no variant_id must
+    not cross the custom-op boundary as the generic root (plan 5.4); the
+    generic spine itself keeps ``None`` legal."""
+    from DLKernel.gemm_base import GemmBase, GemmTmaBase
+    from DLKernel.gemm_sm120 import GemmSm120
+    from DLKernel.gemm_sm90 import GemmSm90
+
+    class _RoleNoToken(GemmSm90):
+        pass
+
+    with pytest.raises(TypeError, match="variant_id"):
+        _RoleNoToken.gemm_with_activation(None, None)
+    # The guard fires before any tensor work, so the generic spine is cheap to
+    # check: SM bases and their subclass-overriding peer keep None.
+    assert GemmBase._host_entry_variant() is None
+    assert GemmTmaBase._host_entry_variant() is None
+    assert GemmSm90._host_entry_variant() is None
+    assert GemmSm120._host_entry_variant() is None
+    assert _RoleNoToken.bind_epilogue  # local composition stays available
+
+
+def test_epi_mod_local_payload_identity_and_consumption():
+    cloudpickle = pytest.importorskip("cloudpickle")  # noqa: F841
+    from DLKernel.cache.async_compile import PoolPayload
+    from DLKernel.gemm_runtime.identity import LOCAL_EPI_MODS, install_epi_mod_payload
+    from DLKernel.rounding import RoundingMode
+
+    def build():
+        @gemm_epilogue()
+        def local_epi(acc):
+            return {"D": acc}
+
+        return local_epi
+
+    mod = build()
+    mint_key = ((), 10, False, False, (), RoundingMode.RN, (), False)
+    ref = mod._class_ref(mint_key)
+    payload = ref.__dlkernel_pool_payload__()
+    assert isinstance(payload, PoolPayload)
+    assert payload.identity == mod.semantic_digest
+
+    # Model the separate worker: it starts without the submitter's registry.
+    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is mod  # consumes (pops)
+    with pytest.raises(ValueError, match="digest mismatch"):
+        install_epi_mod_payload("wrong-digest", payload.data)
+    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is None
+
+    install_epi_mod_payload(payload.identity, payload.data)
+    resolve_gemm_class(ref)  # consumes the installed payload
+    assert LOCAL_EPI_MODS.resolve(mod.semantic_digest) is None
+
+
+def test_epi_scalar_fixed_abi():
+    f32 = Scalar("scale")
+    assert f32.host_arg_key(1.5) == ("immediate", Float32)
+    x = torch.ones(1, device="cuda", dtype=torch.float32)
+    assert f32.host_arg_key(x) == ("pointer", Float32)
+    with pytest.raises(TypeError, match="must have dtype"):
+        f32.host_arg_key(x.half())
+    with pytest.raises(ValueError, match="exactly one"):
+        f32.host_arg_key(torch.ones(2, device="cuda", dtype=torch.float32))
+    seed = Scalar("seed", dtype=Int32)
+    assert seed.host_arg_key(torch.ones(1, device="cuda", dtype=torch.int32)) == (
+        "pointer",
+        Int32,
+    )
+
+
+def test_epi_mode_validates_shapes_without_inference():
+    A = torch.empty((1, 8, 8), device="cuda", dtype=torch.bfloat16)
+    B = torch.empty((1, 16, 8), device="cuda", dtype=torch.bfloat16)
+    D = torch.empty((1, 8, 16), device="cuda", dtype=torch.bfloat16)
+    half_aux = torch.empty((1, 8, 8), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="must have shape"):
+        relu_mod.gemm(
+            A,
+            B,
+            D,
+            epi_args=dict(postact=half_aux),
+            tile_M=8,
+            tile_N=8,
+            cluster_M=1,
+            cluster_N=1,
+        )
+
+    B_odd = torch.empty((1, 15, 8), device="cuda", dtype=torch.bfloat16)
+    odd_aux = torch.empty((1, 8, 7), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="even GEMM N"):
+        swiglu_mod.gemm(
+            A,
+            B_odd,
+            None,
+            epi_args=dict(postact=odd_aux),
+            tile_M=8,
+            tile_N=8,
+            cluster_M=1,
+            cluster_N=1,
+        )
+
+    semaphore = torch.zeros(1, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="requires is_dynamic_persistent"):
+        relu_mod.gemm(
+            A,
+            B,
+            D,
+            epi_args=dict(postact=torch.empty_like(D)),
+            tile_M=8,
+            tile_N=8,
+            cluster_M=1,
+            cluster_N=1,
+            tile_count_semaphore=semaphore,
+        )
+
+
+def test_bind_contract_guard_closed_for_bypasses():
+    """The host-entry guard is an explicit spine allowlist plus a registry
+    identity check — closed against both bypasses the attribute-heuristic
+    had: a role subclass riding its parent's inherited token, and a custom
+    class self-declaring ``supported_sm_majors`` to pose as generic."""
+    from DLKernel.gemm_base import GemmBase, GemmTmaBase
+    from DLKernel.gemm_sm120 import GemmSm120
+    from DLKernel.gemm_sm90 import GemmSm90
+    from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
+
+    class CustomMoe(GemmMoeSm90):
+        pass
+
+    class OwnMajors(GemmSm90):
+        supported_sm_majors = (9,)
+
+    # Inherited token: the registry maps "moe_sm90" to GemmMoeSm90, not to
+    # the subclass — its overrides would be silently dropped across the op
+    # boundary.
+    with pytest.raises(TypeError, match="registered to"):
+        CustomMoe._host_entry_variant()
+    with pytest.raises(TypeError, match="without a"):
+        OwnMajors._host_entry_variant()
+    # The generic spine keeps None; a registered role gets its own token.
+    assert GemmBase._host_entry_variant() is None
+    assert GemmTmaBase._host_entry_variant() is None
+    assert GemmSm90._host_entry_variant() is None
+    assert GemmSm120._host_entry_variant() is None
+    assert GemmMoeSm90._host_entry_variant() == "moe_sm90"
+
+
+def test_bind_contract_non_class_argument_refused():
+    """``_bind_gemm_class`` fails fast on a non-class argument (the check is
+    real code, not docstring prose)."""
+    from DLKernel.epilogue.library import linear_act_mod
+
+    mod = linear_act_mod("silu", gated=False, has_c=False, has_rowvec=False, has_colvec=False)
+    for bad in (42, "moe_sm90", 3.14):
+        with pytest.raises(TypeError, match="must be a Gemm class"):
+            mod._bind_gemm_class(bad)
+
+
+def test_bind_contract_generator_ctor_args():
+    """Generator constructor arguments survive both construction and a bound
+    rebuild: the iterable declarations are normalized exactly once and shared
+    between the body and the ``_ctor_recipe`` (no double consumption)."""
+    from DLKernel.epilogue.frontend import gemm_epilogue
+    from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
+
+    @gemm_epilogue(outputs=(n for n in ["mAuxOut"]))
+    def gen_fn(acc):
+        return {"mAuxOut": acc}
+
+    @gemm_epilogue(outputs=["mAuxOut"])
+    def tuple_fn(acc):
+        return {"mAuxOut": acc}
+
+    assert gen_fn.outputs == ("mAuxOut",)
+    # Distinct fns never share a digest; the outputs DECLARATION entry must.
+    assert gen_fn.semantic_key[2] == tuple_fn.semantic_key[2] == ("mAuxOut",)
+    bound = gen_fn._bind_gemm_class(GemmMoeSm90)
+    assert bound.outputs == ("mAuxOut",)
+    assert bound.semantic_digest != gen_fn.semantic_digest  # class identity bound
+    assert gen_fn.outputs == ("mAuxOut",)  # original untouched

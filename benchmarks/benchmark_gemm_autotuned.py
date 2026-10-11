@@ -14,11 +14,11 @@ Usage:
     # Control worker count
     DLKERNEL_COMPILE_WORKERS=8 python benchmarks/benchmark_gemm_autotuned.py
 
-    # Cold start: clear .so + autotuning caches to see parallel pre-compilation
+    # Cold start: clear object + autotuning caches to see parallel pre-compilation
     python benchmarks/benchmark_gemm_autotuned.py --cold
 
 Environment variables:
-    DLKERNEL_COMPILE_WORKERS   Number of parallel compile workers (default: 4)
+    DLKERNEL_COMPILE_WORKERS   Number of parallel compile workers (default: 16)
     DLKERNEL_PRINT_AUTOTUNING  Set to "1" for verbose autotuner output (always on in this script)
 """
 
@@ -34,26 +34,25 @@ from triton.testing import do_bench
 
 from DLKernel.autotuner import default_cache_dir
 from DLKernel.cache import get_cache_path
+from DLKernel.gemm_base import GemmBase
 from DLKernel.gemm_config import GemmConfig
 from DLKernel.gemm_interface import (
     act_to_pytorch_fn_map,
     gemm,
-    gemm_act,
-    gemm_dgated,
     gemm_tuned,
     gated_to_pytorch_fn_map,
 )
 
 
 def clear_caches():
-    """Clear both the .so kernel cache and the autotuning result cache."""
-    # .so kernel cache (from DLKernel.cache.get_cache_path)
-    so_cache = str(get_cache_path())
-    if os.path.isdir(so_cache):
-        shutil.rmtree(so_cache)
-        print(f"Cleared .so cache: {so_cache}")
-    # Autotuning result cache (from autotuner.default_cache_dir)
-    autotune_cache = str(default_cache_dir())
+    """Clear the effective object and autotuning winner cache roots."""
+    # Persistent object cache (DLKERNEL_ARTIFACT_CACHE_DIR when set).
+    object_cache = str(get_cache_path())
+    if os.path.isdir(object_cache):
+        shutil.rmtree(object_cache)
+        print(f"Cleared .o cache: {object_cache}")
+    # Autotuning winners have an independent root.
+    autotune_cache = os.environ.get("DLKERNEL_CACHE_DIR", "").strip() or str(default_cache_dir())
     if os.path.isdir(autotune_cache):
         shutil.rmtree(autotune_cache)
         print(f"Cleared autotuning cache: {autotune_cache}")
@@ -153,11 +152,13 @@ def benchmark_gemm_act(
     nflops = 2 * m * b_n * k
 
     if config is None:
-        fn = lambda: gemm_act(a, b, activation=activation, out_dtype=dtype, tuned=tuned)
+        fn = lambda: GemmBase.gemm_with_activation(
+            a, b, activation=activation, out_dtype=dtype, tuned=tuned
+        )
     else:
         preact = torch.empty(m, b_n, device="cuda", dtype=dtype)
         postact = torch.empty(m, n if is_gated else b_n, device="cuda", dtype=dtype)
-        fn = lambda: gemm_act(
+        fn = lambda: GemmBase.gemm_with_activation(
             a,
             b,
             activation=activation,
@@ -207,11 +208,13 @@ def benchmark_gemm_dgated(
     nflops = 2 * m * n * k
 
     if config is None:
-        fn = lambda: gemm_dgated(a, b, preact, activation=activation, out_dtype=dtype, tuned=tuned)
+        fn = lambda: GemmBase.gemm_with_activation_grad(
+            a, b, preact, activation=activation, out_dtype=dtype, tuned=tuned
+        )
     else:
         dx_out = torch.empty(m, 2 * n, device="cuda", dtype=dtype)
         postact_out = torch.empty(m, n, device="cuda", dtype=preact.dtype)
-        fn = lambda: gemm_dgated(
+        fn = lambda: GemmBase.gemm_with_activation_grad(
             a,
             b,
             preact,
@@ -301,7 +304,7 @@ def main():
     parser.add_argument("--config-cluster-n", type=int, default=1)
     parser.add_argument("--config-pingpong", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--config-swap-ab", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--cold", action="store_true", help="Clear .so and autotuning caches first")
+    parser.add_argument("--cold", action="store_true", help="Clear .o and autotuning caches first")
     args = parser.parse_args()
 
     if args.cold:
@@ -335,7 +338,7 @@ def main():
 
     if args.only_gated:
         print(
-            f"GEMM gated activation benchmark  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '4')})"
+            f"GEMM gated activation benchmark  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '16')})"
         )
         print(f"  batch={args.batch}, dim={args.dim}, ffn={ffn}, dtype={args.dtype}")
         if forced_config is not None:
@@ -358,7 +361,7 @@ def main():
 
     if args.only_dgated:
         print(
-            f"GEMM gated backward benchmark  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '4')})"
+            f"GEMM gated backward benchmark  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '16')})"
         )
         print(f"  batch={args.batch}, dim={args.dim}, ffn={ffn}, dtype={args.dtype}")
         if forced_config is not None:
@@ -379,7 +382,7 @@ def main():
             )
         return
 
-    print(f"GEMM autotuning demo  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '4')})")
+    print(f"GEMM autotuning demo  (workers={os.environ.get('DLKERNEL_COMPILE_WORKERS', '16')})")
     print(f"  M={M}, N={N}, K={K}, dtype={args.dtype}")
     if forced_config is not None:
         print(f"  forced config: {forced_config}")

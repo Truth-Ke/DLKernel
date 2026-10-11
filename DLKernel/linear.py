@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-from DLKernel.gemm_interface import gemm, gemm_add_inplace, gemm_act, gemm_dact
-from DLKernel.gemm_interface import gemm_gated, gemm_dgated
+from DLKernel.gemm_base import GemmBase
+from DLKernel.gemm_interface import gemm, gemm_add_inplace
 from DLKernel.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
 
 
@@ -92,26 +92,27 @@ class _LinearUntunedOps(_LinearOps):
 
 
 class _LinearActOps(_LinearOps):
-    matmul_fwd_fn = gemm_act
+    matmul_fwd_fn = GemmBase.gemm_with_activation
 
 
 class _LinearActUntunedOps(_LinearUntunedOps):
-    matmul_fwd_fn = partial(gemm_act, tuned=False)
+    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, tuned=False)
 
 
 class _LinearGatedOps(_LinearOps):
-    matmul_fwd_fn = gemm_gated
+    # Gated math is selected by the activation name inside gemm_with_activation.
+    matmul_fwd_fn = GemmBase.gemm_with_activation
 
 
 class _LinearGatedUntunedOps:
-    matmul_fwd_fn = partial(gemm_gated, tuned=False)
+    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, tuned=False)
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
 
 
 class _LinearGatedConcatOps(_LinearGatedOps):
-    matmul_fwd_fn = partial(gemm_gated, concat_layout=("B", "bias"))
+    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, concat_layout=("B", "bias"))
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, concat_layout=("B",))
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, concat_layout=("out",))
     matmul_bwd_dw_inplace = partial(
@@ -120,7 +121,7 @@ class _LinearGatedConcatOps(_LinearGatedOps):
 
 
 class _LinearGatedConcatUntunedOps(_LinearGatedUntunedOps):
-    matmul_fwd_fn = partial(gemm_gated, tuned=False, concat_layout=("B", "bias"))
+    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, tuned=False, concat_layout=("B", "bias"))
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
     matmul_bwd_dw_inplace = partial(
@@ -129,22 +130,23 @@ class _LinearGatedConcatUntunedOps(_LinearGatedUntunedOps):
 
 
 class _DActLinearOps(_LinearOps):
-    matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True)
+    matmul_bwd_dx = partial(GemmBase.gemm_with_activation_grad, dynamic_scheduler=True)
     recompute_postact = staticmethod(_recompute_act_postact)
 
 
 class _DActLinearUntunedOps(_LinearUntunedOps):
-    matmul_bwd_dx = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dx = partial(GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tuned=False)
     recompute_postact = staticmethod(_recompute_act_postact)
 
 
 class _DGatedLinearOps(_LinearOps):
-    matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True)
+    # Gated math is selected by the activation name inside the grad entry.
+    matmul_bwd_dx = partial(GemmBase.gemm_with_activation_grad, dynamic_scheduler=True)
     recompute_postact = staticmethod(_recompute_gated_postact)
 
 
 class _DGatedLinearUntunedOps(_LinearUntunedOps):
-    matmul_bwd_dx = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dx = partial(GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tuned=False)
     recompute_postact = staticmethod(_recompute_gated_postact)
 
 
@@ -293,11 +295,13 @@ class DActLinearFunc(torch.autograd.Function):
             x = x.flatten(0, -2)
             out = ops.matmul_fwd_fn(x, weight.T, bias=bias)
             # Store preact instead of x, we will recompute x (postact) in backward.
-            # dpreact needs gemm_dact(dout, weight, preact) → needs both weight and preact.
-            # dweight needs postact: if dpreact is also needed, postact comes from gemm_dact;
+            # dpreact needs gemm_with_activation_grad(dout, weight, preact) → needs both
+            # weight and preact.
+            # dweight needs postact: if dpreact is also needed, postact comes from
+            # gemm_with_activation_grad;
             # otherwise we can recompute postact = act(preact) cheaply without weight.
             need_preact = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
-            need_weight = ctx.needs_input_grad[0]  # only gemm_dact needs weight
+            need_weight = ctx.needs_input_grad[0]  # only the grad GEMM needs weight
             linear_fwd_postprocess(
                 ctx, preact, weight, weight_og, needs_x_w_grad=(need_weight, need_preact)
             )
@@ -319,7 +323,8 @@ class DActLinearFunc(torch.autograd.Function):
             dout = _ensure_contiguous(dout.flatten(0, -2))
             dbias = dout.sum(0, dtype=ctx.bias_dtype) if ctx.compute_dbias else None
             if ctx.needs_input_grad[0]:
-                # Need dpreact: gemm_dact(dout, weight, preact) → (dpreact, postact)
+                # Need dpreact: gemm_with_activation_grad(dout, weight, preact)
+                # → (dpreact, postact)
                 preact = preact.flatten(0, -2)
                 assert weight is not None
                 dpreact, x = ops.matmul_bwd_dx(dout, weight, preact, activation=ctx.activation)
@@ -367,3 +372,6 @@ class Linear(nn.Linear):
             return linear_func(input, self.weight, self.bias, fuse_grad_accum=self.fuse_grad_accum)
         else:
             return F.linear(input, self.weight, self.bias)
+
+
+__all__ = ["linear_func", "linear_act_func", "linear_gated_func"]

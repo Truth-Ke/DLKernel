@@ -396,10 +396,11 @@ def test_gemm_split_k_rejects_unsupported():
         gemm(A, B, cu_seqlens_m=cu_seqlens_m, tuned=False, split_k=2)
     with pytest.raises(Exception, match="split_k"):
         gemm(A, B, tuned=False, split_k=2, split_k_mode="bogus")
-    from DLKernel.gemm_interface import gemm_act, gemm_symmetric
+    from DLKernel.gemm_base import GemmBase
+    from DLKernel.gemm_interface import gemm_symmetric
 
     with pytest.raises(NotImplementedError, match="split_k"):
-        gemm_act(A, B, activation="relu", split_k=2)
+        GemmBase.gemm_with_activation(A, B, activation="relu", split_k=2)
     with pytest.raises(NotImplementedError, match="split_k"):
         gemm_symmetric(A, A.mT.contiguous().mT, split_k=2)
 

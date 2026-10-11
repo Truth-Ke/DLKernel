@@ -868,3 +868,6 @@ class LinearCrossEntropy(nn.Linear):
                 reduction=self.reduction,
                 inplace_backward=self.inplace_backward,
             )
+
+
+__all__ = ["LinearCrossEntropy", "chunked_linear_cross_entropy", "chunked_linear_cross_entropy_fwd"]

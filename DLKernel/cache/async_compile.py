@@ -33,7 +33,7 @@ Design notes:
   surfaces with a local traceback.
 
 Env knobs: ``DLKERNEL_ASYNC_COMPILE_START=spawn`` (disable the fork sidecar),
-``DLKERNEL_COMPILE_WORKERS`` (shared-executor size, default 8).
+``DLKERNEL_COMPILE_WORKERS`` (shared-executor size, default 16).
 """
 
 from __future__ import annotations
@@ -329,7 +329,7 @@ def get_shared_executor() -> ProcessPoolExecutor:
 
     Reuses the active :class:`CompilePool`'s executor when one exists (the
     pytest ``--async-compile`` session pool); otherwise lazily creates a
-    process-wide executor sized by ``DLKERNEL_COMPILE_WORKERS`` (default 8).
+    process-wide executor sized by ``DLKERNEL_COMPILE_WORKERS`` (default 16).
     Deliberately ignores :class:`suppress_pool` — suppression turns off the
     *defer-on-miss* behavior of jit_cache, not access to compile workers.
     """
@@ -339,7 +339,7 @@ def get_shared_executor() -> ProcessPoolExecutor:
     if _shared_executor is None:
         import atexit
 
-        _shared_executor = _make_executor(int(os.environ.get("DLKERNEL_COMPILE_WORKERS", "8")))
+        _shared_executor = _make_executor(int(os.environ.get("DLKERNEL_COMPILE_WORKERS", "16")))
         # Explicit teardown: without this, the executor is GC'd during
         # interpreter shutdown after its weakref machinery is already gone,
         # printing a spurious "Exception ignored in weakref_cb".

@@ -27,6 +27,9 @@ class GemmSm80(GemmBase):
 
     arch = 80
     _supported_archs = (80, 86, 87, 89)
+    # Host-side class selection (GemmBase.select_gemm_class), not the device
+    # arch set above.
+    supported_sm_majors = (8,)
 
     def __init__(
         self,

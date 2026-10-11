@@ -1,5 +1,4 @@
 # Copyright (c) 2025, Tri Dao
-import os
 from functools import partial
 from typing import NamedTuple, Optional, Tuple, Literal
 
@@ -28,6 +27,7 @@ from DLKernel.gemm_config import (
 from DLKernel.autotuner import autotune, AutotuneConfig
 from DLKernel.cute_dsl_utils import get_device_capacity
 from DLKernel.gemm import gemm as gemm_dispatch, run_gemm_plan
+from DLKernel.gemm_base import GemmBase
 from DLKernel.gemm_iface import (
     IfacePlan,
     VariantSpec,
@@ -702,16 +702,18 @@ def _gemm_execute(
     )
 
 
-## ── gemm_act / gemm_gated ───────────────────────────────────────────────────
+## ── gemm_with_activation (act / gated) ──────────────────────────────────────
 # Ported to the epilogue-object surface (see the gemm_rms note below):
 # DLKernel.epilogue.library.linear_act_mod owns canonicalization, plan caching, and
 # tuning (incl. varlen/gather, blockscaled, concat_layout, and swap-at-trace
 # for the element-mode forms; the gated config space never had swap_ab).
+# The public entry is GemmBase.gemm_with_activation (gemm_base.py); this
+# module owns the shared dispatch and the eager/op run helper below.
 # SR (rounding_mode/sr_seed) is not exposed here; call
 # linear_act_mod(..., sr=True).gemm(rounding_mode=...) directly.
 
 
-def _gemm_act_call(
+def _run_activation_gemm(
     A: Tensor,
     B: Tensor,
     preact_out: Optional[Tensor],
@@ -731,6 +733,7 @@ def _gemm_act_call(
     alpha: float | Tensor = 1.0,
     tuned: bool,
     config: Optional[GemmConfig] = None,
+    kernel_variant: Optional[str] = None,
 ) -> None:
     from DLKernel.epilogue.library import linear_act_mod
 
@@ -741,7 +744,7 @@ def _gemm_act_call(
         bias, concat_layout = _act_concat_bias(bias, concat_layout, False)
         concat_layout = tuple(sorted(concat_layout)) if concat_layout else None
     has_alpha = scalar_mode(alpha) != 0
-    mod = linear_act_mod(
+    math_mod = linear_act_mod(
         activation,
         gated=activation in gated_to_pytorch_fn_map,
         has_c=C is not None,
@@ -750,6 +753,7 @@ def _gemm_act_call(
         sr=False,
         has_alpha=has_alpha,
     )
+    mod = GemmBase.resolve_kernel_variant(kernel_variant).bind_epilogue(math_mod)
     outs = {"mAuxOut": postact_out}
     store_d = preact_out is not None
     if store_d:
@@ -798,15 +802,16 @@ def _act_concat_bias(bias, concat_layout, swap_ab):
     return bias, concat_layout
 
 
-## ── gemm_dact / gemm_dgated ─────────────────────────────────────────────────
+## ── gemm_with_activation_grad (dact / dgated) ───────────────────────────────
 # Ported to the epilogue-object surface (see the gemm_rms note below):
 # DLKernel.epilogue.library.dact_mod / dgated_mod own canonicalization, plan caching,
 # and tuning (incl. varlen/gather and dynamic_scheduler=True, dact's default).
+# The public entry is GemmBase.gemm_with_activation_grad (gemm_base.py).
 # The colvec reduce comes back finalized via the generic
 # VecReduce.host_finalize — the same partials.sum(dim=-1) the old wrapper ran.
 
 
-def _gemm_dact_call(
+def _run_activation_grad_gemm(
     A: Tensor,
     B: Tensor,
     PreAct: Tensor,
@@ -825,13 +830,19 @@ def _gemm_dact_call(
     dynamic_scheduler: bool,
     tuned: bool,
     config: Optional[GemmConfig] = None,
+    kernel_variant: Optional[str] = None,
 ) -> Optional[Tensor]:
-    """Launch dact/dgated on the epilogue object. Returns the finalized colvec
-    reduce (colvec_reduce=True) or None."""
+    """Launch dact/dgated on the bound epilogue object. Returns the finalized
+    colvec reduce (colvec_reduce=True) or None."""
     from DLKernel.epilogue.library import dact_mod, dgated_mod
 
     mod_fn = dgated_mod if activation in gated_to_pytorch_fn_map else dact_mod
-    mod = mod_fn(activation, has_scale=colvec_scale is not None, has_reduce=colvec_reduce)
+    math_mod = mod_fn(
+        activation,
+        has_scale=colvec_scale is not None,
+        has_reduce=colvec_reduce,
+    )
+    mod = GemmBase.resolve_kernel_variant(kernel_variant).bind_epilogue(math_mod)
     operands = {}
     if colvec_scale is not None:
         operands["mColVecBroadcast"] = colvec_scale
@@ -2027,38 +2038,39 @@ def gemm_add_inplace_op(
     )
 
 
-def gemm_act(
+def _dispatch_activation_gemm(
+    *,
+    kernel_variant: Optional[str],
     # For blockscaled: a BlockScaledOperand container - see gemm().
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     A: Tensor | BlockScaledOperand,
     B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N)
-    C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Activation = None,
-    alpha: float | Tensor = 1.0,  # pre-activation accumulator scale
-    preact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
-    cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
-    store_preact: bool = True,
-    dynamic_scheduler: bool = False,
-    tuned: bool = True,
-    config: Optional[GemmConfig] = None,  # explicit pin (eager only); overrides tuned
-    concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
-    split_k: Optional[int] = 1,
-    split_k_mode: int = SplitKMode.SERIAL,
+    C: Optional[Tensor],  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    bias: Optional[Tensor],  # (N,) or (L, N)
+    activation: Activation,
+    alpha: float | Tensor,  # pre-activation accumulator scale
+    preact_out: Optional[Tensor],  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    postact_out: Optional[Tensor],  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    out_dtype: Optional[torch.dtype],
+    postact_dtype: Optional[torch.dtype],
+    cu_seqlens_m: Optional[Tensor],
+    A_idx: Optional[Tensor],  # (total_M,) if gather_A with varlen_m
+    store_preact: bool,
+    dynamic_scheduler: bool,
+    tuned: bool,
+    config: Optional[GemmConfig],  # explicit pin (eager only); overrides tuned
+    concat_layout: tuple | None,  # tensors whose non-contiguous dim is concat [gate; up]
+    split_k: Optional[int],
+    split_k_mode: int,
 ) -> Tuple[Optional[Tensor], Tensor]:
-    """GEMM with activation (or gated activation) and optional output tensors.
-
-    ``alpha`` scales the accumulator before the activation
-    (``postact = act(alpha * A @ B + C + bias)``). It is applied in fp32 and
-    may be a float or a 1-element CUDA tensor; 1.0 keeps the alpha-free epilogue.
-    """
+    """Shared implementation of ``GemmBase.gemm_with_activation``: input
+    normalization (blockscaled unwrap, alpha folding), output allocation, the
+    empty-input fast path, and the eager/typed-op split. The public defaults
+    live on the class entry; this receives them fully expanded, with the
+    caller's ``kernel_variant`` token supplying the class identity."""
     _reserve_blockscaled_out(out_dtype)
     _reserve_blockscaled_out(postact_dtype)
-    _check_split_k_unsupported("gemm_act", split_k)
+    _check_split_k_unsupported("gemm_with_activation", split_k)
     opA, opB = _unpack_operand(A), _unpack_operand(B)
     A, B = opA.data, opB.data
     SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
@@ -2083,22 +2095,28 @@ def gemm_act(
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    # Empty-input fast path. For M=0 or N=0 the outputs are empty; for K=0
-    # (A@B == 0) the no-bias / no-C surface yields preact=0 and act(0)=0 for
-    # every supported activation, so both outputs are zero.
+    # Empty-input fast path: M=0 / N=0 leave the outputs empty (empty
+    # routing or empty batches). K=0 with non-empty outputs has no real
+    # workload — refuse it rather than emulate degenerate epilogue math.
     if postact_out.numel() == 0 or A.numel() == 0:
+        if A.numel() == 0 and postact_out.numel() != 0:
+            raise ValueError(
+                "gemm_with_activation: K=0 (zero contraction) with non-empty outputs is "
+                f"unsupported; A={tuple(A.shape)}, out={tuple(out_shape)}"
+            )
         if preact_out is not None:
             _empty_k_matmul_into(preact_out)
         _empty_k_matmul_into(postact_out)
         return preact_out, postact_out
     if torch.compiler.is_compiling():
         if config is not None:
-            raise NotImplementedError("gemm_act: explicit config under torch.compile")
+            raise NotImplementedError("gemm_with_activation: explicit config under torch.compile")
         if SFA is not None:
             SFA, SFB = _sf_encode(SFA), _sf_encode(SFB)
         concat_str = ",".join(concat_layout) if concat_layout else None
         op = gemm_gated_out if is_gated else gemm_act_out
         kwargs = {"concat_layout": concat_str} if is_gated else {}
+        kwargs["kernel_variant"] = kernel_variant
         op(
             A,
             B,
@@ -2120,7 +2138,7 @@ def gemm_act(
             **kwargs,
         )
         return preact_out, postact_out
-    _gemm_act_call(
+    _run_activation_gemm(
         A,
         B,
         preact_out,
@@ -2139,18 +2157,16 @@ def gemm_act(
         alpha=alpha,
         tuned=tuned,
         config=config,
+        kernel_variant=kernel_variant,
     )
     return preact_out, postact_out
-
-
-gemm_gated = gemm_act
 
 
 @torch.library.custom_op(
     "dlkernel::gemm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None, str? kernel_variant=None) -> ()",
 )
 def gemm_act_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2170,9 +2186,10 @@ def gemm_act_out(
     bs_format_b: Optional[str] = None,
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
+    kernel_variant: str | None = None,
 ) -> None:
     """GEMM with activation and pre-allocated output tensors."""
-    _gemm_act_call(
+    _run_activation_gemm(
         A,
         B,
         preact_out,
@@ -2189,6 +2206,7 @@ def gemm_act_out(
         dynamic_scheduler=dynamic_scheduler,
         alpha=_merge_tensor(alpha, alpha_tensor),
         tuned=tuned,
+        kernel_variant=kernel_variant,
     )
 
 
@@ -2244,40 +2262,45 @@ def gemm_act_ref(
 gemm_gated_ref = gemm_act_ref
 
 
-def gemm_dact(
+def _dispatch_activation_grad_gemm(
+    *,
+    kernel_variant: Optional[str],
     # For blockscaled: a BlockScaledOperand container - see gemm().
     # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     A: Tensor | BlockScaledOperand,
     B: Tensor | BlockScaledOperand,  # (K, N) or (L, K, N)
     PreAct: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m; or (M, 2*N) for dgated
-    activation: Activation = None,
+    activation: Activation,
     dx_out: Optional[
         Tensor
-    ] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m; double for gated
-    postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
-    out_dtype: Optional[torch.dtype] = None,
-    postact_dtype: Optional[torch.dtype] = None,
-    colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    colvec_reduce: bool = False,
-    cu_seqlens_m: Optional[Tensor] = None,
-    A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
-    dynamic_scheduler: bool = True,
-    tuned: bool = True,
-    config: Optional[GemmConfig] = None,  # explicit pin (eager only); overrides tuned
-    split_k: Optional[int] = 1,
-    split_k_mode: int = SplitKMode.SERIAL,
+    ],  # (M, N) or (L, M, N) or (total_M, N) if varlen_m; double for gated
+    postact_out: Optional[Tensor],  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
+    out_dtype: Optional[torch.dtype],
+    postact_dtype: Optional[torch.dtype],
+    colvec_scale: Optional[Tensor],  # (M,) or (L, M) or (total_M,) if varlen_m
+    colvec_reduce: bool,
+    cu_seqlens_m: Optional[Tensor],
+    A_idx: Optional[Tensor],  # (total_M,) if gather_A with varlen_m
+    dynamic_scheduler: bool,
+    tuned: bool,
+    config: Optional[GemmConfig],  # explicit pin (eager only); overrides tuned
+    split_k: Optional[int],
+    split_k_mode: int,
 ):
-    """GEMM with activation (or gated activation) gradient and optional output tensors."""
+    """Shared implementation of ``GemmBase.gemm_with_activation_grad``: input
+    normalization (blockscaled unwrap, per-tensor-scale rejection), output
+    allocation, the empty-input fast path, and the eager/typed-op split — same
+    contract as :func:`_dispatch_activation_gemm`."""
     _reserve_blockscaled_out(out_dtype)
     _reserve_blockscaled_out(postact_dtype)
-    _check_split_k_unsupported("gemm_dact", split_k)
+    _check_split_k_unsupported("gemm_with_activation_grad", split_k)
     opA, opB = _unpack_operand(A), _unpack_operand(B)
     A, B = opA.data, opB.data
     SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
     if opA.per_tensor_scale is not None or opB.per_tensor_scale is not None:
         raise NotImplementedError(
-            "gemm_dact does not support NVFP4 per-tensor scales yet (the dact/dgated "
-            "epilogues have no alpha to fold them into)"
+            "gemm_with_activation_grad does not support NVFP4 per-tensor scales yet "
+            "(the dact/dgated epilogues have no alpha to fold them into)"
         )
     if SFA is not None:
         SFA, SFB = _sf_batch_canonicalize(SFA, SFB, A.ndim == 3 or cu_seqlens_m is not None)
@@ -2299,9 +2322,15 @@ def gemm_dact(
         dx_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    # Empty-input fast path: M=0 / N=0 → outputs are empty; K=0 (A.numel()==0)
-    # makes the upstream GEMM gradient zero, so dx is zero regardless of activation.
+    # Empty-input fast path: M=0 / N=0 leave the outputs empty. K=0 with
+    # non-empty outputs is refused (see _dispatch_activation_gemm) — the
+    # upstream GEMM gradient would be zero while postact recompute is not.
     if dx_out.numel() == 0 or A.numel() == 0:
+        if A.numel() == 0 and dx_out.numel() != 0:
+            raise ValueError(
+                "gemm_with_activation_grad: K=0 (zero contraction) with non-empty "
+                f"outputs is unsupported; A={tuple(A.shape)}, dx={tuple(out_shape)}"
+            )
         _empty_k_matmul_into(dx_out)
         _empty_k_matmul_into(postact_out)
         results = [dx_out, postact_out]
@@ -2311,7 +2340,9 @@ def gemm_dact(
         return tuple(results)
     if torch.compiler.is_compiling():
         if config is not None:
-            raise NotImplementedError("gemm_dact: explicit config under torch.compile")
+            raise NotImplementedError(
+                "gemm_with_activation_grad: explicit config under torch.compile"
+            )
         if SFA is not None:
             SFA, SFB = _sf_encode(SFA), _sf_encode(SFB)
         out_op = gemm_dgated_out if is_dgated else gemm_dact_out
@@ -2332,9 +2363,10 @@ def gemm_dact(
             SFB=SFB,
             bs_format_a=bs_format_a,
             bs_format_b=bs_format_b,
+            kernel_variant=kernel_variant,
         )
     else:
-        colvec_reduce_final = _gemm_dact_call(
+        colvec_reduce_final = _run_activation_grad_gemm(
             A,
             B,
             PreAct,
@@ -2352,6 +2384,7 @@ def gemm_dact(
             dynamic_scheduler=dynamic_scheduler,
             tuned=tuned,
             config=config,
+            kernel_variant=kernel_variant,
         )
     results = [dx_out, postact_out]
     if colvec_reduce:
@@ -2359,14 +2392,11 @@ def gemm_dact(
     return tuple(results)
 
 
-gemm_dgated = gemm_dact
-
-
 @torch.library.custom_op(
     "dlkernel::gemm_dact_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str? activation=None, bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None) -> Tensor",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str? activation=None, bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, str? kernel_variant=None) -> Tensor",
 )
 def gemm_dact_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2385,9 +2415,10 @@ def gemm_dact_out(
     SFB: Optional[Tensor] = None,
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
+    kernel_variant: str | None = None,
 ) -> Tensor:
     """GEMM with activation gradient and pre-allocated output tensors."""
-    result = _gemm_dact_call(
+    result = _run_activation_grad_gemm(
         A,
         B,
         PreAct,
@@ -2404,6 +2435,7 @@ def gemm_dact_out(
         bs_format_b=bs_format_b,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
+        kernel_variant=kernel_variant,
     )
     if result is None:  # Have to return a tensor, not None, to make torch compile happy
         return torch.empty(0, device=A.device, dtype=torch.float32)
@@ -2734,7 +2766,7 @@ def gemm_symmetric(
     "dlkernel::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None, str? kernel_variant=None) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2755,9 +2787,10 @@ def gemm_gated_out(
     bs_format_b: Optional[str] = None,
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
+    kernel_variant: str | None = None,
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
-    _gemm_act_call(
+    _run_activation_gemm(
         A,
         B,
         preact_out,
@@ -2775,6 +2808,7 @@ def gemm_gated_out(
         dynamic_scheduler=dynamic_scheduler,
         alpha=_merge_tensor(alpha, alpha_tensor),
         tuned=tuned,
+        kernel_variant=kernel_variant,
     )
 
 
@@ -2782,7 +2816,7 @@ def gemm_gated_out(
     "dlkernel::gemm_dgated_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a!) dx_out, Tensor(b!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None) -> Tensor",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a!) dx_out, Tensor(b!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, str? kernel_variant=None) -> Tensor",
 )
 def gemm_dgated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2801,9 +2835,10 @@ def gemm_dgated_out(
     SFB: Optional[Tensor] = None,
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
+    kernel_variant: str | None = None,
 ) -> Tensor:
     """GEMM with gated activation gradient and pre-allocated output tensors."""
-    result = _gemm_dact_call(
+    result = _run_activation_grad_gemm(
         A,
         B,
         PreAct,
@@ -2820,6 +2855,7 @@ def gemm_dgated_out(
         bs_format_b=bs_format_b,
         dynamic_scheduler=dynamic_scheduler,
         tuned=tuned,
+        kernel_variant=kernel_variant,
     )
     if result is None:  # Have to return a tensor, not None, to make torch compile happy
         return torch.empty(0, device=A.device, dtype=torch.float32)
@@ -2863,6 +2899,7 @@ def gemm_dgated_out_fake(
     SFB: Optional[Tensor] = None,
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
+    kernel_variant: Optional[str] = None,
 ) -> Tensor:
     return _colvec_reduce_fake(A, colvec_reduce, cu_seqlens_m, A_idx)
 
@@ -2885,6 +2922,7 @@ def gemm_dact_out_fake(
     SFB: Optional[Tensor] = None,
     bs_format_a: Optional[str] = None,
     bs_format_b: Optional[str] = None,
+    kernel_variant: Optional[str] = None,
 ) -> Tensor:
     return _colvec_reduce_fake(A, colvec_reduce, cu_seqlens_m, A_idx)
 
@@ -3538,3 +3576,6 @@ gemm_norm_gated_ref = gemm_norm_act_ref
 #     })
 # except ImportError:
 #     pass
+
+
+__all__ = ["gemm", "gemm_add"]

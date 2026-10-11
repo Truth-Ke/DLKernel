@@ -23,6 +23,7 @@ class GemmEpilogueTunePolicy(VarlenGemmTunePolicy):
         *,
         ragged_m_out_names: Optional[Iterable[str]] = None,
         opaque_tensor_names: Iterable[str] = (),
+        routed_m_tensor_names: Iterable[str] = ("mColVecBroadcast",),
     ) -> None:
         super().__init__()
         self.mod = mod
@@ -35,6 +36,7 @@ class GemmEpilogueTunePolicy(VarlenGemmTunePolicy):
             ragged_m_out_names = ("out", "C", "D", *declared_outputs)
         self._ragged_m_out_names = frozenset(ragged_m_out_names)
         self._opaque_tensor_names = frozenset((*sink_names, *opaque_tensor_names))
+        self._routed_m_tensor_names = frozenset(routed_m_tensor_names)
 
     def bind_signature(self, arg_names, arg_defaults) -> None:
         super().bind_signature(arg_names, arg_defaults)
@@ -55,6 +57,7 @@ class GemmEpilogueTunePolicy(VarlenGemmTunePolicy):
             self.arg_defaults,
             ragged_m_out_names=self._ragged_m_out_names,
             opaque_tensor_names=self._opaque_tensor_names,
+            routed_m_tensor_names=self._routed_m_tensor_names,
         )
         return default_key() if key is None else key
 

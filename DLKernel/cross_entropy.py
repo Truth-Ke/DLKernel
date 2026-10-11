@@ -764,3 +764,6 @@ def cross_entropy(
         raise ValueError(
             f"Invalid reduction mode: {reduction}. Expected one of 'none', 'mean', or 'sum'"
         )
+
+
+__all__ = ["cross_entropy", "cross_entropy_fwd", "cross_entropy_bwd"]

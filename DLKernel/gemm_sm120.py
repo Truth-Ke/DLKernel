@@ -243,6 +243,11 @@ class GemmSm120(GemmSm90):
     """
 
     arch = 120
+    # Host-side class selection (GemmBase.select_gemm_class). MUST stay an
+    # explicit override: this class inherits GemmSm90 for mainloop reuse, and
+    # the inherited (9,) would wrongly claim Hopper applicability — SM120
+    # hardware is not SM90 hardware.
+    supported_sm_majors = (12,)
     # CUTLASS sm120_builder StagesC policy (sm120_get_tma_dispatch_policy):
     # StagesC = StagesD = min(EpiTiles, 2) — "smaller stage counts in order to
     # fit within the limited shared memory capacity". At 101376 B the SM90

@@ -3,22 +3,25 @@
 import enum
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, Literal, Optional, Sequence, Tuple, Type
+from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Sequence, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
+import torch
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 from cutlass.utils import LayoutEnum
+from torch import Tensor
 
 import DLKernel.copy_utils as copy_utils
 import DLKernel.layout_utils as layout_utils
 import DLKernel.utils as utils
 from DLKernel import pipeline_checks
+from DLKernel.blockscaled.operand import BlockScaledOperand
 from DLKernel.cute_dsl_utils import ParamsBase
 from DLKernel.epilogue.ops import DStore, EpiSmemBytes, TileLoad, TileStore, VecReduce
-from DLKernel.gemm_config import SplitKMode
+from DLKernel.gemm_config import GemmConfig, SplitKMode
 from DLKernel.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from DLKernel.sync import Semaphore
 from DLKernel.tile_scheduler import (
@@ -29,6 +32,37 @@ from DLKernel.tile_scheduler import (
     VarlenMTileSchedulerArguments,
 )
 from DLKernel.varlen_utils import VarlenManager
+
+_GENERIC_GEMM_SPINE = None
+
+
+def _generic_gemm_spine() -> "frozenset":
+    """The classes allowed to cross a host entry as the generic root.
+
+    An explicit allowlist — never inferred from declared attributes. Built
+    lazily (every SM module imports GemmBase at module level, so this module
+    cannot import them eagerly) and cached; hot entries reach it only for a
+    ``None``-token class that is not GemmBase itself.
+    """
+    global _GENERIC_GEMM_SPINE
+    if _GENERIC_GEMM_SPINE is None:
+        from DLKernel.gemm_sm80 import GemmSm80
+        from DLKernel.gemm_sm90 import GemmSm90
+        from DLKernel.gemm_sm100 import GemmSm100
+        from DLKernel.gemm_sm120 import GemmSm120
+
+        _GENERIC_GEMM_SPINE = frozenset(
+            {GemmBase, GemmTmaBase, GemmSm80, GemmSm90, GemmSm100, GemmSm120}
+        )
+    return _GENERIC_GEMM_SPINE
+
+
+if TYPE_CHECKING:
+    # Annotation-only: both sit ABOVE this module in the import graph (the
+    # interface imports the SM modules, which import GemmBase), so importing
+    # either at module level would cycle. The public entries quote these names.
+    from DLKernel.epilogue.frontend import EpiMod
+    from DLKernel.gemm_interface import Activation
 
 
 class NamedBarrierGemm(enum.IntEnum):
@@ -74,6 +108,16 @@ class GemmBase:
     """Common non-mainloop pieces shared by GEMM architectures."""
 
     arch = 0
+    # Wire token for the compiled custom-op boundary (kernel_variant). A
+    # class that may be minted from across torch.compile declares a stable
+    # string here; None means the class cannot cross that boundary.
+    variant_id = None
+    # HOST-side class-selection contract (see select_gemm_class): the SM
+    # capability majors a concrete class applies to. None on the generic root
+    # and intermediate bases means "no concrete claim" — selection then maps
+    # the major to the generic SM base class instead. This never replaces the
+    # device instance's ``arch``, ``_supported_archs``, or codegen targets.
+    supported_sm_majors = None
     # Epilogue mixins that need a reduction over the full accumulator tile
     # BEFORE any subtile is stored (e.g. QK-norm's per-head sum of squares)
     # set this in epi_to_underlying_arguments. The epilogue then runs a
@@ -113,6 +157,288 @@ class GemmBase:
     # contiguous N dim; "m": along the contiguous M dim (the AB-swapped-caller
     # layout). Replaces the per-call torch .view(float32) host views.
     cd_packed = None
+
+    # ------------------------------------------------------------------
+    # Host-side class selection and kernel_variant identity (plain Python;
+    # device code never calls these)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def select_gemm_class(cls, sm_major: int) -> type:
+        """The Gemm class applicable to SM capability major ``sm_major``.
+
+        Returns a class, never an instance, and compiles nothing. On the
+        generic root (``supported_sm_majors`` None) the major maps to the
+        generic SM base class: 8 -> GemmSm80, 9 -> GemmSm90, 10/11 ->
+        GemmSm100, 12 -> GemmSm120. On a class that declares
+        ``supported_sm_majors``, a major inside the declared set returns
+        ``cls`` itself. SM120 overrides the set it would inherit from
+        GemmSm90: applicability is declared per class, never inferred from
+        the subclass relation.
+
+        Error categories follow the historical EpiMod kernel-base selection:
+        an unknown major raises ValueError; a known major outside the class's
+        declared set raises TypeError (the class exists but does not apply).
+        """
+        from DLKernel.gemm_sm80 import GemmSm80
+        from DLKernel.gemm_sm90 import GemmSm90
+        from DLKernel.gemm_sm100 import GemmSm100
+        from DLKernel.gemm_sm120 import GemmSm120
+
+        # Lazy: every SM module imports GemmBase at module level.
+        generic_bases = {
+            8: GemmSm80,
+            9: GemmSm90,
+            10: GemmSm100,
+            11: GemmSm100,
+            12: GemmSm120,
+        }
+        try:
+            generic = generic_bases[sm_major]
+        except KeyError:
+            raise ValueError(
+                f"unsupported SM major version {sm_major}; supported: {sorted(generic_bases)}"
+            ) from None
+        if cls.supported_sm_majors is None:
+            return generic
+        if sm_major not in cls.supported_sm_majors:
+            raise TypeError(
+                f"{cls.__module__}.{cls.__qualname__} supports SM majors "
+                f"{tuple(cls.supported_sm_majors)}, not {sm_major}"
+            )
+        return cls
+
+    @classmethod
+    def register_kernel_variant(cls) -> None:
+        """Register this class under its declared ``variant_id`` token.
+
+        The class-side entry for the neutral identity registry: checks the
+        class's own declaration — a stable string token and an importable
+        module-level definition (async workers rebuild the class from
+        module:qualname, so ``__main__`` locals cannot cross the boundary) —
+        then maps the token. Same token + same class is idempotent; a
+        different class on a taken token raises. Called explicitly after a
+        static role's class definition, never from ``__init_subclass__``:
+        ``type()``-minted kernel classes inherit the role but must stay out
+        of the registry.
+        """
+        token = cls.get_kernel_variant()
+        if token is None:
+            raise TypeError(
+                f"{cls.__module__}.{cls.__qualname__} declares no variant_id; a class "
+                "crossing the kernel_variant custom-op boundary must own a stable token"
+            )
+        if cls.__module__ == "__main__":
+            raise TypeError(
+                f"{cls.__qualname__} is defined in __main__, which a fresh process "
+                "cannot import; a kernel_variant class needs a module-level definition"
+            )
+        from DLKernel.gemm_runtime.identity import register_kernel_variant_class
+
+        register_kernel_variant_class(token, cls)
+
+    @classmethod
+    def get_kernel_variant(cls) -> Optional[str]:
+        """The declared kernel_variant wire token, or None (the generic root).
+
+        A pure declaration read — no registry access, no import. The trace
+        side reads this to fill the custom-op ``kernel_variant`` field.
+        """
+        token = cls.variant_id
+        if token is not None and (not isinstance(token, str) or not token):
+            raise TypeError(
+                f"{cls.__module__}.{cls.__qualname__} declares an invalid variant_id "
+                f"{token!r}; expected a non-empty string or None"
+            )
+        return token
+
+    @classmethod
+    def resolve_kernel_variant(cls, kernel_variant: Optional[str]) -> type:
+        """The static Gemm class for a ``kernel_variant`` token.
+
+        ``None`` means the generic root and returns ``GemmBase`` itself — a
+        constant return ahead of any registry lookup or import. A non-empty
+        token resolves through the neutral identity registry; an unknown
+        token raises instead of falling back to the generic root (a graph
+        carrying a token this process cannot resolve must not silently run a
+        different implementation). Architectural selection stays with
+        :meth:`select_gemm_class`, invoked when a class is actually minted.
+        """
+        if kernel_variant is None:
+            return GemmBase
+        from DLKernel.gemm_runtime.identity import resolve_kernel_variant_class
+
+        return resolve_kernel_variant_class(kernel_variant)
+
+    @classmethod
+    def bind_epilogue(cls, epilogue_mod: "EpiMod") -> "EpiMod":
+        """``epilogue_mod`` bound to this Gemm class.
+
+        The class-side entry of the single private composition seam: the full
+        rebuild lives in ``EpiMod._bind_gemm_class`` — a fresh EpiMod from the
+        original declaration parameters (output ops, pins, sinks, extra ops,
+        prepass, mode, vectorize) with ALL run caches empty, never a
+        ``copy.copy`` of a warm mod and never an in-place owner swap of the
+        library's math mod. Single-bind semantics: binding the generic root,
+        or re-binding the class a mod already belongs to, returns the original
+        object untouched (ahead of cache creation, declaration copy, digest
+        computation, and registration); only binding a different class
+        constructs a new declaration, memoized in the math mod's
+        ``_bound_epilogues`` (itself a run cache, cleared when pickled). The
+        bound class identity enters the semantic digest; minting routes
+        through :meth:`select_gemm_class`.
+        """
+        return epilogue_mod._bind_gemm_class(cls)
+
+    @classmethod
+    def _host_entry_variant(cls) -> Optional[str]:
+        """The wire token a host class entry crosses the op boundary with.
+
+        ``None`` is reserved for the generic spine: GemmBase, intermediate
+        plumbing bases, and the generic SM bases (which declare their own
+        ``supported_sm_majors``). A role fork — a subclass of a generic SM
+        base that ships no ``variant_id`` — must not cross as ``None``: the
+        execution side would resolve it to the generic root and silently run
+        the un-forked implementation. Refuse it here. Local composition of an
+        unregistered class via ``bind_epilogue`` remains available; this
+        guard applies only to the host entry / custom-op boundary.
+        """
+        token = cls.get_kernel_variant()
+        if token is None:
+            if cls is GemmBase or cls in _generic_gemm_spine():
+                return None
+            raise TypeError(
+                f"{cls.__module__}.{cls.__qualname__} is a GEMM role class without a "
+                "variant_id; a role crossing the kernel_variant custom-op boundary "
+                "must declare and register a stable token (or compose locally "
+                "via bind_epilogue)"
+            )
+        from DLKernel.gemm_runtime.identity import KERNEL_VARIANT_CLASSES
+
+        registered = KERNEL_VARIANT_CLASSES.get(token)
+        if registered is not cls:
+            holder = (
+                "no class in this process"
+                if registered is None
+                else f"{registered.__module__}.{registered.__qualname__}"
+            )
+            raise TypeError(
+                f"{cls.__module__}.{cls.__qualname__} crosses the kernel_variant "
+                f"boundary with token {token!r} registered to {holder}; declare "
+                "and register its own token (or compose locally via bind_epilogue)"
+            )
+        return token
+
+    @classmethod
+    def gemm_with_activation(
+        cls,
+        A: Tensor | BlockScaledOperand,
+        B: Tensor | BlockScaledOperand,
+        C: Tensor | None = None,
+        bias: Tensor | None = None,
+        activation: "Activation" = None,
+        alpha: float | Tensor = 1.0,
+        preact_out: Tensor | None = None,
+        postact_out: Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+        postact_dtype: torch.dtype | None = None,
+        cu_seqlens_m: Tensor | None = None,
+        A_idx: Tensor | None = None,
+        store_preact: bool = True,
+        dynamic_scheduler: bool = False,
+        tuned: bool = True,
+        config: GemmConfig | None = None,
+        concat_layout: tuple | None = None,
+        split_k: int | None = 1,
+        split_k_mode: int = SplitKMode.SERIAL,
+    ) -> tuple[Tensor | None, Tensor]:
+        """GEMM with activation (or gated activation) and optional output tensors.
+
+        ``alpha`` scales the accumulator before the activation
+        (``postact = act(alpha * A @ B + C + bias)``). It is applied in fp32 and
+        may be a float or a 1-element CUDA tensor; 1.0 keeps the alpha-free epilogue.
+
+        This class entry owns the public defaults; the shared implementation
+        (``_dispatch_activation_gemm``) receives them fully expanded. The
+        class crosses the compile boundary via ``cls.get_kernel_variant()``.
+        """
+        from DLKernel.gemm_interface import _dispatch_activation_gemm
+
+        return _dispatch_activation_gemm(
+            kernel_variant=cls._host_entry_variant(),
+            A=A,
+            B=B,
+            C=C,
+            bias=bias,
+            activation=activation,
+            alpha=alpha,
+            preact_out=preact_out,
+            postact_out=postact_out,
+            out_dtype=out_dtype,
+            postact_dtype=postact_dtype,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            store_preact=store_preact,
+            dynamic_scheduler=dynamic_scheduler,
+            tuned=tuned,
+            config=config,
+            concat_layout=concat_layout,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
+        )
+
+    @classmethod
+    def gemm_with_activation_grad(
+        cls,
+        A: Tensor | BlockScaledOperand,
+        B: Tensor | BlockScaledOperand,
+        PreAct: Tensor,
+        activation: "Activation" = None,
+        dx_out: Tensor | None = None,
+        postact_out: Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+        postact_dtype: torch.dtype | None = None,
+        colvec_scale: Tensor | None = None,
+        colvec_reduce: bool = False,
+        cu_seqlens_m: Tensor | None = None,
+        A_idx: Tensor | None = None,
+        dynamic_scheduler: bool = True,
+        tuned: bool = True,
+        config: GemmConfig | None = None,
+        split_k: int | None = 1,
+        split_k_mode: int = SplitKMode.SERIAL,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
+        """GEMM with activation (or gated activation) gradient and optional
+        output tensors; returns ``(dx, postact)`` plus the finalized colvec
+        reduce when ``colvec_reduce=True``.
+
+        Same contract shape as :meth:`gemm_with_activation`: public defaults
+        live here, the shared ``_dispatch_activation_grad_gemm`` receives them
+        expanded, and the class identity crosses via
+        ``cls.get_kernel_variant()``.
+        """
+        from DLKernel.gemm_interface import _dispatch_activation_grad_gemm
+
+        return _dispatch_activation_grad_gemm(
+            kernel_variant=cls._host_entry_variant(),
+            A=A,
+            B=B,
+            PreAct=PreAct,
+            activation=activation,
+            dx_out=dx_out,
+            postact_out=postact_out,
+            out_dtype=out_dtype,
+            postact_dtype=postact_dtype,
+            colvec_scale=colvec_scale,
+            colvec_reduce=colvec_reduce,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            dynamic_scheduler=dynamic_scheduler,
+            tuned=tuned,
+            config=config,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
+        )
 
     def _recast_packed_cd(self, mT):
         """Trace-time f32 view of a kernel-order 16-bit packed tensor: halve
@@ -1324,3 +1650,12 @@ class GemmTmaBase(GemmBase):
             op, tensor, smem_layout, smem_tile, internal_type=internal_type
         )
         return tma_atom, tma_tensor
+
+
+__all__ = ["GemmBase", "gemm_with_activation", "gemm_with_activation_grad"]
+
+
+# Public entry points: the classmethods bound once at import, so identity is
+# stable across re-exports (DLKernel.gemm_with_activation is this object).
+gemm_with_activation = GemmBase.gemm_with_activation
+gemm_with_activation_grad = GemmBase.gemm_with_activation_grad

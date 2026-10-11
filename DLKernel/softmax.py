@@ -421,3 +421,6 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
         Softmax output tensor of same shape as x
     """
     return SoftmaxFunction.apply(x)
+
+
+__all__ = ["softmax", "softmax_fwd", "softmax_bwd"]

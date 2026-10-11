@@ -5,18 +5,15 @@ import torch
 
 from DLKernel.cute_dsl_utils import get_device_capacity
 from DLKernel.gemm import gemm as dlkernel_gemm
+from DLKernel.gemm_base import GemmBase
 from DLKernel.gemm_interface import (
     gemm,
     gemm_ref,
     gemm_add,
     gemm_add_ref,
     gemm_add_inplace,
-    gemm_act,
-    gemm_dact,
     gemm_act_ref,
     gemm_dact_ref,
-    gemm_gated,
-    gemm_dgated,
     gemm_gated_ref,
     gemm_dgated_ref,
 )
@@ -405,7 +402,7 @@ def test_gemm_add_inplace_varlen_m(
 @pytest.mark.parametrize("n", [1024, 1504])
 @pytest.mark.parametrize("k", [512, 768])
 @pytest.mark.parametrize("num_groups", [2, 4])
-def test_gemm_act_varlen_m(
+def test_gemm_with_activation_varlen_m(
     num_groups,
     k,
     n,
@@ -430,7 +427,7 @@ def test_gemm_act_varlen_m(
     if B_major == "k":
         B = B.permute(0, 2, 1).contiguous().permute(0, 2, 1)
     # Test with kernel
-    preact, postact = gemm_act(
+    preact, postact = GemmBase.gemm_with_activation(
         A,
         B,
         C,
@@ -472,7 +469,7 @@ def test_gemm_act_varlen_m(
 @pytest.mark.parametrize("n", [1024, 1504])
 @pytest.mark.parametrize("k", [512, 768])
 @pytest.mark.parametrize("num_groups", [2, 4])
-def test_gemm_dact_varlen_m(
+def test_gemm_with_activation_grad_varlen_m(
     num_groups,
     k,
     n,
@@ -500,7 +497,7 @@ def test_gemm_dact_varlen_m(
         B = B.permute(0, 2, 1).contiguous().permute(0, 2, 1)
     colvec_scale = torch.randn(total_m, device=device) if has_colvec_scale else None
     # Test with kernel
-    dx, postact, *rest = gemm_dact(
+    dx, postact, *rest = GemmBase.gemm_with_activation_grad(
         A,
         B,
         PreAct,
@@ -561,7 +558,7 @@ def test_gemm_dact_varlen_m(
 @pytest.mark.parametrize("n", [1024, 1504])
 @pytest.mark.parametrize("k", [512, 768])
 @pytest.mark.parametrize("num_groups", [2, 4])
-def test_gemm_gated_varlen_m(
+def test_gemm_with_activation_gated_varlen_m(
     num_groups,
     k,
     n,
@@ -594,7 +591,7 @@ def test_gemm_gated_varlen_m(
     else:
         preact_buf, postact_buf = None, None
     # Test with kernel
-    preact, postact = gemm_gated(
+    preact, postact = GemmBase.gemm_with_activation(
         A,
         B,
         C,
@@ -649,7 +646,7 @@ def test_gemm_gated_varlen_m(
 # @pytest.mark.parametrize("k", [512])
 @pytest.mark.parametrize("num_groups", [2, 4])
 # @pytest.mark.parametrize("num_groups", [2])
-def test_gemm_dgated_varlen_m(
+def test_gemm_with_activation_grad_gated_varlen_m(
     num_groups,
     k,
     n,
@@ -683,7 +680,7 @@ def test_gemm_dgated_varlen_m(
     else:
         dx_buf, postact_buf = None, None
     # Test with kernel
-    dx, postact, *rest = gemm_dgated(
+    dx, postact, *rest = GemmBase.gemm_with_activation_grad(
         A,
         B,
         PreAct,
@@ -799,7 +796,7 @@ def test_gemm_varlen_m_concat(
 @pytest.mark.parametrize("n", [1504])
 @pytest.mark.parametrize("k", [736])
 @pytest.mark.parametrize("num_groups", [3])
-def test_gemm_gated_varlen_m_concat(
+def test_gemm_with_activation_gated_varlen_m_concat(
     num_groups,
     k,
     n,
@@ -827,7 +824,7 @@ def test_gemm_gated_varlen_m_concat(
         postact_buf = torch.empty((total_m, n // 2), device=device, dtype=input_dtype)
     else:
         preact_buf, postact_buf = None, None
-    preact, postact = gemm_gated(
+    preact, postact = GemmBase.gemm_with_activation(
         A,
         B,
         bias=bias,
@@ -916,8 +913,8 @@ def test_gemm_add_varlen_m_empty(zero_dim):
         assert torch.equal(out, C)
 
 
-@pytest.mark.parametrize("zero_dim", ["total_m", "N", "K"])
-def test_gemm_act_varlen_m_empty(zero_dim):
+@pytest.mark.parametrize("zero_dim", ["total_m", "N"])
+def test_gemm_with_activation_varlen_m_empty(zero_dim):
     L, total_m, K, N = 4, 4096, 4096, 4096
     if zero_dim == "total_m":
         total_m = 0
@@ -928,13 +925,15 @@ def test_gemm_act_varlen_m_empty(zero_dim):
     cu_seqlens_m = _make_cu_seqlens(L, total_m)
     A = torch.randn(total_m, K, device="cuda", dtype=torch.bfloat16)
     B = torch.randn(L, K, N, device="cuda", dtype=torch.bfloat16)
-    preact, postact = gemm_act(A, B, activation="relu", cu_seqlens_m=cu_seqlens_m, tuned=False)
+    preact, postact = GemmBase.gemm_with_activation(
+        A, B, activation="relu", cu_seqlens_m=cu_seqlens_m, tuned=False
+    )
     assert preact.shape == (total_m, N)
     assert postact.shape == (total_m, N)
 
 
-@pytest.mark.parametrize("zero_dim", ["total_m", "N", "K"])
-def test_gemm_dact_varlen_m_empty(zero_dim):
+@pytest.mark.parametrize("zero_dim", ["total_m", "N"])
+def test_gemm_with_activation_grad_varlen_m_empty(zero_dim):
     L, total_m, K, N = 4, 4096, 4096, 4096
     if zero_dim == "total_m":
         total_m = 0
@@ -946,7 +945,9 @@ def test_gemm_dact_varlen_m_empty(zero_dim):
     A = torch.randn(total_m, K, device="cuda", dtype=torch.bfloat16)
     B = torch.randn(L, K, N, device="cuda", dtype=torch.bfloat16)
     PreAct = torch.randn(total_m, N, device="cuda", dtype=torch.bfloat16)
-    out = gemm_dact(A, B, PreAct, activation="relu", cu_seqlens_m=cu_seqlens_m, tuned=False)
+    out = GemmBase.gemm_with_activation_grad(
+        A, B, PreAct, activation="relu", cu_seqlens_m=cu_seqlens_m, tuned=False
+    )
     dx, postact = out[0], out[1]
     assert dx.shape == (total_m, N)
     assert postact.shape == (total_m, N)

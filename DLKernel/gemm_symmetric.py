@@ -452,3 +452,6 @@ def _build_gemm_symmetric_plan(
         scheduler_uses_semaphore=scheduler_uses_semaphore,
         scheduler_static=scheduler_static,
     )
+
+
+__all__ = ["gemm_symmetric"]

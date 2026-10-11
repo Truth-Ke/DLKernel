@@ -135,7 +135,7 @@ def _run_rank():
         err = (postact.float() - ref).abs().max().item()
         tol = (baseline - ref).abs().max().item() + 1e-4
         if err > 2 * tol:
-            failures.append(f"rank{rank} AG+gemm_act(silu) iter={it}: err={err} tol={tol}")
+            failures.append(f"rank{rank} AG+gemm_with_activation(silu) iter={it}: err={err} tol={tol}")
 
     # --- Outer-capture smoke: the epoch is device-resident, so a caller may
     # capture any number of whole calls and replay.

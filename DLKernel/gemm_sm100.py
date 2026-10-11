@@ -202,6 +202,9 @@ class GemmSm100(GemmTmaBase):
     """
 
     arch = 100
+    # Host-side class selection (GemmBase.select_gemm_class): includes major
+    # 11 — B300 reports capability 11 while ``arch`` stays 100.
+    supported_sm_majors = (10, 11)
 
     EpilogueArguments = GemmTmaBase.EpilogueArguments
     EpilogueParams = GemmTmaBase.EpilogueParams
@@ -3003,7 +3006,7 @@ class GemmSm100(GemmTmaBase):
         ):
             is_valid = False
 
-        # Check valid d_dtype (None: gemm_act with no preact store)
+        # Check valid d_dtype (None: gemm_with_activation with no preact store)
         if d_dtype is not None and d_dtype not in {
             Float32,
             cutlass.Float16,

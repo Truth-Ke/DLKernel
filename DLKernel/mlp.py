@@ -1,27 +1,27 @@
 # Copyright (c) 2025, Tri Dao
-from typing import Literal
 from functools import partial
+from typing import Literal
 
 import torch
-import torch.nn as nn
-from torch import Tensor
-
 from einops import rearrange
+from torch import Tensor, nn
 
-from DLKernel.linear import linear_act_func, act_linear_func
-from DLKernel.linear import linear_gated_func, gated_linear_func
-from DLKernel.linear import linear_fwd_convert_type
-from DLKernel.linear import _recompute_act_postact, _recompute_gated_postact
 from DLKernel.activation import gate_fn_map
+from DLKernel.gemm_base import GemmBase
 from DLKernel.gemm_interface import (
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
     gemm,
     gemm_add_inplace,
-    gemm_gated,
-    gemm_dgated,
-    gemm_act,
-    gemm_dact,
+)
+from DLKernel.linear import (
+    _recompute_act_postact,
+    _recompute_gated_postact,
+    act_linear_func,
+    gated_linear_func,
+    linear_act_func,
+    linear_fwd_convert_type,
+    linear_gated_func,
 )
 
 Activation = Literal[
@@ -45,8 +45,8 @@ Activation = Literal[
 
 class _MLPOps:
     matmul_fwd = gemm
-    matmul_fwd_act = gemm_act
-    matmul_bwd_dact = partial(gemm_dact, dynamic_scheduler=True)
+    matmul_fwd_act = GemmBase.gemm_with_activation
+    matmul_bwd_dact = partial(GemmBase.gemm_with_activation_grad, dynamic_scheduler=True)
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True)
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
@@ -55,8 +55,10 @@ class _MLPOps:
 
 class _MLPUntunedOps:
     matmul_fwd = partial(gemm, tuned=False)
-    matmul_fwd_act = partial(gemm_act, tuned=False)
-    matmul_bwd_dact = partial(gemm_dact, dynamic_scheduler=True, tuned=False)
+    matmul_fwd_act = partial(GemmBase.gemm_with_activation, tuned=False)
+    matmul_bwd_dact = partial(
+        GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tuned=False
+    )
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
@@ -64,19 +66,22 @@ class _MLPUntunedOps:
 
 
 class _MLPGatedOps(_MLPOps):
-    matmul_fwd_act = gemm_gated
-    matmul_bwd_dact = partial(gemm_dgated, dynamic_scheduler=True)
+    # Gated math is selected by the activation name inside both class entries.
+    matmul_fwd_act = GemmBase.gemm_with_activation
+    matmul_bwd_dact = partial(GemmBase.gemm_with_activation_grad, dynamic_scheduler=True)
     recompute_postact = staticmethod(_recompute_gated_postact)
 
 
 class _MLPGatedUntunedOps(_MLPUntunedOps):
-    matmul_fwd_act = partial(gemm_gated, tuned=False)
-    matmul_bwd_dact = partial(gemm_dgated, dynamic_scheduler=True, tuned=False)
+    matmul_fwd_act = partial(GemmBase.gemm_with_activation, tuned=False)
+    matmul_bwd_dact = partial(
+        GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tuned=False
+    )
     recompute_postact = staticmethod(_recompute_gated_postact)
 
 
 class _MLPGatedConcatOps(_MLPGatedOps):
-    matmul_fwd_act = partial(gemm_gated, concat_layout=("B",))
+    matmul_fwd_act = partial(GemmBase.gemm_with_activation, concat_layout=("B",))
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, concat_layout=("B",))
     matmul_bwd_dw1 = partial(gemm, dynamic_scheduler=True, concat_layout=("out",))
     matmul_bwd_dw1_inplace = partial(
@@ -86,7 +91,7 @@ class _MLPGatedConcatOps(_MLPGatedOps):
 
 
 class _MLPGatedConcatUntunedOps(_MLPGatedUntunedOps):
-    matmul_fwd_act = partial(gemm_gated, tuned=False, concat_layout=("B",))
+    matmul_fwd_act = partial(GemmBase.gemm_with_activation, tuned=False, concat_layout=("B",))
     matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
     matmul_bwd_dw1 = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
     matmul_bwd_dw1_inplace = partial(
@@ -103,8 +108,9 @@ class MLPRecomputeFunc(torch.autograd.Function):
       - Saves: batch * 2 * hidden * dtype_size bytes of activation memory
       - Costs: one extra GEMM (x @ W1.T) during backward
 
-    Ops class selects between non-gated (gemm_act/gemm_dact) and gated (gemm_gated/gemm_dgated)
-    variants, as well as tuned/untuned.
+    Ops class selects between non-gated and gated activation math (chosen by the
+    activation name inside gemm_with_activation / gemm_with_activation_grad),
+    as well as tuned/untuned.
     """
 
     @staticmethod
@@ -123,10 +129,10 @@ class MLPRecomputeFunc(torch.autograd.Function):
             # Save only x and weights — no preact (the whole point of recompute)
             needs_input_grad = ctx.needs_input_grad
             any_grad = needs_input_grad[0] or needs_input_grad[1] or needs_input_grad[2]
-            need_dact = needs_input_grad[0] or needs_input_grad[1]  # gemm_dact for dpreact
+            need_dact = needs_input_grad[0] or needs_input_grad[1]  # grad GEMM for dpreact
             saved_x = x if any_grad else None  # recompute preact = x @ W1.T
             saved_w1 = weight1 if any_grad else None  # recompute + dx
-            saved_w2 = weight2 if need_dact else None  # only gemm_dact needs W2
+            saved_w2 = weight2 if need_dact else None  # only the grad GEMM needs W2
             ctx.save_for_backward(
                 saved_x,
                 saved_w1,
@@ -151,12 +157,13 @@ class MLPRecomputeFunc(torch.autograd.Function):
             recompute_fwd = getattr(ops, "recompute_fwd", ops.matmul_fwd)
             if need_dact:
                 preact = recompute_fwd(x_flat, weight1.T)
-                # gemm_dact computes: dpreact = d_act(dout @ W2, preact) AND recomputes postact
+                # The grad GEMM computes dpreact = d_act(dout @ W2, preact) AND
+                # recomputes postact
                 dpreact, postact = ops.matmul_bwd_dact(
                     dout, weight2, preact, activation=ctx.activation
                 )
             elif any_grad:
-                # Only dW2 needed: recompute postact from preact cheaply (no gemm_dact)
+                # Only dW2 needed: recompute postact from preact cheaply (no grad GEMM)
                 preact = recompute_fwd(x_flat, weight1.T)
                 postact = ops.recompute_postact(preact, ctx.activation)
                 dpreact = None
@@ -333,3 +340,6 @@ class MLP(nn.Module):
             else:
                 y = act_to_pytorch_fn_map[self.activation](y)
             return self.fc2(y)
+
+
+__all__ = ["MLP"]

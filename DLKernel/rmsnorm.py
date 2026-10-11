@@ -1872,3 +1872,6 @@ def layernorm_rstd_ref(x: torch.Tensor, eps: float = 1e-6):
 
 def layernorm_mean_ref(x: torch.Tensor) -> torch.Tensor:
     return x.float().mean(dim=-1)
+
+
+__all__ = ["RMSNorm", "rmsnorm", "rmsnorm_fwd", "rmsnorm_bwd", "rmsnorm_ref", "rmsnorm_bwd_ref"]

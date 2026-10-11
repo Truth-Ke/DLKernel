@@ -600,13 +600,12 @@ def rule_table() -> Dict[str, Any]:
 #: 32 routed rows per expert; a finer floor would only split the key space.
 _MIN_AVERAGE_ROWS = 32
 
-#: Prefix of the key.  v3 includes the selector leaf, canonical defaults and
-#: the operand device identity.  v4 bumps because the k-high candidate set
-#: gained the dynamic-persistent twins (varlen-rule-tree-v7): a v3 cache entry
-#: pins a winner chosen among static-only candidates, and without the bump a
-#: warm cache would never measure the twins.  A version bump deliberately
-#: orphans older caches whose entries did not carry those distinctions.
-_KEY_VERSION = "gemm_token_bucket_v4"
+#: Prefix of the key.  v3 includes the selector leaf, canonical defaults and the
+#: operand device identity.  v4 adds the dynamic-persistent k-high candidates;
+#: v5 additionally canonicalizes routed epilogue vectors such as
+#: ``mColVecBroadcast`` with the routed-M bucket.  Each bump deliberately
+#: orphans older winners whose identity did not carry the new distinction.
+_KEY_VERSION = "gemm_token_bucket_v5"
 
 #: Named operands.  They are covered by the shape rewrite below, so they are
 #: never added to the key as plain values (their identity does not matter).
@@ -693,6 +692,7 @@ def gemm_tune_key(
     arg_defaults=None,
     ragged_m_out_names=("out", "C", "D"),
     opaque_tensor_names=(),
+    routed_m_tensor_names=(),
 ) -> Optional[Tuple[Any, ...]]:
     """Bucket-collapsed varlen tune key; ``None`` for dense calls.
 
@@ -705,10 +705,16 @@ def gemm_tune_key(
     bundled transform operands).  Only ``dtype`` enters the key; capacity
     legality is enforced per call by the operator's prune, not by winner
     identity.
+
+    ``routed_m_tensor_names``: per-routed-row vectors (for example
+    ``mColVecBroadcast`` in a fused MoE epilogue).  Their row extent is
+    canonicalized with the same routed-M bucket as ``A``/the ragged outputs;
+    runtime shape and buffer legality remain checked by the operator.
     """
     names = tuple(arg_names)
     ragged_m_out_names = frozenset(ragged_m_out_names)
     opaque_names = frozenset(opaque_tensor_names)
+    routed_m_tensor_names = frozenset(routed_m_tensor_names)
     positions = _argument_index(names)
     if arg_defaults is None:
         defaults = {}
@@ -809,6 +815,11 @@ def gemm_tune_key(
         # Only declared roles may collapse M; equal extents do not imply equal roles.
         if varlen_m and name in ragged_m_out_names and len(shape) >= 2:
             shape[-2] = _ragged_dimension(shape[-2], m_experts)
+        elif varlen_m and name in routed_m_tensor_names and len(shape) >= 1:
+            # mColVecBroadcast is a per-routed-row vector.  Use its final
+            # extent for both (M,) and (L, M) spellings, while leaving the
+            # actual tensor shape available to runtime legality checks.
+            shape[-1] = _ragged_dimension(shape[-1], m_experts)
         elif varlen_m and name == "A" and not gather_a and len(shape) >= 2:
             shape[-2] = _ragged_dimension(shape[-2], m_experts)
         if varlen_m and name == "A_idx" and len(shape) >= 1:

@@ -196,13 +196,8 @@ from DLKernel.gemm_config import (
     default_config,
 )
 from DLKernel.gemm_tvm_ffi_utils import tensor_key
-from DLKernel.gemm_sm80 import GemmSm80
-from DLKernel.gemm_sm90 import GemmSm90
-from DLKernel.gemm_sm100 import GemmSm100
-from DLKernel.gemm_sm120 import GemmSm120
+from DLKernel.gemm_base import GemmBase
 from DLKernel.rounding import RoundingMode
-
-_SM_BASE = {8: GemmSm80, 9: GemmSm90, 10: GemmSm100, 11: GemmSm100, 12: GemmSm120}
 
 _EPI_MODES = {"element", "acc_pair", "packed_cd_b16x2"}
 
@@ -307,8 +302,36 @@ class EpiMod:
         prepass_outs=(),
         extra_ops=(),
         vectorize=None,
+        _gemm_cls=None,
     ):
         self.fn = fn
+        # Normalize the iterable declarations ONCE, ahead of both the recipe
+        # and the body below: a generator argument must never be consumed
+        # twice (the snapshot and the body would otherwise disagree). The
+        # tuples are immutable, so the recipe shares these exact objects.
+        outputs = tuple(outputs)
+        paired = tuple(paired)
+        prepass_outs = tuple(prepass_outs)
+        extra_ops = tuple(extra_ops)
+        # The ORIGINAL declaration arguments, taken before any promotion
+        # below: ``_bind_gemm_class`` rebuilds a bound copy through this
+        # constructor, and the promoted pieces of ``self`` (quant codecs
+        # lifted into extra_ops, the merged sinks dict, the resolved mode)
+        # must never be fed back as constructor arguments. Dicts are copied
+        # so a caller-side mutation after construction cannot leak into a
+        # later rebuild; the normalized tuples are shared.
+        self._ctor_recipe = (
+            outputs,
+            dict(ops) if ops else None,
+            dict(reduces) if reduces else None,
+            mode,
+            paired,
+            dict(outs) if outs else None,
+            prepass,
+            prepass_outs,
+            extra_ops,
+            vectorize,
+        )
         # ``outputs`` entries are names or TileStore instances (per-op config:
         # rounding, predicate, quantize codec); a bare name gets a default
         # TileStore.
@@ -356,6 +379,9 @@ class EpiMod:
         if vectorize not in (None, False):
             raise ValueError("vectorize= accepts None (auto) or False (escape hatch)")
         self.vectorize = vectorize
+        # The bound Gemm class (None = the generic root — an unbound math
+        # mod; ``_mint`` routes that through GemmBase.select_gemm_class).
+        self._gemm_cls = _gemm_cls
         self.prepass = prepass
         self.prepass_outs = tuple(prepass_outs)
         if (prepass is None) != (not self.prepass_outs):
@@ -405,6 +431,12 @@ class EpiMod:
             tuple(op.cache_key() for _, op in sorted(self.output_ops.items())),
             tuple(op.cache_key() for op in self.extra_ops),
             ("vectorize", self.vectorize),
+            (
+                "gemm_cls",
+                None
+                if self._gemm_cls is None
+                else (self._gemm_cls.__module__, self._gemm_cls.__qualname__),
+            ),
         )
         self.semantic_digest = hashlib.sha256(repr(self.semantic_key).encode()).hexdigest()
         self._ident = f"{fn.__name__}_{self.semantic_digest[:16]}"
@@ -415,12 +447,15 @@ class EpiMod:
 
     def __getstate__(self):
         # Shipped by value (cloudpickle) to async-compile workers when there
-        # is no importable anchor: the minted classes and launch plans are
-        # process-local (compiled fns, registered dynamic classes) — the
-        # worker re-mints from the recipe.
+        # is no importable anchor: the minted classes, launch plans, eager
+        # call recipes and the binding memo are process-local (compiled fns,
+        # registered dynamic classes, owner-keyed bound mods) — the worker
+        # re-mints from the recipe.
         state = self.__dict__.copy()
         state["_minted"] = {}
         state["_plan_cache"] = {}
+        state["_call_cache"] = {}
+        state.pop("_bound_epilogues", None)
         return state
 
     def _module_locator(self):
@@ -450,6 +485,58 @@ class EpiMod:
             mint_key=mint_key,
             semantic_digest=self.semantic_digest,
         )
+
+    def _bind_gemm_class(self, gemm_cls: type) -> "EpiMod":
+        """This declaration bound to the Gemm class ``gemm_cls`` (the body of
+        ``GemmBase.bind_epilogue``). Fails fast on a non-class argument.
+
+        if not isinstance(gemm_cls, type):
+            raise TypeError(
+                f"gemm_cls {gemm_cls!r} must be a Gemm class, not an instance"
+            )
+        Identity fast returns first — they must stay ahead of memo creation
+        and any construction/digest work: rebinding the class a mod already
+        belongs to returns the same object, and a generic math mod
+        (``_gemm_cls`` None, the library-factory default) bound to the
+        generic root ``GemmBase`` IS that generic mod. Only an actual change
+        of class allocates the lazy ``_bound_epilogues`` memo on the math mod
+        and constructs a new EpiMod from the pre-promotion ``_ctor_recipe`` —
+        through this constructor, so every validation and the
+        ``TORCH_OP_EPI_MODS`` digest registration run again, quantize codecs
+        lift exactly once, and all runtime caches start empty (nothing is
+        copied from the math mod or a sibling binding).
+        """
+        if not isinstance(gemm_cls, type):
+            raise TypeError(f"gemm_cls {gemm_cls!r} must be a Gemm class, not an instance")
+        if self._gemm_cls is gemm_cls:
+            return self
+        if self._gemm_cls is None and gemm_cls is GemmBase:
+            return self
+        memo = self.__dict__.get("_bound_epilogues")
+        if memo is None:
+            memo = self._bound_epilogues = {}
+        bound = memo.get(gemm_cls)
+        if bound is not None:
+            return bound
+        outputs, ops, reduces, mode, paired, outs, prepass, prepass_outs, extra_ops, vectorize = (
+            self._ctor_recipe
+        )
+        bound = EpiMod(
+            self.fn,
+            outputs=outputs,
+            ops=ops,
+            reduces=reduces,
+            mode=mode,
+            paired=paired,
+            outs=outs,
+            prepass=prepass,
+            prepass_outs=prepass_outs,
+            extra_ops=extra_ops,
+            vectorize=vectorize,
+            _gemm_cls=gemm_cls,
+        )
+        memo[gemm_cls] = bound
+        return bound
 
     def _mint(
         self, kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms, add_to_output
@@ -522,10 +609,17 @@ class EpiMod:
             self._minted[key] = existing
             return existing
         # The store path (incl. the gated halved-tile machinery) is TileStore
-        # config, so every minted class shares one base pair.
+        # config, so every minted class shares one base pair — selected (and
+        # validated against the arch map) in one place: the bound Gemm class
+        # owns arch applicability (GemmBase.select_gemm_class on the generic
+        # root). Roles are scheduling/mainloop forks whose ``arch`` names the
+        # forked generation, never a capability claim — never read
+        # ``role.arch`` as the capability major.
+        gemm_cls = self._gemm_cls if self._gemm_cls is not None else GemmBase
+        base_cls = gemm_cls.select_gemm_class(sm)
         cls = type(
             cls_name,
-            (_EpiModMixinBase, _SM_BASE[sm]),
+            (_EpiModMixinBase, base_cls),
             {
                 "_epi_ops": tuple(epi_ops),
                 "_epi_mod_fn": staticmethod(self.fn),

@@ -42,7 +42,7 @@ def test_gemm_policy_binds_signature_and_stages_selection(monkeypatch):
     configs = [AutotuneConfig(config="a"), AutotuneConfig(config="b")]
 
     key = policy.make_key((A, B, out, cu), {}, lambda: ("default",))
-    assert key[0] == "gemm_token_bucket_v4"
+    assert key[0] == "gemm_token_bucket_v5"
     prepared = policy.prepare_candidates(configs, {"A": A}, {"cu_seqlens_m": cu})
     selected = policy.shortlist(prepared, {"A": A}, {"cu_seqlens_m": cu})
 
@@ -106,6 +106,49 @@ def test_same_bucket_same_leaf_shares_key_and_cross_leaf_splits(monkeypatch):
     assert key_high_1 == key_high_2  # same bucket + same leaf -> shared winner
     assert key_low != key_high_1  # same bucket, different leaf -> tuned apart
     assert ("avg_expert_m", 2048) in key_low and ("avg_expert_m", 2048) in key_high_1
+
+
+def test_epilogue_policy_buckets_routed_mcolvec_broadcast(monkeypatch):
+    """The routed score vector shares the same M bucket as the expert rows."""
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("DLKERNEL_ARCH", "90")
+    policy = GemmEpilogueTunePolicy(SimpleNamespace(outputs=(), sinks={}))
+    policy.bind_signature(
+        ("A", "B", "D", "mColVecBroadcast", "cu_seqlens_m"),
+        (None,) * 5,
+    )
+
+    def key_for(total_m):
+        A = torch.empty((total_m, 512), dtype=torch.bfloat16)
+        B = torch.empty((32, 512, 512), dtype=torch.bfloat16)
+        D = torch.empty((total_m, 512), dtype=torch.bfloat16)
+        route = torch.empty((total_m,), dtype=torch.bfloat16)
+        cu = torch.empty((33,), dtype=torch.int32)
+        return policy.make_key(
+            (),
+            {"A": A, "B": B, "D": D, "mColVecBroadcast": route, "cu_seqlens_m": cu},
+            lambda: ("dense",),
+        )
+
+    # Both workloads are in the same avg-M bucket and the same m-high selector leaf.
+    assert key_for(32 * 1200) == key_for(32 * 1250)
+    # Crossing the next power-of-two average-M bucket must still split the winner.
+    assert key_for(32 * 2500) != key_for(32 * 1250)
+
+    dense = torch.empty((32 * 1250,), dtype=torch.bfloat16)
+    dense_key = policy.make_key(
+        (),
+        {
+            "A": torch.empty((32 * 1250, 512), dtype=torch.bfloat16),
+            "B": torch.empty((32, 512, 512), dtype=torch.bfloat16),
+            "D": torch.empty((32 * 1250, 512), dtype=torch.bfloat16),
+            "mColVecBroadcast": dense,
+            "cu_seqlens_m": None,
+        },
+        lambda: ("dense",),
+    )
+    assert dense_key == ("dense",)
 
 
 def test_epilogue_policy_buckets_scratch_and_d_output(monkeypatch):
