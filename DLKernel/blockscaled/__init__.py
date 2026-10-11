@@ -11,7 +11,7 @@
 
 The GEMM entry points live in :mod:`DLKernel.gemm_interface`; pass
 :class:`BlockScaledOperand` operands (``(data, scale_factor)`` tuples are
-rejected with a TypeError). Design doc: ``AI/blockscaled_api.md``.
+rejected with a TypeError). Design doc: ``docs/modules/blockscaled_api.md``.
 """
 
 from DLKernel.blockscaled.operand import (  # noqa: F401

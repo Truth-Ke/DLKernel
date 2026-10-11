@@ -792,7 +792,7 @@ class TileScheduler:
            proves every real work index has left the pool. An INVALID
            response proves nothing: clusterlaunchcontrol.try_cancel fails
            SPURIOUSLY under GPU contention long before the pool is empty
-           (standalone repro: AI/repro_clc_spurious_invalid.py), and the
+           (reproduced standalone under contention), and the
            original drain — triggered on such retirements, with a
            budget/baseline read from the invalid response's garbage bidx —
            canceled hundreds of REAL pending clusters (whole trailing
@@ -838,7 +838,7 @@ class TileScheduler:
         history of this function).
 
         Reproduce with ``python benchmarks/benchmark_clc_varlen_drain.py
-        --warmup 50 --rep 500``. See AI/clc_spurious_invalid_investigation.md
+        --warmup 50 --rep 500``. See docs/notes/clc_spurious_invalid_investigation.md
         for the correctness investigation."""
         if const_expr(
             self.params.persistence_mode == PersistenceMode.CLC and self.grid_may_exceed_work

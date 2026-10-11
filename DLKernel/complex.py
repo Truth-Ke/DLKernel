@@ -16,7 +16,7 @@ Boundary convention (tvm-ffi): the compiled kernel's ABI sees f64 storage.
 At the call site, pass `torch.complex64` tensors as `t.view(torch.float64)`
 -- use `complex_storage(t)` for the conversion.
 
-See `AI/complex64_design_notes.md` for the why and what's been validated.
+See `docs/modules/complex64.md` for the why and what's been validated.
 """
 
 from __future__ import annotations

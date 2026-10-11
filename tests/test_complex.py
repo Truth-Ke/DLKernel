@@ -192,7 +192,7 @@ def test_complex_static_unpack_pack_roundtrip():
 
 
 # ===========================================================================
-# Tier 1-8 Complex64 type tests. See AI/complex64_design_notes.md for the
+# Tier 1-8 Complex64 type tests. See docs/modules/complex64.md for the
 # behaviors being pinned. Most kernel-side tests share the same harness:
 # launch a one-thread kernel that writes test results into a small Complex64
 # output buffer; verify on the host.

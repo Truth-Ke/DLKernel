@@ -507,7 +507,7 @@ def create_blockscaled_varlen_m_operands(
     # Build padded SFA storage (tile-aligned per-batch). Each expert's m_i rows of
     # scales are written at padded tile offset `cu_seqlens[i] // 128 + i`.
     # Allocation: `ceildiv(total_m, 128) + (L - 1)` tiles — proven sufficient
-    # in AI/varlen_blockscaled_sf_layout.md (proof 2's "tighter alternative").
+    # in docs/modules/varlen_blockscaled_sf_layout.md (proof 2's "tighter alternative").
     # Matches `total_m // 128 + L` when total_m % 128 > 0; 1 tile smaller
     # when total_m is an exact multiple of 128.
     tile = 128

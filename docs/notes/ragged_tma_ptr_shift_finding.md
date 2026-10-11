@@ -58,8 +58,8 @@ Concretely:
 
 This is what `DLKernel/gemm_sm90.py` and `DLKernel/gemm_sm100.py` currently implement.
 
-## Reproducer scripts
+## A/B/C checks
 
-- `AI/repro_tma_store_ok.py` — varlen_m GEMM (D store uses ptr_shift=True): **PASS**
-- `AI/repro_tma_load_fail.py` — varlen_k GEMM (A/B loads use ptr_shift=True): **FAIL**
-- `AI/repro_tma_load_ok.py` — varlen_k GEMM (A/B loads use ptr_shift=False): **PASS**
+- varlen_m GEMM (D store uses ptr_shift=True): **PASS**
+- varlen_k GEMM (A/B loads use ptr_shift=True): **FAIL** — the base pointer, shifted backward ~1 GB, lands in unmapped memory
+- varlen_k GEMM (A/B loads use ptr_shift=False): **PASS**

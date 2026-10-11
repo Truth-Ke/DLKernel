@@ -53,13 +53,13 @@ Key rules:
 **Reduction kernels** (`rmsnorm.py`, `softmax.py`, `cross_entropy.py`) inherit from `ReductionBase` in `reduction_base.py`. They share a pattern: configure cluster size, get tiled copies, allocate reduction buffers with mbarriers, then launch a `@cute.kernel`.
 
 **GEMM** has a multi-layer design:
-- `gemm.py` — public API, validates inputs, selects SM version, caches compiled kernels
-- `gemm_interface.py` — unified interface across SM versions
+- `gemm_interface.py` — variant API on top: unified entry (`gemm`/`gemm_act`/...), validates inputs, allocates outputs
+- `gemm.py` — low-level dispatch it calls: plan cache, SM version selection, jit compile + launch
 - `gemm_sm90.py` / `gemm_sm100.py` — SM-specific implementations
 - `DLKernel/epilogue/` — fused epilogues: `ops.py` (EpiOp vocabulary) → `mixin.py`
   (ComposableEpiMixin) → `frontend.py`/`visit.py` (`@gemm_epilogue` fn authoring +
   minted kernel classes) → `library.py` + domain modules (rotary, scaled_exp, ...).
-  Hand-written mixins (`gemm_default_epi.py`, `gemm_drmsnorm_bwd.py`) are the escape hatch.
+  Hand-written mixins (`gemm_default_epi.py`) are the escape hatch.
 - `DLKernel/gemm_runtime/` — generic host plumbing shared by every epilogue/transform:
   `identity.py` (digests, refs, registries — a leaf) → `host.py` (plan/compile/launch) →
   `torch_op.py` (the single `dlkernel::gemm_epi` custom op) + `autotune.py`
@@ -81,6 +81,8 @@ Key rules:
 Tests use pytest with parametrize across dtypes (`float32`, `float16`, `bfloat16`), dimensions, and batch sizes. Each test includes a reference implementation for numerical validation.
 
 Every test must verify **numerical correctness** against a reference, not just shapes or smoke. A test that only checks `.shape` or "doesn't crash" is not a test — it hides bugs. Always compare kernel output values against a PyTorch reference (float32 for ground truth, same dtype for tolerance baseline).
+
+## Deep-dive docs: see docs/README.md
 
 ## Iteration Speed
 

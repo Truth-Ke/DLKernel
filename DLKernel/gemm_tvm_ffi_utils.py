@@ -91,7 +91,7 @@ def validate_blockscaled_sf(
     (total_m, k) and SFA must be a single M-padded buffer (tile-aligned
     per-batch padding) (1, total_padded_rm, rk, 32, 4, 4) with
     total_padded_rm >= ceil(total_m/128) + (num_batches - 1) — the bound from
-    AI/varlen_blockscaled_sf_layout.md that suffices for any per-batch split
+    docs/modules/varlen_blockscaled_sf_layout.md that suffices for any per-batch split
     of total_m. SFB stays per-batch: (num_batches, rn, rk, 32, 4, 4).
 
     When varlen_k, A is (m, total_k) m-major and B is (n, total_k) n-major
@@ -725,8 +725,7 @@ def compile_gemm_kernel(
             # SM120's dynamic persistence is CLC (cluster launch control, same
             # Blackwell feature as sm100's) — no tile-count semaphore needed.
             # Pingpong included: it consumes CLC responses one-at-a-time
-            # (128x128 pingpong + CLC is the best-measured mxfp8 config, see
-            # AI/sm120_blockscaled_gemm_worklog.md).
+            # (128x128 pingpong + CLC is the best-measured mxfp8 config).
             # Gate on the COMPILE TARGET, not the dispatch arch: CLC
             # instructions are sm_100+, so the H100 CI proxy legs
             # (DLKERNEL_ARCH=120 compiled for sm_90a) must fall back to the

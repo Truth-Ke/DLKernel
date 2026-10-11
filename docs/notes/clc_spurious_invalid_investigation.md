@@ -10,8 +10,7 @@ is harmless for exact grids, but DLKernel's varlen padding drain (`afe2ef3`)
 fired blind cancels at exactly these false retirements and killed **real**
 pending tiles, whose output rows silently kept stale allocator memory.
 Fixed by gating the drain on a *decoded phantom* (a valid grant whose work
-index delinearizes to padding) — never on an invalid response. Standalone
-reproducer: `AI/repro_clc_spurious_invalid.py`.
+index delinearizes to padding) — never on an invalid response.
 
 ## Symptom
 
@@ -73,7 +72,7 @@ controlled experiment, and several produced independently useful facts:
 
 | Hypothesis | Verdict | Evidence |
 |---|---|---|
-| Grant non-monotonicity (cancels steal real tiles out of order) | **refuted** | 576M observed cancels, zero out-of-order grants (`repro_clc_grant_monotonicity.py`) |
+| Grant non-monotonicity (cancels steal real tiles out of order) | **refuted** | 576M observed cancels, zero out-of-order grants |
 | Orphaned response write-backs at CTA exit | real hazard, not this bug | fire-and-forget exit fail-stops with Xid 43 in minimal kernels; but a response-drained spray still corrupted |
 | Cross-grid cancels (killing the next launch's clusters) | **refuted** | 0/800 back-to-back-PDL trials; grants never cross grid boundaries |
 | PDL, multicast queries, pipelined 2-in-flight queries | clean | direct probe arms |
@@ -115,14 +114,7 @@ back-to-back. Adding `--stream-depth` (N launches per sync) to the probe:
 The reproducing kernel is a **plain serial try_cancel steal loop** — no
 multicast, no PDL, no TMEM, no TMA, 32 threads/CTA. The verdict is
 self-proving: on an invalid response the probe retries; a grant on the retry
-proves the pool was non-empty. Run it:
-
-```bash
-# terminal 1: any contender, e.g. a matmul loop 3s-on/2s-off
-# terminal 2:
-python AI/repro_clc_spurious_invalid.py --trials 3000 --stream-depth 300
-# -> RESULT streaming grid=1344 depth=300 launches=3000: 73 RETRY-PROVEN spurious invalids
-```
+proves the pool was non-empty.
 
 Bug-report one-liner: *with several `clusterlaunchcontrol` grids queued
 back-to-back on a stream and a second process time-slicing the GPU,
@@ -174,12 +166,6 @@ drain, 300 µs-delayed drain. Delay-only (no cancels): clean.
 
 ## Artifacts
 
-- `AI/repro_clc_spurious_invalid.py` — the minimal reproducer + full
-  ingredient/exoneration matrix in its docstring (`--stream-depth`,
-  `--multicast`, `--pdl-attr`, `--xgrid`, `--tmem`, `--traffic`,
-  `--tma-traffic`, `--pipelined` modes).
-- `AI/repro_clc_grant_monotonicity.py` — grant-order validation (576M
-  cancels, monotone) and the Xid-43 fire-and-forget-exit fail-stop repro.
 - `DLKernel/tile_scheduler.py::cancel_pending_tail` — the fixed drain, with the
   invariants documented in its docstring.
 - Test-level repro: `pytest tests/test_linear_varlen_m.py -k

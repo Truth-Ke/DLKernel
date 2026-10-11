@@ -59,9 +59,9 @@ def reinterpret_packed_fp6(mT, dtype):
     elements, floored to 554 = 415.5 B). This is safe because the FFI arg
     spec admits only 32 B-aligned pitches and the tensormap encode rounds the
     element stride back to the nearest TMA granule, recovering the true pitch
-    exactly: the residue is < 0.75 B either way (verified bit-exact with
-    poisoned padding at pitches 416/448/544/4128, both floor and ceil -
-    AI/probe_fp6_pitch.py). The 32 B stride validation is load-bearing for
+    exactly: the residue is < 0.75 B either way (verified bit-exact with a
+    pitch-probe sweep over poisoned padding at pitches 416/448/544/4128,
+    both floor and ceil). The 32 B stride validation is load-bearing for
     correctness here, not just for the tensormap's alignment rule.
     """
     shape = tuple(s * 4 // 3 if i == 1 else s for i, s in enumerate(mT.shape))

@@ -5,8 +5,7 @@
 # Unlike SM90 WGMMA (which reads A/B from SMEM directly), warp-level MMA
 # requires explicit SMEM→RMEM copies via ldmatrix before each MMA instruction.
 
-# Measured facts (RTX 5090, 2026-07-29 — see AI/sm120_transform_fp8_tuning.md
-# for the full session data; verify before assuming they changed):
+# Measured facts (RTX 5090, 2026-07-29; verify before assuming they changed):
 # - Warp-mma dense rates (boosted clocks): bf16/f32acc 255 TF, fp8/f32acc
 #   507 TF via BOTH the Ada-era sm_89 mma.sync (MmaFP8Op) AND the plain
 #   kind::f8f6f4 instruction — measured head-to-head via inline PTX in one
@@ -1563,11 +1562,10 @@ class GemmSm120(GemmSm90):
 
         The DSL atom's trait describes the SOURCE correctly (lane l provides
         the 16-byte n-row at k = l) but its DST value layout is provably wrong
-        vs hardware — 12 of 16 slots per lane; byte-level repro in
-        AI/cute_dsl_ldmatrix16x16x8b_trans_bug_report.md. Compositions that
-        consult the broken Dst therefore mis-place bytes unless the error
-        happens to cancel: ``make_tiled_copy_A`` for m-major A does cancel
-        (verified), ``make_tiled_copy_B`` does not (it fetches the wrong k).
+        vs hardware — 12 of 16 slots per lane. Compositions that consult the
+        broken Dst therefore mis-place bytes unless the error happens to
+        cancel: ``make_tiled_copy_A`` for m-major A does cancel (verified),
+        ``make_tiled_copy_B`` does not (it fetches the wrong k).
         This construction never consults the Dst: partition_S composes only
         the (correct) Src side, and _retile_b's fragment regroup encodes the
         MEASURED delivery (per the C++ SM100_U8x16_LDSM_T trait, cute/atom/

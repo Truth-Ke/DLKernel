@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Han Guo, Tri Dao.
 """Fused GEMM epilogues.
 
-Layer map (see AI/epilogue_transform_reorg.md):
+Layer map (see docs/notes/epilogue_transform_reorg.md):
 
 * :mod:`DLKernel.epilogue.ops` — the EpiOp vocabulary: per-tensor resource
   lifecycle, value ports, host schema, cache identity. Writing a new op here

@@ -23,7 +23,7 @@ For bf16 input and output:
 GMEM bytes = 2N load + 2N store = 4N bytes
 ```
 
-I use the SM-local MIO/shared-memory/shuffle roof from `AI/gpu_pipe_microbench_notes.md`:
+I use the SM-local MIO/shared-memory/shuffle roof from `docs/notes/gpu_pipe_microbench_notes.md`:
 
 ```text
 SMEM/MIO roof = 128 B / clk / SM

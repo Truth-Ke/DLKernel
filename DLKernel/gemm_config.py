@@ -328,11 +328,11 @@ def blockscaled_default_config(m: int, n: int, device_capacity: int = 10) -> Gem
     On SM120 (warp MMA, no clusters), (128, 128) pingpong — riding CLC via
     is_dynamic_persistent — measured best across mxfp8/nvfp4/mxfp4 at 2048³
     through 8192³ on RTX 5090 (interleaved medians, 2026-07-30). The older
-    snapshot codebase's fp4-at->=8192 (256, 128) cooperative rule (see
-    AI/sm120_blockscaled_gemm_worklog.md) no longer holds: (256, 128) is now
-    the WORST of the three candidates at 8192³ (nvfp4 1051 vs pingpong 1354
-    TF); the sole exception is mxfp4 8192³ where (128, 128) coop leads
-    pingpong by ~5% — not enough for a format-special rule.
+    snapshot codebase's fp4-at->=8192 (256, 128) cooperative rule no longer
+    holds: (256, 128) is now the WORST of the three candidates at 8192³
+    (nvfp4 1051 vs pingpong 1354 TF); the sole exception is mxfp4 8192³
+    where (128, 128) coop leads pingpong by ~5% — not enough for a
+    format-special rule.
     """
     if device_capacity == 12:
         return _blockscaled_config(128, 128, (1, 1), device_capacity=12, pingpong=True)

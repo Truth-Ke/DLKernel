@@ -156,7 +156,7 @@ def _concat_interleave_bias(t):
 #
 # Blockscaled A / B operands are :class:`DLKernel.blockscaled.operand.BlockScaledOperand`
 # instances carrying (qdata, scale, format, per_tensor_scale) - see
-# AI/blockscaled_api.md. The container is the ONLY blockscaled operand form;
+# docs/modules/blockscaled_api.md. The container is the ONLY blockscaled operand form;
 # (data, scale_factor) tuples are rejected with a TypeError at the unwrap site.
 # Scale factors use the canonical cuBLAS/CUTLASS 128x4
 # blocked layout: shape ``(rm, rk, 32, 4, 4)`` (optionally with a leading batch L),
@@ -256,7 +256,7 @@ def _reserve_blockscaled_out(out_dtype) -> None:
     if _resolve_blockscaled_out(out_dtype) is not None:
         raise NotImplementedError(
             f"blockscaled output (out_dtype={out_dtype}) is only supported by DLKernel.gemm "
-            f"for now - see AI/blockscaled_api.md section 7"
+            f"for now - see docs/modules/blockscaled_api.md section 7"
         )
 
 

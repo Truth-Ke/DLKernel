@@ -1539,7 +1539,7 @@ class GemmSm100(GemmTmaBase):
                     # on a decoded-phantom retirement. The old fire-and-forget
                     # burst spray caused the July 2026 varlen corruption; see
                     # cancel_pending_tail and
-                    # AI/clc_spurious_invalid_investigation.md.
+                    # docs/notes/clc_spurious_invalid_investigation.md.
                     tile_scheduler.cancel_pending_tail()
 
         # Specialized A-index prefetch warp (gather_A only)

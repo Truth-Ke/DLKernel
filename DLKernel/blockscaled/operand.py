@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Tri Dao.
 """Block-scaled operand container and format descriptors.
 
-Design doc: AI/blockscaled_api.md. In short:
+Design doc: docs/modules/blockscaled_api.md. In short:
 
 - ``BlockScaledFormat`` is a frozen descriptor (storage dtype, element bits, scale
   dtype, scale vector size, ...) and the single source of truth for format
@@ -75,7 +75,7 @@ class BlockScaledFormat:
     # CuTe-DSL MMA element type (may differ from storage: fp6). None marks a format
     # with no DSL element type at all — host-side complete (quantize/dequantize/
     # serialize) but consumable by a kernel only once that kernel declares its own
-    # (copy dtype, MMA dtype, convert) triple. See AI/blockscaled_api.md section 9.
+    # (copy dtype, MMA dtype, convert) triple. See docs/modules/blockscaled_api.md section 9.
     cutlass_dtype_name: Optional[str]
     elem_bits: int
     # Keep this field in its original positional slot. Besides preserving the
@@ -370,7 +370,7 @@ BLOCKSCALED_FORMAT_REGISTRY = {
 
 # Worked examples of formats the descriptor already expresses but that are NOT
 # registered (registry rows land with their consumer kernels; see
-# AI/blockscaled_api.md sections 9-10, and the executable versions in
+# docs/modules/blockscaled_api.md sections 9-10, and the executable versions in
 # tests/test_blockscaled_operand.py::test_future_recipe_examples). The scale
 # recipe axis mirrors cuBLASLt's cublasLtMatmulMatrixScale_t / torch's
 # _ScalingType, factored into fields instead of an enum:
@@ -461,7 +461,7 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
     # e8m0 / vec-32 only — fp32 scales, vec 128, 2D grids are software recipes),
     # must fail HERE with the reason, not at the per-arch gate later. Software
     # kinds (blockwise promotion: fp32-scale fp8, one-sided bf16, int4) are a
-    # follow-up with their own kind names — see AI/blockscaled_api.md section 9.
+    # follow-up with their own kind names — see docs/modules/blockscaled_api.md section 9.
     for fmt in (fmt_a, fmt_b):
         if _mma_element_class(fmt) is None:
             raise ValueError(
@@ -473,7 +473,7 @@ def mma_kind_for_pair(fmt_a: "BlockScaledFormat", fmt_b: "BlockScaledFormat") ->
             raise ValueError(
                 f"{fmt.name} (scales {fmt.scale_dtype}, vec {fmt.sf_vec_size}) has no "
                 f"hardware MMA kind: kind::mxf8f6f4 requires e8m0 scales with vec size "
-                f"32; software-scaled recipes are a follow-up (AI/blockscaled_api.md "
+                f"32; software-scaled recipes are a follow-up (docs/modules/blockscaled_api.md "
                 f"section 9)"
             )
     # Everything else - fp8 x fp8 and any mix involving a packed sub-byte

@@ -5,7 +5,7 @@ Operands are BlockScaledOperand containers - the only accepted blockscaled
 operand form ((data, scale_factor) tuples are rejected, see
 test_tuple_operand_rejected).
 
-Layout contract (see DLKernel/gemm_interface.py and AI/blockscaled_api.md):
+Layout contract (see DLKernel/gemm_interface.py and docs/modules/blockscaled_api.md):
   A:   (M, K) or (L, M, K)   fp8 e4m3/e5m2, packed fp4x2 (K/2 bytes), or packed fp6 (3K/4 bytes)
   B:   (K, N) or (L, K, N)   K-contiguous (pass W.mT of an (N, K) weight); A/B formats are
        independent under kind::mxf8f6f4 (nvfp4 pairs only with itself)
@@ -595,7 +595,7 @@ def test_blockscaled_gemm_training_orientations():
     check(dim0(dY).mT, dim0(X), dY.float().T @ X.float(), "wgrad", 0.04)
 
 
-# -- BlockScaledOperand-specific regressions (see AI/blockscaled_api.md section 10) --
+# -- BlockScaledOperand-specific regressions (see docs/modules/blockscaled_api.md section 10) --
 
 
 def test_tuple_operand_rejected():

@@ -3,7 +3,7 @@
 
 Covers construction validation, the logical-metadata surface, transpose
 semantics, serialization/pytree, and the format registry - see
-AI/blockscaled_api.md section 3 and section 8.
+docs/modules/blockscaled_api.md section 3 and section 8.
 """
 
 import copy
@@ -711,7 +711,7 @@ def test_format_without_dsl_element_type():
     e3m4): it must fail loudly at the kernel seam (to_cutlass_dtype) and at
     kind selection (no silent mxf8f6f4 fall-through), and a registered
     DSL-typeless format must not break registry-wide dtype lookup for the
-    formats that do have DSL types. See AI/blockscaled_api.md section 9."""
+    formats that do have DSL types. See docs/modules/blockscaled_api.md section 9."""
     from DLKernel.blockscaled.operand import BLOCKSCALED_FORMAT_REGISTRY, mma_kind_for_pair
 
     weird = BlockScaledFormat("e3m4_test", torch.uint8, None, 8, 1, torch.float8_e8m0fnu, 32)
@@ -735,7 +735,7 @@ def test_format_without_dsl_element_type():
 
 def test_future_recipe_examples():
     """Executable form of the worked examples next to BLOCKSCALED_FORMAT_REGISTRY
-    (AI/blockscaled_api.md section 10): recipes the descriptor already expresses
+    (docs/modules/blockscaled_api.md section 10): recipes the descriptor already expresses
     as pure data, pinned to fail at the KIND layer with the right reason until
     their consumer kernels land. The scale-recipe axis mirrors cuBLASLt's
     cublasLtMatmulMatrixScale_t and torch._C._ScalingType."""
