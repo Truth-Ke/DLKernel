@@ -7,11 +7,11 @@ CuTe DSL kernel 以 `--enable-tvm-ffi` 编译时采用两阶段：
 1. 编译期：用 fake（符号）张量构建 MLIR，下译到 PTX。
 2. 调用期：传入真实张量；TVM-FFI 提取指针并校验形状。
 
-编译产物经 `@jit_cache` 缓存（内存 dict + 文件系统 `.o`）。因此只有新的 dtype / major / tile / activation 组合才触发重新编译。
+`@jit_cache` 缓存编译产物（内存 dict + 文件系统 `.o`）。因此只有新的 dtype / major / tile / activation 组合才触发重新编译。
 
 ## 符号形状与 `sym_int`
 
-fake 张量用 `cute.sym_int()` 表示符号维。**多个张量复用同一个 `sym_int`，即向 TVM-FFI 声明这些维在运行时必须相等。**
+fake 张量用 `cute.sym_int()` 表示符号维。多个张量复用同一个 `sym_int`，即向 TVM-FFI 声明这些维在运行时必须相等。
 
 ```python
 m, n, k, l = cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()
@@ -55,7 +55,7 @@ mD = fake_tensor(d_dtype, (m, m, l), ...)  # 方阵输出
 
 ## NamedTuple 作为 kernel 参数
 
-Epilogue 参数、scheduler 参数、varlen 参数都是经 `@mlir_namedtuple` 装饰的 NamedTuple。装饰器添加 `__new_from_mlir_values__`。TVM-FFI 运行时据此从展平的 MLIR 值重建结构体。
+Epilogue、scheduler、varlen 参数都是 `@mlir_namedtuple` 装饰的 NamedTuple。装饰器添加 `__new_from_mlir_values__`。TVM-FFI 运行时据此从展平的 MLIR 值重建结构体。
 
 ```python
 @mlir_namedtuple
@@ -72,14 +72,14 @@ class EpilogueArguments(NamedTuple):
 
 1. 遍历编译期模板（`self`）的字段；
 2. `None` 与 `StaticTypes`（int、bool、str、Constexpr 等）原样保留；
-3. 复杂类型（cute.Tensor、指针）经 `cutlass.new_from_mlir_values(field_val, values[:n_items])` 消费 N 个 MLIR 值；
+3. 复杂类型（cute.Tensor、指针）调用 `cutlass.new_from_mlir_values(field_val, values[:n_items])`，消费 N 个 MLIR 值；
 4. 返回重建字段的 NamedTuple 实例。
 
 ## Constexpr 字段
 
 标注 `cutlass.Constexpr[T]` 的字段是编译期常量。其值在编译期烘焙进 kernel。调用期对这些字段传 `None`。
 
-该行为由对 TVM-FFI 参数转换器的 monkey-patch 启用（`DLKernel/cute_dsl_utils.py:39`）：
+对 TVM-FFI 参数转换器的 monkey-patch 启用该行为（`DLKernel/cute_dsl_utils.py:39`）：
 
 ```python
 def _patched_convert_single_arg(arg, arg_name, arg_type, ctx):
@@ -88,11 +88,11 @@ def _patched_convert_single_arg(arg, arg_name, arg_type, ctx):
     ...
 ```
 
-示例：`act_fn` 是 `Constexpr[Callable]`。激活函数被编译进 kernel。不同 activation 产出不同的编译产物。
+示例：`act_fn` 是 `Constexpr[Callable]`。编译期将激活函数烘焙进 kernel。不同 activation 产出不同的编译产物。
 
 ### NamedTuple 类型注解的变通
 
-NamedTuple 经 `tuple` 注解的参数传入时（如 `epilogue_args: tuple`），TVM-FFI 转换器看不到 NamedTuple 的字段类型。patch 改用 `type(arg)`（实际的 NamedTuple 类）：
+NamedTuple 以 `tuple` 注解传入时（如 `epilogue_args: tuple`），TVM-FFI 转换器看不到 NamedTuple 的字段类型。patch 改用 `type(arg)`（实际的 NamedTuple 类）：
 
 ```python
 if (isinstance(arg, tuple) and hasattr(type(arg), "_fields")

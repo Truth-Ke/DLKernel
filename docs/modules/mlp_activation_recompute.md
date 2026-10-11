@@ -11,7 +11,7 @@ DLKernel 的 `MLP` 用三种模式在内存与计算之间取舍：
 | checkpoint + torch.compile | 2 | 2（重放）+ 4 = 6 | **8** | 仅 `x` | compile 无收益 |
 | `recompute=True` | 2 | 1（重放 fc1）+ 4 = 5 | **7** | 仅 `x` | 内置，只重放 fc1 |
 
-`recompute=True` 严格优于 `torch.utils.checkpoint`：内存节省相同，反向少一次
+`recompute=True` 严格优于 `torch.utils.checkpoint`。内存节省相同，反向少一次
 GEMM。checkpoint 之上加 `torch.compile` 无收益。编译器看不到自定义
 `autograd.Function` 子类内部，无法知道 fc2 的重放是冗余的。反向的
 `gemm_with_activation_grad` 已经从 `preact` 重算 `postact`。
@@ -24,12 +24,12 @@ GEMM。checkpoint 之上加 `torch.compile` 无收益。编译器看不到自定
   开销约 0。
 - fc2（`DActLinearFunc`）保存 `preact`，即 fc1 的预激活输出。这份是内存大头。
 
-fc2 自身已部分重算。它存 `preact` 而不存 `postact`，反向经
+fc2 自身已部分重算。它存 `preact` 而不存 `postact`。反向经
 `gemm_with_activation_grad` 从 `preact` 重算 `postact`。前向到反向之间多持有的
 激活只有 `preact`。
 
-`torch.utils.checkpoint` 不保存 `preact`，代价是反向重放整个前向（fc1 + fc2，
-2 次 GEMM）。`recompute=True` 只重放 fc1（1 次 GEMM）。只有这份激活需要重算；
+`torch.utils.checkpoint` 不保存 `preact`。代价是反向重放整个前向（fc1 + fc2，
+2 次 GEMM）。`recompute=True` 只重放 fc1（1 次 GEMM）。只有 `preact` 需要重算；
 重放 fc2 是浪费。
 
 ## GEMM kernel 分解
@@ -95,16 +95,17 @@ def forward(self, x):
     return x
 ```
 
-## activation_memory_budget（torch.compile SAC）对本库无效
+## activation_memory_budget 对本库无效
 
 `torch._functorch.config.activation_memory_budget` 是另一套机制：
 
+- 即 torch.compile 的 SAC。
 - 需要 `torch.compile` 追踪联合前向-反向图。
 - 用 min-cut 划分器自动决定每个算子保存还是重算，预算取 0.0–1.0。
 - 看不到自定义 `autograd.Function` 子类内部。DLKernel 的 `LinearActFunc`、
   `DActLinearFunc` 对编译器不透明。
 
-DLKernel 的 MLP 走自定义 autograd Function，`save_for_backward` / `backward`
+DLKernel 的 MLP 走自定义 autograd Function。`save_for_backward` / `backward`
 全部手写。`activation_memory_budget` 旋钮因此无效。请改用 `recompute=True`。
 
 | 方案 | 需要 torch.compile | 兼容自定义 autograd.Function | 粒度 |
@@ -119,7 +120,12 @@ DLKernel 的 MLP 走自定义 autograd Function，`save_for_backward` / `backwar
 `out.sum().backward()` 经 `expand()` 产生步长 `(0, 0)` 的全一梯度。GEMM kernel
 要求连续步长：TMA 需要一个已知的连续维。
 
-`DLKernel/linear.py` 的 `_ensure_contiguous` 负责处理。`LinearFunc`、
-`LinearActFunc`、`DActLinearFunc` 三个类的 backward 都对 dout 调用它。常规
-路径先查 `stride(-1) != 1`，避免多余拷贝。`torch.compile` 下无条件调用
-`.contiguous()`：dynamo 无法在 fake tensor 上检查步长。
+`DLKernel/linear.py` 的 `_ensure_contiguous` 负责处理。以下三个类的 backward
+都对 dout 调用它：
+
+- `LinearFunc`
+- `LinearActFunc`
+- `DActLinearFunc`
+
+常规路径先校验 `stride(-1) != 1`，避免多余拷贝。`torch.compile` 下无条件调用
+`.contiguous()`。dynamo 无法在 fake tensor 上校验步长。

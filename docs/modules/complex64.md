@@ -1,11 +1,13 @@
 # Complex64 元素类型设计
 
-`DLKernel/complex.py` 提供原生的 `complex64` 元素类型。它面向 CuTe-DSL kernel，
-不改动 C++ MLIR 绑定。tvm-ffi 边界约定：kernel ABI 按 f64 存储。调用处用
-`complex_storage(t)` 把 `torch.complex64` 张量转成 `torch.float64` 视图。
+`DLKernel/complex.py` 提供原生的 `complex64` 元素类型。`complex64` 面向
+CuTe-DSL kernel，不改动 C++ MLIR 绑定。tvm-ffi 边界约定：kernel ABI
+按 f64 存储。调用处用 `complex_storage(t)` 把 `torch.complex64` 张量转成
+`torch.float64` 视图。
 
-`tests/test_complex.py` 的 44 个用例验证该类型：构造分支、算术矩阵、方法、类
-不变量、辅助函数、`__c_pointers__` 边界、特殊值、自动提升和 smem 往返。
+`tests/test_complex.py` 的 44 个用例验证该类型。覆盖构造分支、算术矩阵、
+方法、类不变量与辅助函数，也覆盖 `__c_pointers__` 边界、特殊值、自动提升和
+smem 往返。
 
 本文记录设计取舍、已验证边界和使用限制。
 
@@ -21,9 +23,9 @@ TypeError: expects value type to be int, float, ptr or sparse_elem,
            but got 'complex<f32>'
 ```
 
-检查在 `_cute_ir`（编译后的绑定）里执行。Python 层没有绕过手段。
+检查在 `_cute_ir`（编译后的绑定）里执行。Python 层无法绕过。
 
-其他"独占"的 MLIR 类型候选同样被拒：
+白名单同样拒绝其他"独占"的 MLIR 类型候选：
 
 | MLIR 元素类型 | 在白名单内 | 是否 Complex64 独占 |
 | --- | :---: | --- |
@@ -40,7 +42,7 @@ TypeError: expects value type to be int, float, ptr or sparse_elem,
 存储类型是 `f64`。kernel 作者要求 `tensor[i]` 返回 `Complex64`，不是
 `Float64`。JIT 侧 `_Tensor` 经 `Numeric.from_mlir_type` 从 MLIR memref 推导
 `element_type`。该查找是多对一：f64 永远映射回 `Float64`。构造时声明的
-Python 类型身份必须在往返后存活。
+Python 类型身份必须在往返后保留。
 
 两条构造路径，结果不同：
 
@@ -48,8 +50,8 @@ Python 类型身份必须在往返后存活。
    dtype 存进 `_dtype` 属性。只要 `Complex64.mlir_type == T.f64()`，MLIR
    memref 是 f64，`_dtype` 保持 `Complex64`。
 2. `SmemAllocator.allocate_tensor`、`cute.recast_tensor` 和指针转 tensor 的
-   `make_tensor` 从 MLIR 值构造 JIT tensor，不带 dtype。`_dtype` 回退到
-   `Numeric.from_mlir_type(f64)` = `Float64`，需要重新打标。
+   `make_tensor` 从 MLIR 值构造 JIT tensor，不带 dtype。`_dtype` 默认取
+   `Numeric.from_mlir_type(f64)` = `Float64`，此时需要重新打标。
 
 修复是一行包装：`allocate_smem_complex(...)` 与 `recast_to_complex64(...)`。
 两者内部执行 `t._dtype = Complex64; return t`。
@@ -131,13 +133,13 @@ if isinstance(x, Complex64):
 1. **MLIR 边界丢失 dtype。** 凡从 MLIR 值构造 JIT tensor 的路径（smem 分配、
    recast、指针转 tensor）都丢 Complex64 标记。使用 `DLKernel/complex.py` 的
    包装，或手动调用 `_retag_as_complex64(t)`。
-2. **`isinstance(c, Float32) is True`。** cutlass 只有一个位置检查它
+2. `isinstance(c, Float32) is True`。cutlass 只有一个位置检查它
    （`nvvm_wrappers.py` 的 fmax 辅助）。行为可疑时先 grep 这个位置。
 3. **`is_same_kind(Complex64, Float32) is True`**（两者 `is_float=True`）。
    `tensor[i] = some_float32` 经 `_cvt_to_dest` 自动提升为
    `Complex64(float32_instance)`，落为 `(re=value, im=0)`。标量实数写入因此
-   方便；想存"复数位"而误存 f32 会被静默包装。要加固特定 kernel，在
-   `__setitem__` 加显式类型检查。
+   方便；想存"复数位"而误存 f32，自动提升会静默包装它。要加固特定 kernel，
+   在 `__setitem__` 加显式类型检查。
 4. **`Float32 OP Complex64` 依赖反射算符优先。** 前提是 `Complex64` 保持
    `Float32` 的严格子类。不要破坏该继承。
 5. **`Numeric.from_mlir_type` 是单一全局注册表。** 为 Complex64 到 Float64 的
