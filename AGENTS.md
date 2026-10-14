@@ -56,6 +56,8 @@ Key rules:
 - `gemm_interface.py` — variant API on top: unified entry (`gemm`/`gemm_act`/...), validates inputs, allocates outputs
 - `gemm.py` — low-level dispatch it calls: plan cache, SM version selection, jit compile + launch
 - `gemm_sm90.py` / `gemm_sm100.py` — SM-specific implementations
+- `fused_grouped_gemm/` — SM90 MoE fused primitives (role class owning the host contract over the plain SM90 core)
+- `gemm_sm90_ptr_array.py` — SM90 pointer-array grouped GEMM: one launch over multiple weight allocations (device `B_ptrs` + per-call tensormap slot workspace); sibling compile wrapper after `gemm_symmetric.py`
 - `DLKernel/epilogue/` — fused epilogues: `ops.py` (EpiOp vocabulary) → `mixin.py`
   (ComposableEpiMixin) → `frontend.py`/`visit.py` (`@gemm_epilogue` fn authoring +
   minted kernel classes) → `library.py` + domain modules (rotary, scaled_exp, ...).
@@ -80,9 +82,24 @@ Key rules:
 
 Tests use pytest with parametrize across dtypes (`float32`, `float16`, `bfloat16`), dimensions, and batch sizes. Each test includes a reference implementation for numerical validation.
 
-Every test must verify **numerical correctness** against a reference, not just shapes or smoke. A test that only checks `.shape` or "doesn't crash" is not a test — it hides bugs. Always compare kernel output values against a PyTorch reference (float32 for ground truth, same dtype for tolerance baseline).
+Every test must verify **numerical correctness** against a reference, not just shapes or smoke.
+
+The public API surface is locked by `tests/test_public_api.py` (exact `__all__`, signature
+sequences, keyword-only boundaries) — a deliberate signature change updates that lock first. A test that only checks `.shape` or "doesn't crash" is not a test — it hides bugs. Always compare kernel output values against a PyTorch reference (float32 for ground truth, same dtype for tolerance baseline).
 
 ## Deep-dive docs: see docs/README.md
+
+`docs/` holds system documentation only. Specs, plans, and other working
+documents live outside it.
+
+## Documentation Sync
+
+A code change that alters behavior, interfaces, or module structure updates
+the affected `docs/` pages in the same change. Write those pages per
+ASD-STE100. Updating `AGENTS.md` meets a stricter bar: only durable
+agent-facing facts — build and test commands, the architecture map,
+hard-won gotchas. No changelogs. No per-commit records. No speculative
+guidance. When in doubt, leave `AGENTS.md` unchanged.
 
 ## Iteration Speed
 
@@ -90,9 +107,9 @@ When iterating on kernel code, run a small subset of tests (1-3 parametrizations
 
 ## Debugging Failures
 
-When debugging any failure — kernel correctness, torch.compile interaction, test infrastructure — get to the bottom of it. The goal is not to make the test pass; it is to understand **why** it fails and fix the actual cause.
+Find out why a failure happens before you fix it. Making the test pass without understanding the cause hides the bug.
 
-Do not route around the bug just to make a test pass, for example by pruning a config, skipping a path, resetting state, increasing limits, or switching to a different implementation. A workaround that makes CI green but leaves the bug for users is worse than useless — it hides the problem and the deeper issue will eventually surface at greater cost. Only use workarounds after proving the root cause is external (e.g., upstream PyTorch bug) and documenting why.
+Do not route around a bug to make a test pass — no pruning configs, skipping paths, resetting state, raising limits, or swapping implementations. A workaround that makes CI green but leaves the bug hides the problem; it will resurface at greater cost. Accept a workaround only after you prove the root cause is external, and record why.
 
 Start by reproducing the reported failure, then simplify it to the smallest setting that still fails: reduce batch, M/N/K, tile shape, scheduler options, `swap_ab`, beta/C, dtype, and epilogue features where possible. Keep the failing behavior intact while removing unrelated complexity.
 
@@ -142,3 +159,8 @@ CuTe-DSL:
   corruption); derive extents from the copy atom.
 - `DLKERNEL_CACHE_ENABLED=0` for const_expr ablations — the jit cache ignores
   env flags, and identical timings across an ablation mean a stale cubin.
+- `@autotune` persists tune results to `~/.dlkernel/cache` by default
+  (`cache_results=True` at the decorator): warm calls execute only the best
+  config — tests that must sweep force it cold (`cache_results=False`).
+- ruff format >= 0.16 rewrites `Optional[X]` in DSL signatures to `X | None`;
+  both trace identically, but fork kernel code verbatim and re-verify.

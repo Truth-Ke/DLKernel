@@ -1,4 +1,4 @@
-# AI/ 文档索引
+# 文档索引
 
 DLKernel 是用 CuTe DSL 编写的 CUDA kernel 库,覆盖 LLM 推理与训练的核心算子。
 目标硬件:SM90(H100/H200)、SM100/SM110(B200/B300)、SM120(GeForce RTX 50)。
@@ -16,28 +16,38 @@ DLKernel 是用 CuTe DSL 编写的 CUDA kernel 库,覆盖 LLM 推理与训练的
 
 ## 文档地图
 
-文档分三类:**架构**(系统分层与组合)、**模块**(单个子系统的机制参考)、
-**笔记**(硬件/接口的硬性限制与实测数据;行内以"约束/依据"标注原类别)。
+文档分三类:**架构**(系统分层与组合)、**模块**(单个子系统的机制参考,
+与 architecture.md「九层职责表」的模块一一对应)、**笔记**(硬件/接口的
+硬性限制与实测数据;行内以"约束/依据"标注原类别)。
 写法约定:结论前置、代码路径可点、不收开发记录。
 
 ### 架构
 
 | 文档 | 回答什么 |
 |---|---|
-| [architecture.md](architecture.md) 架构参考 | 系统分几层、入口分几类、一次调用怎么走、绑定与身份怎么运作 |
+| [architecture.md](architecture.md) 架构参考 | 系统分几层、入口分几类、一次调用怎么走、绑定与身份怎么运作;「九层职责表」末列是全部模块文档的索引 |
 
-### 模块(modules/)
+### 模块(modules/,按调用链自顶向下)
 
 | 文档 | 回答什么 |
 |---|---|
-| [autotuning_subsystem.md](modules/autotuning_subsystem.md) Autotune 子系统 | tune 怎么选配置、缓存怎么复用、环境变量怎么切 |
-| [blockscaled_api.md](modules/blockscaled_api.md) Block-scaled API | block-scaled 操作数 API、fp4/6/8 格式、SF 生成 |
-| [caching_and_parallel_compilation.md](modules/caching_and_parallel_compilation.md) 编译缓存与并行编译 | 三层编译栈怎么工作、--async-compile 怎么用、冷启动时间去哪了 |
-| [complex64.md](modules/complex64.md) complex64 | complex64 元素类型怎么实现、哪些验证过、坑在哪 |
 | [mlp_activation_recompute.md](modules/mlp_activation_recompute.md) MLP 激活重计算 | 激活怎么重算、为什么不能用 torch.compile SAC |
-| [moe_sm90.md](modules/moe_sm90.md) MoE SwiGLU primitives (SM90) | token-row gather、concat W13、dH/A′/dS 两个独立入口与调用方合同 |
-| [tvm_ffi_compilation.md](modules/tvm_ffi_compilation.md) TVM-FFI 编译 | 符号形状/NamedTuple/ParamsBase 参数怎么编译与缓存 |
+| [gemm_variant_api.md](modules/gemm_variant_api.md) 变体 API | 变体入口与四个变体族、typed out-op 注册面、VariantSpec 声明式样板 |
+| [gemm_dispatch.md](modules/gemm_dispatch.md) 低层 dispatch | `gemm.py` 的 plan cache、`sm_to_cls` 选择、split-K 第二 kernel、launch 边界 |
+| [gemm_runtime.md](modules/gemm_runtime.md) 通用宿主管线 | digest/registry 跨进程身份、`GemmEpiPlan`、`dlkernel::gemm_epi` 算子、autotune 接入点 |
+| [epilogue.md](modules/epilogue.md) epilogue 子系统 | EpiOp 协议、`@gemm_epilogue` 铸类、library 工厂、Complex64 域件 |
+| [operand_transform.md](modules/operand_transform.md) A 操作数变换 | `TransformA` 契约、`make_copy_block` 挂载点、W4/W8 打包解码格式 |
+| [sm_device_layer.md](modules/sm_device_layer.md) SM 设备实现层 | 继承树与覆写面、四代 mainloop 差异、mixin 菱形组合、SM 选择入口 |
+| [fused_grouped_gemm.md](modules/fused_grouped_gemm.md) MoE grouped GEMM | token-row gather、concat W13、dH/A′/dS 两个独立入口与调用方合同 |
+| [tile_scheduler.md](modules/tile_scheduler.md) tile 调度 | 四种持久化模式、三类调度器的覆写点、K 维分解 |
+| [support_layer.md](modules/support_layer.md) 支撑层 | copy atom 原语、pipeline 类交换、dsl 进程级补丁、归约代数、varlen 参数族 |
+| [reduction_family.md](modules/reduction_family.md) reduction 家族 | `ReductionBase` 形态、rmsnorm/softmax/cross_entropy/topk 的 host 链路 |
+| [all_gather_gemm.md](modules/all_gather_gemm.md) AllGather+GEMM | `ag_args` 接入任意变体、三次流水线、blockscaled 变体 |
+| [blockscaled_api.md](modules/blockscaled_api.md) Block-scaled API | block-scaled 操作数 API、fp4/6/8 格式、SF 生成 |
 | [varlen_blockscaled_sf_layout.md](modules/varlen_blockscaled_sf_layout.md) varlen blockscaled SF 布局 | varlen 下 SF 的布局规则 |
+| [tvm_ffi_compilation.md](modules/tvm_ffi_compilation.md) TVM-FFI 编译 | 符号形状/NamedTuple/ParamsBase 参数怎么编译与缓存 |
+| [caching_and_parallel_compilation.md](modules/caching_and_parallel_compilation.md) 编译缓存与并行编译 | 三层编译栈怎么工作、--async-compile 怎么用、冷启动时间去哪了 |
+| [autotuning_subsystem.md](modules/autotuning_subsystem.md) Autotune 子系统 | tune 怎么选配置、缓存怎么复用、环境变量怎么切 |
 
 ### 笔记(notes/)
 
@@ -52,9 +62,10 @@ DLKernel 是用 CuTe DSL 编写的 CUDA kernel 库,覆盖 LLM 推理与训练的
 | [hadamard_roofline_analysis.md](notes/hadamard_roofline_analysis.md)【依据】 Hadamard roofline | 分阶段 SMEM Hadamard vs FHT 什么时候谁快 |
 | [global_memory_coalescing_notes.md](notes/global_memory_coalescing_notes.md)【依据】 全局内存合并访问 | H100 上合并访问的实测行为 |
 | [gpu_pipe_microbench_notes.md](notes/gpu_pipe_microbench_notes.md)【依据】 GPU pipe 微基准 | SMEM/SHFL/REDUX 吞吐数据与复现命令 |
+| [sm120_ncu_profiling.md](notes/sm120_ncu_profiling.md)【依据】 SM120 Nsight Compute 指南 | 怎么在 RTX 50 上采集与对比 kernel 时序 |
 
 ## 阅读路径
 
 1. 读 [architecture.md](architecture.md)。先看分层图与入口分类,建立九层地图。
 2. 按其"阅读顺序"表逐层读源码。每一步给出文件、行号与理解目标。
-3. 按任务查模块文档。硬件行为存疑时查笔记与 AGENTS.md 的 Measured facts 节。
+3. 按模块查 modules/ 文档(顺序即调用链自顶向下)。硬件行为存疑时查笔记与 AGENTS.md 的 Measured facts 节。

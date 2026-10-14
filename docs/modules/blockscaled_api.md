@@ -20,7 +20,7 @@
 | D2 | **`shape` / `dtype` 报告逻辑 hp 视图**（解包形状、`orig_dtype`、默认 bf16），作为诚实的计算属性。存储真相在 `qdata`/`scale`。容器在每个公共入口顶部解包（`_unpack_operand` 所在处）；**这行以下的一切都看不到容器**——custom op、autotuner、`jit_cache`、TVM-FFI 全部拿到展平的普通张量。 |
 | D3 | **转置 = qdata 步长交换视图；scale 原样保留。**`(rm, rk, 32, 4, 4)` 的分块 scale 原子不可视图转置；scale 定义为"任一朝向都沿 K 分块"。这保住了承重的 `weight.T` / `qw.mT` 惯用法。qdata 与 scale 的形状耦合在 GEMM 分发时校验（`validate_blockscaled_sf`），不在构造期——varlen 的 padding scale 缓冲必须始终可构造。 |
 | D4 | **格式 = frozen dataclass 描述符**（`BlockScaledFormat`），不是枚举：存储 dtype、元素位数、打包方式、scale dtype、sf_vec_size、K 对齐都是*每格式的数据*。新格式是数据，不是代码。注册表 + 单例；旧短名（`"mxfp8"`）仍可转换。`elems_per_container` 保留原位置槽，以维持构造/pickle 契约；`storage_layout` 为它表达不了的布局（packed fp6）版本化。 |
-| D5 | **格式以标量 `bs_format: str` op-schema 参数显式跨 custom-op 边界。**格式从不由张量 dtype 推导（没有 `SF_DTYPE_TO_VEC_SIZE` 表、没有 fp4 `A.dtype` 的逻辑-K 特例、没有 `gemm_blockscaled_ref` 的 sf-vec 三元分支）；`_sf_decode` 由格式驱动——这杀死了"uint8 scale 视图被解码成 e8m0 ⇒ NVFP4 静默跑成 vec-32 MXFP8"的陷阱。全仓不存在 dtype→格式推断点。 |
+| D5 | **格式以标量 `bs_format: str` op-schema 参数显式跨 custom-op 边界。**格式从不由张量 dtype 推导（没有 `SF_DTYPE_TO_VEC_SIZE` 表、没有 fp4 `A.dtype` 的逻辑-K 特例、没有 `gemm_blockscaled_ref` 的 sf-vec 三元分支）；`_sf_decode` 由格式驱动——这杀死了"uint8 scale 视图被解码成 e8m0 ⇒ NVFP4 静默跑成 vec-32 MXFP8"这类静默错误。全仓不存在 dtype→格式推断点。 |
 | D6 | **MXFP6 存储名无歧义。**`mxfp6_e2m3` / `mxfp6_e3m2` 是每 fp6 元素占一个 `uint8` 的字节容器格式，含其量化器行为与序列化描述符（checkpoint 兼容与 host 侧转换用）。kernel 就绪的 `mxfp6_e2m3_packed` / `mxfp6_e3m2_packed` 用 `storage_layout="packed_lsb_v1"`：小端 6-bit 流，元素 i 位于比特 [6i, 6i+6)，即 CUTLASS SubbyteReference 布局（`pack_uint6`/`unpack_uint6`）。packed gmem 是 TMA unpack 消费的形式（第 6 节），跨 FFI 时是形状 `(..., 3K/4)` 的原始 `torch.uint8`。`to_packed()` 把字节操作数逐位不变地转为 packed。 |
 | D7 | **响亮失败、显式表面。**不做 aten 拦截：torch op 对非张量容器抛普通 `TypeError`。支持的表面是显式方法（`mT`/`T`/`transpose` 限最后两维、`to(device)`——dtype 转换抛错并指向 `dequantize()`、`clone`、`dequantize`）。kernel 库里**没有 dequantize 兜底**。非块缩放入口（`gemm_symmetric`、`gemm_rms`、`gemm_norm_act`）有定向 `TypeError` 守卫，以改善报错信息。 |
 | D8 | **`per_tensor_scale` 是字段**（仅 NVFP4）。`gemm` 在解包点经既有的 *tensor-alpha* 路径把 `pts_A * pts_B` 折进 alpha（无 `.item()` 同步；带 pts 的 nvfp4 编译 tensor-alpha kernel 变体）。 |
@@ -188,7 +188,7 @@ X[i, j] ~= decode(qdata)[i, j] * S[i // bm, j // bk] * (pts if present)
 | 物理 scale 布局 | `BlockScaledOperand` | `bs_layout_{a,b}` 名 |
 | 朝向 | `BlockScaledOperand.quant_dim` | （既有） |
 
-格式是交换契约（数值），布局是存储细节（同 stride）。同一格式合法地存在于多个布局（tcgen05 的 mxfp8 分块、融合量化生产者的 mxfp8 线性）。所以布局按操作数（kernel 独立接收 `sfa_linear` / `sfb_linear`）且永不属于格式身份。布局从不推断：分块（5/6-D）对线性（2/3-D）今天可以嗅 rank，但那是 D5 陷阱的重演，第一个同 rank 布局就破。
+格式是交换契约（数值），布局是存储细节（同 stride）。同一格式合法地存在于多个布局（tcgen05 的 mxfp8 分块、融合量化生产者的 mxfp8 线性）。所以布局按操作数（kernel 独立接收 `sfa_linear` / `sfb_linear`）且永不属于格式身份。布局从不推断：分块（5/6-D）对线性（2/3-D）今天可以嗅 rank，但那是重蹈 D5 要堵的路径，第一个同 rank 布局就破。
 
 ### 9.3 全部带默认的描述符改动（既有格式零改动）
 
@@ -228,7 +228,7 @@ X[i, j] ~= decode(qdata)[i, j] * S[i // bm, j // bk] * (pts if present)
 
 ### 9.6 host 管道
 
-`gemm()` 签名不变——一切骑在操作数上。op schema 增加 `bs_layout_{a,b}` 字符串（同 `bs_format_{a,b}` 模式）。tune 与编译 key 增加布局标签。kernel 标志由操作数推导（`sfa_linear = (opA.scale_layout == "linear")`、`kscale_sfb_1d = (fmt_b.sf_block_mn == 1)`……）。D8 先例延伸：*解释操作数字节*所需的 scale 随操作数走。W8A16 GEMM 之后忘乘一个 `(N,)` 每通道向量，就是 pts 折叠那类静默精度陷阱的重演。容器正是杀掉那类 bug 的东西。
+`gemm()` 签名不变——一切骑在操作数上。op schema 增加 `bs_layout_{a,b}` 字符串（同 `bs_format_{a,b}` 模式）。tune 与编译 key 增加布局标签。kernel 标志由操作数推导（`sfa_linear = (opA.scale_layout == "linear")`、`kscale_sfb_1d = (fmt_b.sf_block_mn == 1)`……）。D8 先例延伸：*解释操作数字节*所需的 scale 随操作数走。W8A16 GEMM 之后忘乘一个 `(N,)` 每通道向量，就是 pts 折叠那类静默精度问题的重演。容器正是杀掉那类 bug 的东西。
 
 ### 9.7 预处理操作数不是格式（一道栅栏）
 

@@ -8,7 +8,7 @@ DLKernel 是用 CuTe DSL 编写的 CUDA kernel 库。覆盖 LLM 推理与训练�
 
 手写一个高性能 GEMM 变体,成本集中在四件事:tile 调度与流水线、随 SM 代际不同的 MMA 指令、逐变体不同的 epilogue 数学、host 侧的校验/编译/缓存/启动。DLKernel 的三个对策:
 
-1. 变体爆炸在一个维度上治理。GEMM 的变化集中在 epilogue(act、norm、梯度、量化输出)与 A 操作数(反量化、dropout、打包解码)两个维度。框架把这两个维度做成正交挂载点。mainloop 与 tile 调度保持不动。
+1. 变体爆炸收敛在少数挂载点上。GEMM 的变化集中在 epilogue(act、norm、梯度、量化输出)与 A 操作数(反量化、dropout、打包解码)两个维度。框架把这两个维度做成正交挂载点。mainloop 与 tile 调度保持不动。
 2. 每个事实在最早能知道它的层处理。dtype、布局在编译期固定。校验与配置选择在建 plan 期完成。每次调用只传指针和标量值(设计注释见 `DLKernel/gemm_tvm_ffi_utils.py:357-425`)。
 3. 编译产物按语义身份缓存,身份可跨进程重建。动态铸出的 kernel 类不进缓存。缓存里只存可 pickle 的重铸配方(digest)。worker 按配方重铸等价类(`DLKernel/gemm_runtime/identity.py`)。
 
@@ -36,9 +36,9 @@ flowchart TB
         GIF["gemm_iface.py<br/>VariantSpec：变体样板收敛为声明"]
     end
 
-    subgraph EPL["epilogue 授权与库层"]
+    subgraph EPL["epilogue 前端与库层"]
         LIB["epilogue/library.py + 域模块<br/>linear_act_mod 等工厂 · rotary · scaled_exp"]
-        EF["epilogue/frontend.py<br/>@gemm_epilogue → EpiMod（fn 授权 + 铸类）"]
+        EF["epilogue/frontend.py<br/>@gemm_epilogue → EpiMod（装饰 fn + 铸类）"]
     end
 
     subgraph RT["通用宿主管线 gemm_runtime/"]
@@ -114,15 +114,15 @@ flowchart TB
 
 | 层 | 代码路径 | 职责 | 细节文档 |
 |---|---|---|---|
-| 前端算子 | `mlp.py`、`linear.py`、`fused_grouped_gemm/interface.py` | torch 层入口与重计算策略;MoE 原语公开入口(薄转发到 `GemmMoeSm90`) | [moe_sm90.md](modules/moe_sm90.md)、[mlp_activation_recompute.md](modules/mlp_activation_recompute.md) |
-| 变体 API | `gemm_interface.py`、`gemm_iface.py` | 变体统一归属地:校验、输出分配、签名规范化;激活族共用实现与 4 个 typed out-op | — |
-| 低层 dispatch | `gemm.py`、`gemm_default_epi.py`、`gemm_tvm_ffi_utils.py`、`split_k_reduce.py` | plan cache + SM 版本选择 + jit 编译 + launch;split-K 第二归约 kernel | — |
-| 通用宿主管线 | `gemm_runtime/`(`identity.py` → `host.py`、`torch_op.py`、`autotune.py`) | 所有 epilogue/transform 共用的 plan/compile/launch 与 `dlkernel::gemm_epi` 算子 | [epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
-| epilogue | `epilogue/`(`ops.py` → `mixin.py` → `frontend.py`/`visit.py` → `library.py` + 域模块) | fn 授权 + EpiOp 词表 + 铸 kernel 类 + 现成 mod 库 | [epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
-| A 操作数变换 | `operand_transform/`(`transform.py`/`kinds.py` → `frontend.py` → `host.py` + `formats/`) | dequant/dropout/value fn 等 A 侧变换,以 `copy_block` 挂载点接进 RS mainloop | [epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
-| SM 设备实现 | `gemm_base.py`、`gemm_sm80/90/100/120.py`、`gemm_w4.py`、`gemm_symmetric.py`、`fused_grouped_gemm/gemm_sm90.py` | `@cute.kernel` 设备代码:mainloop、epilogue 钩子、调度器消费;host 类入口在 `gemm_base.py` | [moe_sm90.md](modules/moe_sm90.md) |
-| 支撑层 | `cache/`、`tile_scheduler.py`、`copy_utils.py`、`layout_utils.py`、`cute_dsl_utils.py`、`varlen_utils.py`、`gemm_config.py`、`compile_utils.py`、`autotuner.py` | 编译缓存、布局代数、拷贝 atom、`GemmConfig` 枚举、扫参框架 | [caching_and_parallel_compilation.md](modules/caching_and_parallel_compilation.md) |
-| 独立 kernel 家族 | `reduction_base.py` + `rmsnorm.py`、`softmax.py`、`cross_entropy.py`;`blockscaled/`、`distributed/all_gather_gemm.py` | 不走 GEMM 管线的归约 kernel、blockscaled 工具、AllGather+GEMM | [blockscaled_api.md](modules/blockscaled_api.md) |
+| 前端算子 | `mlp.py`、`linear.py`、`fused_grouped_gemm/interface.py` | torch 层入口与重计算策略;MoE 原语公开入口(薄转发到 `GemmMoeSm90`) | [fused_grouped_gemm.md](modules/fused_grouped_gemm.md)、[mlp_activation_recompute.md](modules/mlp_activation_recompute.md) |
+| 变体 API | `gemm_interface.py`、`gemm_iface.py` | 各变体统一的校验、输出分配、签名规范化;激活族共用实现与 4 个 typed out-op | [gemm_variant_api.md](modules/gemm_variant_api.md) |
+| 低层 dispatch | `gemm.py`、`gemm_default_epi.py`、`gemm_tvm_ffi_utils.py`、`split_k_reduce.py` | plan cache + SM 版本选择 + jit 编译 + launch;split-K 第二归约 kernel | [gemm_dispatch.md](modules/gemm_dispatch.md)、[tvm_ffi_compilation.md](modules/tvm_ffi_compilation.md) |
+| 通用宿主管线 | `gemm_runtime/`(`identity.py` → `host.py`、`torch_op.py`、`autotune.py`) | 所有 epilogue/transform 共用的 plan/compile/launch 与 `dlkernel::gemm_epi` 算子 | [gemm_runtime.md](modules/gemm_runtime.md)、[epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
+| epilogue | `epilogue/`(`ops.py` → `mixin.py` → `frontend.py`/`visit.py` → `library.py` + 域模块) | 装饰 fn + EpiOp 词表 + 铸 kernel 类 + 现成 mod 库 | [epilogue.md](modules/epilogue.md)、[epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
+| A 操作数变换 | `operand_transform/`(`transform.py`/`kinds.py` → `frontend.py` → `host.py` + `formats/`) | dequant/dropout/value fn 等 A 侧变换,以 `copy_block` 挂载点接进 RS mainloop | [operand_transform.md](modules/operand_transform.md)、[epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
+| SM 设备实现 | `gemm_base.py`、`gemm_sm80/90/100/120.py`、`gemm_w4.py`、`gemm_symmetric.py`、`fused_grouped_gemm/gemm_sm90.py` | `@cute.kernel` 设备代码:mainloop、epilogue 钩子、调度器消费;host 类入口在 `gemm_base.py` | [sm_device_layer.md](modules/sm_device_layer.md)、[fused_grouped_gemm.md](modules/fused_grouped_gemm.md) |
+| 支撑层 | `cache/`、`tile_scheduler.py`、`copy_utils.py`、`layout_utils.py`、`cute_dsl_utils.py`、`varlen_utils.py`、`gemm_config.py`、`compile_utils.py`、`autotuner.py` | 编译缓存、布局代数、拷贝 atom、`GemmConfig` 枚举、扫参框架 | [tile_scheduler.md](modules/tile_scheduler.md)、[support_layer.md](modules/support_layer.md)、[caching_and_parallel_compilation.md](modules/caching_and_parallel_compilation.md) |
+| 独立 kernel 家族 | `reduction_base.py` + `rmsnorm.py`、`softmax.py`、`cross_entropy.py`;`blockscaled/`、`distributed/all_gather_gemm.py` | 不走 GEMM 管线的归约 kernel、blockscaled 工具、AllGather+GEMM | [reduction_family.md](modules/reduction_family.md)、[blockscaled_api.md](modules/blockscaled_api.md)、[all_gather_gemm.md](modules/all_gather_gemm.md) |
 
 ### import 方向
 
@@ -160,7 +160,7 @@ flowchart TB
 
 一次调用 = 元数据键查 plan cache。命中则只剩 launch。未命中才走 校验 → 推导 → jit 编译(可选 autotune)→ launch。
 
-1. 入口:fn 授权的 epilogue 走 `EpiMod.gemm`(`epilogue/frontend.py:660`)。torch.compile 图内走 `dlkernel::gemm_epi`(`gemm_runtime/torch_op.py`);`digest` 经 `identity.py` 的注册表或 module locator 解析。手写变体经 `gemm_iface.py` 规范化后进同一条管线。激活前向/梯度走 `GemmBase.gemm_with_activation`/`gemm_with_activation_grad`(`gemm_base.py:333/:391`);eager 进共用 call helper,torch.compile 分派到 `dlkernel::gemm_act_out` 等 4 个 typed out-op。MoE 的两个公开入口经 `GemmMoeSm90` host 类方法调 `cls.gemm_with_activation`/`cls.gemm_with_activation_grad` 汇入;类方法负责校验、参数映射、严格解包。eager helper 与 op body 在调用前经 `GemmBase.resolve_kernel_variant` 解析 `kernel_variant` 令牌(`None` 常量返回 `GemmBase`;令牌注册表在 `identity.py`),并 `bind_epilogue` 取得绑定后的 mod。
+1. 入口:`@gemm_epilogue` 铸出的 epilogue 走 `EpiMod.gemm`(`epilogue/frontend.py:660`)。torch.compile 图内走 `dlkernel::gemm_epi`(`gemm_runtime/torch_op.py`);`digest` 经 `identity.py` 的注册表或 module locator 解析。手写变体经 `gemm_iface.py` 规范化后进同一条管线。激活前向/梯度走 `GemmBase.gemm_with_activation`/`gemm_with_activation_grad`(`gemm_base.py:333/:391`);eager 进共用 call helper,torch.compile 分派到 `dlkernel::gemm_act_out` 等 4 个 typed out-op。MoE 的两个公开入口经 `GemmMoeSm90` host 类方法调 `cls.gemm_with_activation`/`cls.gemm_with_activation_grad` 汇入;类方法负责校验、参数映射、严格解包。eager helper 与 op body 在调用前经 `GemmBase.resolve_kernel_variant` 解析 `kernel_variant` 令牌(`None` 常量返回 `GemmBase`;令牌注册表在 `identity.py`),并 `bind_epilogue` 取得绑定后的 mod。
 2. 输入校验:`EpiMod.gemm` 对组合限制逐条抛 `ValueError`。varlen_m 要求 persistent、blockscaled 不支持 varlen/gather、split_k 要求 dense、swap_ab 仅 element-mode sink-less(`epilogue/frontend.py`)。
 3. plan cache 探测:`_mod_gemm_key` 以 `tensor_key`(shape/stride/dtype)+ config flags + 每个 op 的 `host_arg_key` + transform digest 为键。命中即"已校验调用的重放",跳过校验直接 launch。`gemm.py` 的 `gemm()`/`run_gemm_plan()` 是同一模式的低层副本(`_gemm_plan_cache`:261)。
 4. 冷路径建 plan:`build_gemm_epi_plan`(`gemm_runtime/host.py:314`)从张量元数据推导 major/dtype/epi keys。它把 transform bundle 还原成 blob,组装 `GemmEpiPlan`(`:267`,18 字段 NamedTuple,含调度器选项与 launch 预计算)。
@@ -172,7 +172,7 @@ flowchart TB
 
 ### 变体 API 与声明式样板(gemm_interface / gemm_iface)
 
-`gemm_interface.py`(3578 行)是每个 GEMM 变体的归属地:输入校验、输出分配、blockscaled 容器拆包、torch 算子 schema、reference、eager 快路径 plan cache。自身不编译不启动。
+`gemm_interface.py`(3578 行)集中每个 GEMM 变体的输入校验、输出分配、blockscaled 容器拆包、torch 算子 schema、reference、eager 快路径 plan cache。自身不编译不启动。
 
 `gemm_iface.py`(372 行)把变体样板(operand 规范化、semaphore、interface-plan 与缓存、warm 回放)收敛为 `VariantSpec`(`:51`)声明加一个通用引擎:`canonicalize`:102 规范化 operand;`make_iface_plan`:232 出 warm 重放闭包;`run_variant`:319 分冷热路径。
 
@@ -186,7 +186,7 @@ flowchart TB
 
 - `ops.py`(3088 行):EpiOp 协议(`:298`)。每个 op 声明一类张量资源的使用方式:smem/TMA/fragment 生命周期与值端口(`:301-321`),以及 host 三件套 `host_arg_key`/`host_fake_arg`/`host_call_arg`(`:373-389`:依次为编译键描述符、fake 追踪参数、运行时参数)。词表含 14 个 op 类,覆盖装载、存储、归约、统计、在线 LSE、量化 SF 写出。
 - `mixin.py`:`ComposableEpiMixin`:60 把 op 元组编排成 `GemmBase` 可调用的 `epi_*` 钩子族。
-- `frontend.py` + `visit.py`:授权层。`@gemm_epilogue`:1818 装饰一个逐元素 Python fn,铸成 `EpiMod`:289;`visit.py:20` 的 `_EpiModMixinBase` 提供铸出类的设备侧通用循环。
+- `frontend.py` + `visit.py`:fn 前端。`@gemm_epilogue`:1818 装饰一个逐元素 Python fn,铸成 `EpiMod`:289;`visit.py:20` 的 `_EpiModMixinBase` 提供铸出类的设备侧通用循环。
 - `library.py` + 域模块:现成 epilogue 库与工厂(`linear_act_mod`:528、`dact_mod`、`norm_act_mod` 等)。这些工厂只产数学 mod,构造器不接收 Gemm 类;`GemmBase.bind_epilogue` 完成绑定。rotary/scaled_exp/head_rmsnorm/quantize_out 各解决一个业务域。
 
 手写 mixin(`gemm_default_epi.py:70` 的 `GemmDefaultEpiMixin`)与 fn 形式共用同一套 EpiOp 机制,是逃生舱而非第二框架。
@@ -202,7 +202,7 @@ flowchart TB
 
 ### A 操作数变换(operand_transform/)
 
-`@a_transform`(`frontend.py:520`)把 Python fn 铸成 `ATransformMod`:323,三族:value fn(逐块数学)、packed 解码(W4/W8 打包权重)、dropout。设备侧契约是 `transform.py:86` 的 `TransformA`。它实现 `make_copy_block`(`:345/:508/:604` 三处),产出 mainloop 每 k16 块调用的 `copy_block` 闭包。`kinds.py:263` 的 `ARG_KINDS` 是运行时操作数分类法。`formats/` 以 `DecodeFormat` 契约(`formats/__init__.py:57`,`:572` 的 `W4_FORMATS` 注册 15 个格式)收纳打包权重解码格式。
+`@a_transform`(`frontend.py:520`)把 Python fn 铸成 `ATransformMod`:323,三族:value fn(逐块数学)、packed 解码(W4/W8 打包权重)、dropout。设备侧契约是 `transform.py:86` 的 `TransformA`。它实现 `make_copy_block`(`:345/:508/:604` 三处),产出 mainloop 每 k16 块调用的 `copy_block` 闭包。`kinds.py:263` 的 `ARG_KINDS` 给运行时的操作数分类。`formats/` 以 `DecodeFormat` 契约(`formats/__init__.py:57`,`:570` 的 `W4_FORMATS` 注册 15 个格式)统一打包权重解码格式。
 
 ### SM 设备实现层
 
@@ -278,7 +278,7 @@ autotune 是可选的首调扫参层。它只选 tile/cluster/pingpong 等 `Gemm
 
 reduction 家族(`ReductionBase`,`reduction_base.py:12`)覆盖 rmsnorm/softmax 前反向、cross-entropy 前向、topk 反向、`gemm_rms` 第二段归约。共同形态:每 CTA 持整行 smem 镜像,warp shuffle 归约(`reduce.py:22`)→ 跨 warp smem buffer → 跨 CTA mbarrier 事务归约(`cluster_reduce`:114),主力 `row_reduce`(`:202`)。例外:`TopK` 前向(寄存器 bitonic)与 `CrossEntropyBackward`(纯逐元素)不继承基类。
 
-支撑层三类:纯设备代数(`copy_utils.py` 1840 行的 copy atom/tiled copy/TMA/TMEM 原语、`layout_utils.py` 布局代数、`reduce.py` 归约代数);host 基础设施(`cache/`、`autotuner.py`、`compile_utils.py`);DSL 地基(`dsl/`:进程级 monkey-patch CuTe 张量索引语法、`cute_op`:29 算子封装,`dsl/__init__.py:5-17` 最先 import)。跨家族共用的还有 `pipeline.py`:13 个类,包装并热替换 cutlass 原始 pipeline(`_override_create`:27 加类交换),`PipelineStasAsync`:387 纯自研,GEMM 与 rmsnorm 反向共用。
+支撑层三类:纯设备代数(`copy_utils.py` 1840 行的 copy atom/tiled copy/TMA/TMEM 原语、`layout_utils.py` 布局代数、`reduce.py` 归约代数);host 基础设施(`cache/`、`autotuner.py`、`compile_utils.py`);DSL 基础件(`dsl/`:进程级 monkey-patch CuTe 张量索引语法、`cute_op`:29 算子封装,`dsl/__init__.py:5-17` 最先 import)。跨家族共用的还有 `pipeline.py`:13 个类,包装并热替换 cutlass 原始 pipeline(`_override_create`:27 加类交换),`PipelineStasAsync`:387 纯自研,GEMM 与 rmsnorm 反向共用。
 
 孤立与超前代码:`tensormap_manager.py` 零引用;`spec/` 原型零消费者(`tensor_spec.py:6-9` 自述 prototype);`quantize_utils.py` 自述服务的"fused RMSNorm 量化前向"尚不存在(文档超前于代码)。blockscaled 的操作数容器是 `BlockScaledOperand`(`blockscaled/operand.py:551`),量化器在 `blockscaled/quantize.py`。all_gather 不是纯外围:`AllGatherRunner`(`distributed/all_gather_gemm.py:275`)经 `ag_args` 接入任意变体;触点在 `tile_scheduler.py:183` 与 `gemm.py:458`。另有 `BlockScaledAllGatherRunner`:818。
 
@@ -293,6 +293,79 @@ reduction 家族(`ReductionBase`,`reduction_base.py:12`)覆盖 rmsnorm/softmax �
 | `make_copy_block` 挂载点 | operand_transform/transform.py:345 | A 侧变换种类多但 mainloop 不想感知 | 每 k16 块一个闭包,mainloop 只调 `copy_block(stage, b, k_tile)`,不感知背后是解码还是 dropout |
 | `TileScheduler` 族 | tile_scheduler.py:250/1067/1257 | persistent 调度随 SM 演进 | 四种持久化模式共用 create/advance/get_current_work 协议;K 维分解收归 `get_split_k_tile_range`:637 |
 | `ReductionBase` | reduction_base.py:12 | 行归约 kernel 骨架重复 | cluster 配置、tiled copy 推导、reduction buffer 与 mbarrier 分配;子类只写数学 |
+
+### 多态方法速查
+
+本节列各继承体系里被覆写的方法:基类有定义,子类给出自己的实现。基类没有定义、由多个子类各自实现的隐式协议单独注明。行号约定同文首,随代码演进漂移。
+
+**GEMM 设备栈**(继承树见上文):
+
+| 基类方法 | 基类定义 | 覆写者 |
+|---|---|---|
+| `GemmBase.epi_smem_warp_shape_mnk` | gemm_base.py:557 | GemmSm90:363、GemmSm100:350、GemmSm120:445 |
+| `GemmBase.epi_r2s_pair_xor` | gemm_base.py:560 | GemmSm90:1851 |
+| `GemmBase.epi_load_acc_subtile` | gemm_base.py:1186 | GemmSm100:2335 |
+| `GemmTmaBase.make_ab_pipeline` | gemm_base.py:1522 | GemmSm100:2492 |
+| `GemmSm90.kernel` | gemm_sm90.py:878 | GemmSm120:763 |
+| `GemmSm90.mma` | gemm_sm90.py:1616 | GemmSm120:1648 |
+| `GemmSm90.canonical_a_load` | gemm_sm90.py:1503 | GemmSm120:717 |
+| `GemmSm90._setup_tiled_mma` | gemm_sm90.py:371 | GemmSm120:523 |
+| `GemmSm90._setup_attributes` | gemm_sm90.py:431 | GemmSm120:463 |
+| `GemmSm90._compute_tile_shape_or_override` | gemm_sm90.py:2093 | GemmSm120:1786 |
+| `GemmSm90._sf_smem_bytes_per_stage` | gemm_sm90.py:367 | GemmSm120:448 |
+| `GemmSm90.epi_smem_warp_shape_mnk` | gemm_sm90.py:363 | GemmSm120:445 |
+| `GemmSm90.__init__` | gemm_sm90.py:156 | GemmSm120:269、GemmMoeSm90:55 |
+| `GemmBase.epi_visit_subtile` | gemm_base.py:1218 | GemmDefaultEpiMixin:128、GemmSymmetricMixin:77、`_EpiModMixinBase`:140(经铸出类 MRO) |
+| `GemmBase.epi_to_underlying_arguments` | gemm_base.py:1267 | GemmDefaultEpiMixin:117、`_EpiModMixinBase`:38 |
+| `GemmBase.get_scheduler_class` | gemm_base.py:1085 | GemmSymmetricMixin:73 |
+| `GemmBase.resolve_epi_m_major` | gemm_base.py:1089 | ComposableEpiMixin:105 |
+
+三个边界:
+
+- `GemmBase.epilogue`(gemm_base.py:577)没有覆写者,四个架构共用同一份 epilogue 驱动器。
+- `GemmSm100.kernel`(gemm_sm100.py:1106)和 `GemmSm80.__call__`(gemm_sm80.py:141)是新定义,不是覆写:它们的基类没有同名方法。
+- `GemmMoeSm90` 只覆写 `__init__`,设备侧零覆写,印证上文 MoE 一节。
+
+**mixin 与 SM 的菱形组合**:mixin 单独不继承 `GemmBase`,组合类(如 `GemmDefaultSm90` = `GemmDefaultEpiMixin` + `GemmSm90`)的 MRO 中 mixin 腿排在 SM 腿之前,mixin 的同名方法由此盖过 SM 腿的版本。具体覆写:
+
+- `ComposableEpiMixin` 的 `epi_*` 钩子整族盖过 `GemmBase` 的默认实现(`epi_begin`:1198、`epi_begin_loop`:1213、`epi_end_loop`:1238、`epi_end`:1254、`epi_get_tma_atoms`:1272、`epi_smem_bytes`:1293、`epi_get_smem_struct`:1301、`epi_get_smem_tensors`:1304、`epi_setup_aux_out`:1307 等,对应 mixin 的 :121/:135/:159/:166/:238/:280/:312/:359);`_compute_tile_shape_or_override`(mixin.py:216)同理盖过 `GemmSm90`:2093,只有不掺 mixin 的 SM 类链才用 SM 自己的版本(如 `GemmSm120`:1786 覆写 `GemmSm90`:2093)。
+- `GemmDefaultEpiMixin` 再覆写 `epi_to_underlying_arguments`(gemm_default_epi.py:117)与 `epi_visit_subtile`(:128),嵌套类 `EpilogueArguments`(:96)同步收窄 `GemmBase`:552 的定义;`_EpiModMixinBase`(visit.py:38/:140)在铸出类里走同一对覆写,另加 `GemmBase` 没有的 `epi_prepass_subtile`:82、`epi_prepass_end`:115 —— `GemmBase` 只以类属性 `epi_needs_acc_prepass`(gemm_base.py:127)声明这个阶段。
+- `GemmSymmetricMixin.get_scheduler_class`(gemm_symmetric.py:73)覆写 `GemmBase`:1085 返回 `TriangularTileScheduler`;`epi_visit_subtile`(:77)先调 `GemmDefaultEpiMixin` 的实现,再返回 `(tRS_rD,)`(:79-80)让镜像输出直接复用 D 值,镜像 tile 的写由 `TileStore` 的 `store_pred` 跳过(:62)。
+
+**TileScheduler**(tile_scheduler.py:250):
+
+| 方法 | 基类定义 | 覆写者 |
+|---|---|---|
+| `to_underlying_arguments` | :389 | TriangularTileScheduler:1126、VarlenMTileScheduler:1333 |
+| `get_grid_shape` | :461 | TriangularTileScheduler:1131、VarlenMTileScheduler:1350 |
+| `_swizzle_cta` | :494 | TriangularTileScheduler:1160、VarlenMTileScheduler:1380 |
+| `_delinearize_work_idx` | :540 | TriangularTileScheduler:1202、VarlenMTileScheduler:1438 |
+| `_cluster_idx_to_work_idx_batch` | :405 | 仅 VarlenMTileScheduler:1338 |
+
+`create`/`advance`/`get_current_work` 是三个调度器共用的协议,无覆写(见「关键抽象速查」)。
+
+**EpiOp**(ops.py:298):各 op 类按需覆写协议方法,`VecLoad`、`VecReduce`、`TileLoad`、`GroupedColStatsBase` 四个中间基类各承接一层。被覆写的方法按组列出:
+
+| 组 | 被覆写的方法(基类定义行) | 覆写者数 |
+|---|---|---|
+| host 三件套 | `host_arg_key`:373、`host_fake_arg`:381、`host_call_arg`:387 | 5、10、2 |
+| 设备生命周期 | `begin`:459、`begin_loop`:463、`end_loop_stage`:472、`end_loop_finish`:493、`end`:502 | 12、8、3、3、1 |
+| smem 资源 | `smem_bytes`:419、`smem_struct_field`:423、`get_smem_tensor`:428、`tma_atoms`:433 | 6、6、8、2 |
+| param 桥 | `param_fields`:404、`to_params`:409、`config_key`:340、`arg_spec_type`:391、`host_arg_form`:398 | 10、10、10、2、1 |
+| fn 端口 | `fn_prepare`:323、`fn_sink_flush`:331 | 1、4 |
+| 装载与判别 | `load_g2s_copy_fn`:445、`load_s2r`:468、`is_tile_load`:437、`is_tile_store`:441、`needs_async_fence`:498、`epi_m_major_score`:414 | 2、1、1、1、1、2 |
+
+构造器 `__init__`:337 被 12 个 op 类覆写。中间基类再暴露自己的覆写点:`VecLoad._get_gmem_vec`(:663)被 `ColVecLoad`:739 覆写;`ColVecReduce` 的 `_merge`/`_finalize`/`_end_loop_values`/`_end_loop_smem`(:1683-1697)被 `OnlineLSEReduce`(:2662-2691)覆写;`GroupedColStatsBase.stat_value`(:2475)被 `HeadRstd`(head_rmsnorm.py:32)与 `MaxLog2`(scaled_exp.py:64)覆写。`RowVecLoad` 无覆写;`RowVecReduce`、`DStore` 只覆写 `EpiOp` 方法,不新增覆写点。
+
+**A 操作数变换**(operand_transform/transform.py:86):`TransformA` 基类只有类属性(`owns_a_layout`、`promote`、`uses_work_tile` 等),没有方法。`make_copy_block` 由三个子类各自实现:`TransformAW4`:345、`TransformAValue`:508、`TransformADropout`:604。两个可选钩子只出现在需要的子类,mainloop 按类属性开关调用:`promote_acc`(TransformAW4:412,慢累加折叠)、`on_work_tile`(TransformADropout:563,每个 work tile 刷新寄存器状态)。
+
+**ReductionBase**(reduction_base.py:12):子类覆写的是配置钩子 —— `__init__`:13(8 个子类)、`_threads_per_row`:19(6 个)、`_num_threads`:22(4 个)、`_set_cluster_n`:25(6 个)、`_get_tiled_copy`:42(仅 TopKBackward:288)。各 kernel 主体是子类新定义(如 `RMSNorm.kernel`:151),不在覆写之列。
+
+**DecodeFormat**(formats/__init__.py:57):`make_consts`:109(9 个格式)、`quantize_reference`:114(13 个)、`dequant_reference`:117(11 个)、`prepare`:120(12 个)。`Qtip2` 增设 `decode_k16`:527,被 `Qtip2S`:560 覆写。
+
+**TunePolicy**(autotuner.py:164):五个钩子沿继承链逐级覆写 —— `make_key`:192、`bind_signature`:195、`budget_override`:209、`prepare_candidates`:214、`shortlist`:217。`GemmTunePolicy`(gemm_tune_policy.py:139)五个全覆;`VarlenGemmTunePolicy`(varlen_selector.py:868)加 `__init__` 后再全覆五个;`GemmEpilogueTunePolicy`(gemm_epilogue_tune_policy.py:16)覆其中四个;`RmsNormTunePolicy`(rmsnorm.py:509)只覆 `prepare_candidates`。
+
+**其余**:`TransformModBase`(operand_transform/frontend.py:147)的 `owned_fmt`:162、`compile_ref`:194、`_module_locator`:201 被 `ATransformMod`(:348/:356)与 `PackedFormatMod`(:462/:465)覆写;`AllGatherRunner.gather`(distributed/all_gather_gemm.py:642)被 `BlockScaledAllGatherRunner`:975 覆写。`pipeline.py` 的 `_override_create`:27 是类级热替换,换掉 cutlass 原类的 `create`,不算方法覆写。`spec/` 原型零消费者,不入本节。
 
 ## 绑定与身份机制
 
@@ -320,10 +393,10 @@ classDiagram
     EpiMod ..> EpiPlanCls : plan 层
 ```
 
-身份机制回答一个问题:动态铸出的类只存活于创建进程。编译缓存、异步 worker、torch.compile 图怎么认得它?
+身份机制回答一个问题:动态铸出的类只存活于创建进程。编译缓存、异步 worker、torch.compile 图如何重新找到它?
 
-- `EpiMod` 构造期算 `semantic_key`(fn 指纹 + 各 op `cache_key()` + mode + 绑定 Gemm 类身份)并 sha256 成 `semantic_digest`,写进注册表。绑定摘要 = 原始 epilogue 声明 + 实际 Gemm 类。generic 数学 mod 与具体类绑定 mod 的摘要不同。
-- 缓存与 worker 之间只传 `GemmClassRef` 五元组。worker 重新 import、验证 digest、按 `mint_key` 重铸等价类(`identity.py:376-411`)。digest 同时编进 jit_cache 磁盘键,保证重铸类与 `.o` 语义一致。序列化(`__getstate__`)清空 `_minted`/`_plan_cache`/`_call_cache`/`_bound_epilogues` 四个运行缓存,worker 重建后的摘要等于提交的绑定摘要。
+- `EpiMod` 构造期算 `semantic_key`(fn 指纹 + 各 op `cache_key()` + mode + 绑定 Gemm 类身份)并 sha256 成 `semantic_digest`,写进注册表。digest 由原始 epilogue 声明与实际 Gemm 类共同决定。generic 数学 mod 与具体类绑定 mod 的 digest 不同。
+- 缓存与 worker 之间只传 `GemmClassRef` 五元组。worker 重新 import、验证 digest、按 `mint_key` 重铸等价类(`identity.py:376-411`)。digest 同时编进 jit_cache 磁盘键,保证重铸类与 `.o` 语义一致。序列化(`__getstate__`)清空 `_minted`/`_plan_cache`/`_call_cache`/`_bound_epilogues` 四个运行缓存,worker 重建出的 digest 与提交的一致。
 - 指纹 fail-closed:无法指纹的捕获直接抛 TypeError。理由:"过粗的键会静默复用错误的 kernel"(`identity.py:47-49`)。注册表写在构造期而非 trace 期,因为 Dynamo 把全局 dict 变异缓冲为延迟副作用(`:231`)。
 - 绑定是唯一的 epilogue 组合挂载点:`GemmBase.bind_epilogue`(`gemm_base.py:274`)首次绑定某类时,`EpiMod._bind_gemm_class`(`frontend.py:489`)用保存的原始构造参数重建对象;重建走 EpiMod 构造器,保留校验与 `TORCH_OP_EPI_MODS` 摘要注册,全部运行缓存从空开始。memo `_bound_epilogues` 以实际 Gemm 类为键;generic root 绑定与同类重复绑定直接返回原对象。`_mint` 铸类调用绑定类的 `select_gemm_class`,EpiMod 自身不持有 SM 策略。
 
@@ -333,11 +406,11 @@ classDiagram
 |---|---|---|
 | 入口 | gemm_interface / gemm_base / torch_op | 调用方进入库的公开函数、类方法或 torch 算子 |
 | 变体 | gemm_interface.py | 一个 GEMM 入口对应的数学与参数组合(如 `gemm_add`) |
-| 授权 | epilogue/frontend.py | `@gemm_epilogue` 把用户 fn 变成可铸类的 EpiMod |
+| fn 前端 | epilogue/frontend.py | `@gemm_epilogue` 把用户 fn 变成可铸类的 EpiMod |
 | 铸类 | epilogue/frontend.py:541 | `type()` 动态组装 kernel 类;fn 与 op 签名成为类属性 |
 | 铸类键(mint key) | EpiMod | kinds、SM、packing、rounding 等决定具体动态类 |
 | 绑定 | gemm_base.py:274 | `bind_epilogue` 把数学 mod 关联到一个 Gemm 类,产生独立 digest 与缓存 |
-| 绑定摘要(`semantic_digest`) | EpiMod 与 identity | fn、op、mode 与绑定类共同决定编译语义 |
+| `semantic_digest` | EpiMod 与 identity | fn、op、mode 与绑定类共同决定编译语义 |
 | 类身份(`variant_id` token) | Gemm 类声明;`identity.py` 中立注册表解析 | 标识跨 custom op 的静态 role;类路径区分实际实现 |
 | 注册表 | identity.py:234/421 | digest→mod 与 token→类的查找表 |
 | plan | gemm_runtime/host.py:267 | 一次调用的启动配方;键为张量元数据与配置 |
@@ -433,7 +506,7 @@ sequenceDiagram
 
 要点:autotune 只选 `GemmConfig` 字段,不改 kernel 语义。policy 剪掉非法候选;tests 钉死数值正确性。失败候选计为 inf,不中断扫参(`autotune.py:300-303`)。
 
-### 链路三 rmsnorm 前向(第二家族对照)
+### 链路三 rmsnorm 前向(reduction 家族对照)
 
 reduction 家族不走 gemm_runtime。host 侧是自己的三层:`@cute_op` torch 算子、`@jit_cache` 编译缓存、`@autotune` 调参。rmsnorm 前向的链路:
 
@@ -449,12 +522,12 @@ reduction 家族不走 gemm_runtime。host 侧是自己的三层:`@cute_op` torc
 |---|---|---|
 | host 编排 | plan cache + identity/digest;注册面为变体 out-op 与 fn 的 `gemm_epi` | `@cute_op` 每算子注册 + `@jit_cache` |
 | 调度 | tile_scheduler(四模式持久化) | 裸 grid-stride 循环(`rmsnorm.py:1002`) |
-| 变体治理 | epilogue/transform 两个挂载点 | 配置平铺(threads/cluster/reload),`@autotune` 搜索空间是平的 config 列表 |
+| 变体组织 | epilogue/transform 两个挂载点 | 配置平铺(threads/cluster/reload),`@autotune` 搜索空间是平的 config 列表 |
 | 共享件 | copy_utils(各自用不同子集)、layout_utils、pipeline、dsl 补丁、cache/jit、autotuner | 同左 |
 
-【推断】分开两套模式的根因:GEMM 的变体爆炸在 epilogue 与操作数维度,需要 plan/registry 治理;归约的变体只在 N/dtype/cluster 配置维度,拉 GEMM 管线进来纯增复杂度。
+【推断】分开两套模式的根因:GEMM 的变体爆炸在 epilogue 与操作数维度,需要 plan/registry 来管理;归约的变体只在 N/dtype/cluster 配置维度,拉 GEMM 管线进来纯增复杂度。
 
-### 设备 kernel 内部一个 tile 的一生(SM90)
+### 设备 kernel 内单个 tile 的执行流程(SM90)
 
 ```mermaid
 flowchart TB
@@ -492,13 +565,13 @@ SM 选择是 device capability major 到 kernel class 的静态映射:`gemm.py` 
 
 ## 硬性约束
 
-以下条目提炼自 AGENTS.md 的 "Measured facts & gotchas" 节,是硬件行为与测量协议的既成事实。原节是唯一权威表述。
+以下条目提炼自 AGENTS.md 的 "Measured facts & gotchas" 节,记录硬件行为与测量方法。原节是唯一权威表述。
 
 - **SF tmem 64-N 粒度**:blockscaled SF 在 UTCCP 写与 QMMA 读两端都按 64-N 粒度访问;`tile_n` 是 32 的倍数但不是 64(如 96、224)时,硬件阻塞访问。
 - **swizzle 不可丢**:对 swizzled smem 取 dtype 视图会丢掉 swizzle;必须用 `recast_ptr` 重挂同一条字节地址 swizzle,不能用裸 `recast_tensor`。
-- **TensorSSA 陷阱**:对全零 stride 的 filtered rmem view 调 `.store` 会被静默丢弃,需改用标量 setitem;`partition_D` 的 tile 不得小于 epilogue tiler(warp 损坏)。
+- **TensorSSA**:对全零 stride 的 filtered rmem view 调 `.store` 会被静默丢弃,需改用标量 setitem;`partition_D` 的 tile 不得小于 epilogue tiler(warp 损坏)。
 - **L1TEX 带宽**:gmem 与 smem 共享 128 B/clk/SM 的管道;带 smem 交换的 16-bit kernel 通常卡在 smem/latency 而非 DRAM。
-- **测量协议**:
+- **基准测试**:
   - sub-100us kernel 必须有 GPU 侧 backlog(burner),否则量的是 host enqueue 间隙。
   - config 顺序跨轮轮换(连续 kernel 链式污染 L2)。
   - 共享节点按单 launch 粒度 interleave 并取 median。
@@ -524,7 +597,7 @@ SM 选择是 device capability major 到 kernel class 的静态映射:`gemm.py` 
 | 新 epilogue 数学 | `@gemm_epilogue` fn 或取 library 工厂 | library.py 各工厂 |
 | 新 epilogue 资源类型 | EpiOp 子类(资源生命周期 + 端口 + host 三件套) | rotary.py 的加载 op |
 | 新 A 侧变换 | `@a_transform` fn | transform.py 三族 |
-| 新打包权重格式 | 注册 DecodeFormat(formats/__init__.py:572) | qtip 系列 |
+| 新打包权重格式 | 注册 DecodeFormat(formats/__init__.py:570) | qtip 系列 |
 | 新 SM 代际 | 继承基类 + sm_to_cls 登记 + GemmConfig 候选空间 | gemm_sm120.py |
 | 新归约 kernel | 继承 ReductionBase | rmsnorm/softmax |
 
@@ -540,7 +613,7 @@ SM 选择是 device capability major 到 kernel class 的静态映射:`gemm.py` 
 
 ### 有意不做的事
 
-- 不做多 kernel 编排:MoE 入口停在 primitive 边界,dW/dX/路由聚合归调用方(合同见 [moe_sm90.md](modules/moe_sm90.md))。
+- 不做多 kernel 编排:MoE 入口停在 primitive 边界,dW/dX/路由聚合归调用方(合同见 [fused_grouped_gemm.md](modules/fused_grouped_gemm.md))。
 - 不保缓存稳定:缓存键哈希整个包源码(`cache/jit.py:165-191`),源码改动即整体换目录重编译(AGENTS.md:cache stability is NOT a design constraint)。
 - 不自建 epilogue IR:DSL tracing 已内联 fn,MLIR 在下层消除子表达式,自建 IR 会丢掉打包内联与寄存器布局控制(`frontend.py:133-137`)。
 
@@ -557,7 +630,7 @@ SM 选择是 device capability major 到 kernel class 的静态映射:`gemm.py` 
 | 5 | `gemm_runtime/host.py` 的 `build_gemm_epi_plan`(:314)与 `run_gemm_epi_plan`(:509);`gemm_tvm_ffi_utils.py:357-425` 设计注释 + `gemm.py` | plan 推导与热路径重放(`GemmEpiPlan` 18 个字段);三层绑定与低层 dispatch |
 | 6 | `gemm_base.py` 的 `epilogue` 驱动器(:577 起);`gemm_sm90.py` 的 `kernel`(:878)与 `mma_rs_interleaved`(:1702) | epi_* 钩子族的调用时序;双 warpgroup 结构、pingpong、copy_block 交叠 |
 | 7 | `tile_scheduler.py` 的 `PersistenceMode`(:31-38)与 `advance_to_next_work` | 四种持久化模式的实现与选择 |
-| 8 | `reduction_base.py` + `rmsnorm.py` 的 `RMSNorm.kernel`(:151) | 第二家族模式,与 GEMM 管线对照 |
+| 8 | `reduction_base.py` + `rmsnorm.py` 的 `RMSNorm.kernel`(:151) | reduction 家族模式,与 GEMM 管线对照 |
 | 参考 | `docs/dsl_control_flow.rst`、`docs/limitations.rst` | CuTe DSL 的语法限制(写 kernel 前必读) |
 
-进阶主题见模块文档:autotune [autotuning_subsystem.md](modules/autotuning_subsystem.md)、编译栈 [caching_and_parallel_compilation.md](modules/caching_and_parallel_compilation.md)、MoE [moe_sm90.md](modules/moe_sm90.md)、blockscaled [blockscaled_api.md](modules/blockscaled_api.md) 与 [varlen_blockscaled_sf_layout.md](modules/varlen_blockscaled_sf_layout.md)、硬件约束 AGENTS.md 的 Measured facts 节与 [notes/](notes/)。
+各模块的细节文档见「九层职责表」末列。专题:autotune [autotuning_subsystem.md](modules/autotuning_subsystem.md)、编译栈 [caching_and_parallel_compilation.md](modules/caching_and_parallel_compilation.md)、MoE [fused_grouped_gemm.md](modules/fused_grouped_gemm.md)、blockscaled [blockscaled_api.md](modules/blockscaled_api.md) 与 [varlen_blockscaled_sf_layout.md](modules/varlen_blockscaled_sf_layout.md);硬件约束见 AGENTS.md 的 Measured facts 节与 [notes/](notes/)。

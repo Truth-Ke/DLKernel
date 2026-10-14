@@ -206,7 +206,7 @@ router、config 或 runtime 层。
   报错,不回退 generic。无 codec 层,编译图按当前格式整体重建。
   moe_down 对类入口的返回值按 `compute_router_weight_grad` 严格解包。错 arity 报
   RuntimeError,不做 None 补齐。
-- 缓存身份:绑定摘要 = 原始 epilogue 声明 + 实际 Gemm 类(`semantic_key` 的
+- 缓存身份:digest 由原始 epilogue 声明与实际 Gemm 类共同决定(`semantic_key` 的
   `("gemm_cls", None|(module, qualname))` 条目)。`GemmMoeSm90.bind_epilogue(math_mod)` 首次绑定时经
   `EpiMod._bind_gemm_class` 从原始构造参数重建 mod。重建走 EpiMod 构造器,保留校验
   与 `TORCH_OP_EPI_MODS` 摘要注册,quantizer 不重复提升。全部运行缓存从空开始。
@@ -214,7 +214,7 @@ router、config 或 runtime 层。
   类绑定与同类重复绑定直接返回原 mod。MoE 绑定 mod 与 generic 数学 mod 的 digest
   不同,各挂各的 plan cache,不新建缓存结构。序列化(`__getstate__`)清空
   `_minted`/`_plan_cache`/`_call_cache`/`_bound_epilogues` 四个运行缓存。worker
-  payload 重建后的摘要等于提交的绑定摘要。torch.compile 路径把 role 物化为
+  payload 重建出的 digest 与提交的一致。torch.compile 路径把 role 物化为
   `variant_id` 令牌(`kernel_variant` schema 不变)。磁盘缓存兼容不是 key schema 的
   设计约束。摘要结构变化允许 `.o` 与 tune winner 一次性失效重编译(先例见
   `docs/notes/epilogue_transform_reorg.md`)。
