@@ -58,10 +58,11 @@ Per `gpu-test/action.yml`: a single pass with async kernel compilation —
   contention. Cold kernel-compile misses are shipped to a pool of 24 CPU
   workers (forkserver sidecar, GPU-blind) while the affected tests defer and
   retry once their `.o` lands; warm runs pay nothing. The
-  persistent kernel cache (`DLKERNEL_CACHE_DIR`) carries `.o` files across runs
-  on the same runner. CI prunes DLKernel source-fingerprint cache directories
-  older than 7 days before each test run, plus interrupted `.o.tmp.*` exports
-  older than 1 day.
+  persistent artifact cache (`DLKERNEL_ARTIFACT_CACHE_DIR`) carries `.o` files
+  across runs on the same runner. `DLKERNEL_CACHE_DIR` holds autotune winner
+  JSON separately. CI removes interrupted `.o.tmp.*` exports older than 1 day
+  from the artifact directory. Fingerprint-directory GC needs a policy that
+  accounts for active readers and compilers; directory mtime is not a hit age.
 
 ## SIF caching on runners
 

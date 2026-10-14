@@ -19,6 +19,7 @@ from __future__ import annotations
 import fcntl
 import functools
 import hashlib
+import inspect
 import os
 import pickle
 import re
@@ -39,6 +40,10 @@ import tvm_ffi
 # always see the live value, not a snapshot taken at module import.
 import DLKernel.cache as _state  # noqa: E402  (intentional partial-import; see __init__.py)
 
+# Capture mode lives in its own dependency-free module so both the package
+# init and this module can reach it without an import cycle.
+from DLKernel.cache import capture as _capture  # noqa: E402
+
 
 EXPORT_FUNC_NAME = "func"
 LOCK_TIMEOUT = 60
@@ -50,10 +55,12 @@ CacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
 
 
 def get_cache_path() -> Path:
+    """Return the absolute artifact root so captured paths survive ``chdir``."""
     if _state.CACHE_DIR is not None:
         cache_dir = Path(_state.CACHE_DIR)
     else:
         cache_dir = Path(tempfile.gettempdir()) / getuser() / "dlkernel_cache"
+    cache_dir = cache_dir.resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -195,6 +202,119 @@ def _key_to_hash(key: tuple) -> str:
     return hashlib.sha256(pickle.dumps(key)).hexdigest()
 
 
+def _fsync_path(path: Path, *, is_dir: bool = False) -> None:
+    """Best-effort fsync for cross-node visibility (DeepGEMM-style hardening).
+
+    Renames alone don't guarantee another host sees the data on every
+    distributed filesystem; flushing the file before publish and the parent
+    directory after closes that gap. Failures on exotic filesystems degrade
+    to plain-rename semantics rather than aborting the publish.
+    """
+    flags = os.O_RDONLY | (os.O_DIRECTORY if is_dir else 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _publish_artifact(tmp_path: Path, o_path: Path) -> bool:
+    """Atomically publish a freshly exported artifact; True if we won.
+
+    DeepGEMM's directory-rename protocol, file edition: correctness comes
+    from filesystem atomicity alone, never from the advisory lock. The
+    no-clobber ``os.link`` is the single publish primitive — EEXIST means
+    some other process/rank/host already published this key, and the loser
+    discards its own export and reuses the existing artifact. Hardlinks are
+    atomic on POSIX and NFS. Any other OSError propagates to the caller's
+    export-failure handling (warn + keep the in-process result).
+    """
+    _fsync_path(tmp_path)
+    try:
+        os.link(tmp_path, o_path)
+        won = True
+    except FileExistsError:
+        won = False  # another publisher won the race; reuse its artifact
+    _fsync_path(o_path.parent, is_dir=True)
+    tmp_path.unlink(missing_ok=True)
+    return won
+
+
+def _export_artifact(compiled_fn, o_path: Path) -> None:
+    """Export through a unique private file, including when a lock times out.
+
+    A PID-only name is unsafe when two threads compile the same key: the
+    fallback exporter could overwrite the active writer's file before it is
+    hard-linked into the cache. ``mkstemp`` reserves a distinct name for each
+    export; CuTe's exporter opens the path in write mode and replaces its bytes.
+    """
+    fd, name = tempfile.mkstemp(prefix=f"{o_path.name}.tmp.", dir=o_path.parent)
+    os.close(fd)
+    tmp_path = Path(name)
+    try:
+        compiled_fn.export_to_c(
+            object_file_path=str(tmp_path),
+            function_name=EXPORT_FUNC_NAME,
+        )
+        _publish_artifact(tmp_path, o_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _file_digest(path: str) -> str:
+    """Digest source bytes, including edits that preserve size and mtime."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        # A missing source cannot contribute its bytes to the identity.
+        return "nosrc"
+
+
+def _module_source_digest(fn) -> str:
+    """Digest of the source file defining *fn*'s module.
+
+    Folds downstream-module edits into the key even when the
+    module's source dir is not registered in ``EXTRA_SOURCE_DIRS`` (the
+    package-wide fingerprint only covers registered trees). Synthetic
+    modules (exec'd strings, REPL definitions) have no source file and get
+    the constant ``"nosrc"``.
+    """
+    try:
+        src = inspect.getsourcefile(fn)
+    except (OSError, TypeError):
+        return "nosrc"
+    if src is None:
+        return "nosrc"
+    return _file_digest(src)
+
+
+def _request_sha(fn, cache_key: tuple, source_digest: str | None = None) -> str:
+    """Disk sha over (module, qualname, module-source digest, args).
+
+    The module is part of the identity: two modules may define same-named
+    compile functions with identical signatures (verified 2026-09-23 —
+    without it, the second module silently loaded the first's artifact).
+    Pool workers already resolve tasks by module + qualname, so this makes
+    the on-disk key match the dispatch identity exactly. The source
+    fingerprint covers the DLKernel package plus ``EXTRA_SOURCE_DIRS``; the
+    per-module digest additionally invalidates keys when a *downstream*
+    module that never registered its source dir edits its ``_compile_*``
+    definitions (previously such edits kept serving stale artifacts).
+    The wrapper freezes the defining source digest when the function is
+    decorated. An old function left alive after an on-disk edit must never
+    export its old code under the new source's key.
+    """
+    return _key_to_hash(
+        (fn.__module__, fn.__qualname__, source_digest or _module_source_digest(fn)) + cache_key
+    )
+
+
 # ---------------------------------------------------------------------------
 # File locking
 # ---------------------------------------------------------------------------
@@ -232,6 +352,37 @@ class FileLock:
 
 
 # ---------------------------------------------------------------------------
+# In-process compile attribution
+# ---------------------------------------------------------------------------
+
+# Shas compiled by *this process* at the two real in-process compile points
+# of the jit_cache wrapper below (slow-path-under-exclusive-lock and the
+# lock-timeout fallback). Answering "which compiles did this run author"
+# from the compile path itself — instead of diffing artifact existence or
+# mtimes around a call — stays correct under concurrency: every racing
+# process attributes exactly the keys it compiled, never a peer's artifact
+# (mtime-equal rewrites included). Loads and pool submissions deliberately
+# do NOT record here: they don't compile.
+_LOCAL_COMPILES: set[str] = set()
+
+
+def note_local_compile(sha: str) -> None:
+    """Record that this process just compiled key ``sha``."""
+    _LOCAL_COMPILES.add(sha)
+
+
+def drain_local_compiles() -> list[str]:
+    """Swap-out: return the locally compiled shas so far and clear the ledger.
+
+    Pool workers drain this after each task so their result can carry the
+    exact set of keys they compiled back to the parent process.
+    """
+    shas = list(_LOCAL_COMPILES)
+    _LOCAL_COMPILES.clear()
+    return shas
+
+
+# ---------------------------------------------------------------------------
 # JIT cache decorator
 # ---------------------------------------------------------------------------
 
@@ -240,7 +391,7 @@ def jit_cache(fn):
     """Decorator that caches compiled CuTe DSL kernels in-memory and on disk.
 
     The decorated function should return a compiled kernel (i.e. call cute.compile).
-    The disk cache key is (fn.__qualname__, *args, **sorted_kwargs).
+    The disk key includes module identity, frozen defining source and arguments.
 
     Concurrency model
     -----------------
@@ -249,12 +400,13 @@ def jit_cache(fn):
     * **Fast path (warm cache).** If the ``.o`` file already exists, we take a
       shared lock just long enough to ``load_module`` it. Many readers can
       proceed concurrently.
-    * **Slow path (cold cache).** The actual ``fn(*args, **kwargs)`` compile
-      runs *under* the exclusive lock. This serializes redundant compilations
-      of the same key across xdist workers / processes: if N processes race
-      on a cold key, only one calls ``cute.compile``; the rest wait for the
-      lock, see the ``.o`` appear, and load it. (Previously the compile ran
-      *between* the shared-lock check and the exclusive-lock export, so all
+    * **Slow path (cold cache).** Normally the actual ``fn(*args, **kwargs)``
+      compile runs *under* the exclusive lock. This serializes redundant
+      compilations of the same key across xdist workers / processes. After a
+      lock timeout, a caller may compile concurrently and attempt a no-clobber
+      publish, so compile-once is a best-effort property under contention.
+      Previously the compile ran *between* the shared-lock check and the
+      exclusive-lock export, so all
       N processes wasted CPU compiling the same key in parallel — wall time
       was unchanged but compile-CPU pressure scaled with concurrency, which
       starved other compiles when many keys were cold at once.)
@@ -264,15 +416,40 @@ def jit_cache(fn):
     cache = {}
     hits = 0
     misses = 0
+    source_digest = _module_source_digest(fn)
+
+    def _memory_key(args, kwargs):
+        return args + tuple(sorted(kwargs.items())) if kwargs else args
+
+    def cache_request(*args, **kwargs):
+        """Resolve this wrapper's current persistent request identity."""
+        sha = _request_sha(fn, _memory_key(args, kwargs), source_digest)
+        o_path = get_cache_path() / _compute_source_fingerprint() / f"{sha}.o"
+        return sha, o_path
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         nonlocal hits, misses
-        cache_key = args + tuple(sorted(kwargs.items())) if kwargs else args
+        cache_key = _memory_key(args, kwargs)
 
         # Snapshot once per call so a concurrent flip of ``_state.CACHE_ENABLED``
         # mid-call can't desync the disk-path branch.
         enabled = _state.CACHE_ENABLED
+
+        # 0. Capture mode (DLKernel.cache.capture): record the boundary and
+        #    abort the call instead of compiling/loading. Discovery-only —
+        #    callers drive entry points with meta tensors and expect the
+        #    abort. Runs BEFORE the in-memory check so discovery reports the
+        #    workload's full key set even for keys this process already holds
+        #    (a fresh process would capture them). The task stores the
+        #    *wrapper* (this function), not the raw ``fn``, so replays go
+        #    through the full cache path (miss counters, pool submission,
+        #    export) instead of silently bypassing it. Requires the object
+        #    cache to be enabled — capture IS cache-key discovery.
+        if enabled and _capture.stack.frames:
+            sha, capture_o_path = cache_request(*args, **kwargs)
+            _capture.stack.record(_capture.CompileSpec(sha, wrapper, args, kwargs, capture_o_path))
+            raise _capture.CompileCaptured(sha, fn.__qualname__)
 
         # 1. In-memory hit. Same process already compiled or loaded this key.
         if cache_key in cache:
@@ -286,10 +463,9 @@ def jit_cache(fn):
             cache[cache_key] = compiled_fn
             return compiled_fn
 
-        sha = _key_to_hash((fn.__qualname__,) + cache_key)
-        cache_path = get_cache_path() / _compute_source_fingerprint()
+        sha, o_path = cache_request(*args, **kwargs)
+        cache_path = o_path.parent
         cache_path.mkdir(parents=True, exist_ok=True)
-        o_path = cache_path / f"{sha}.o"
         lock_path = cache_path / f"{sha}.lock"
 
         def _load_cached() -> object:
@@ -302,9 +478,11 @@ def jit_cache(fn):
             worker, missing __tvm_ffi_func, ...) is a cache miss, not an error:
             delete it so this and future processes recompile instead of failing
             forever (the CI cache persists across runs)."""
-            print(
+            warnings.warn(
                 f"DLKernel cache: corrupt cached object for key {sha} "
-                f"({type(exc).__name__}: {exc}); deleting and recompiling"
+                f"({type(exc).__name__}: {exc}); deleting and recompiling",
+                RuntimeWarning,
+                stacklevel=2,
             )
             try:
                 o_path.unlink()
@@ -321,10 +499,11 @@ def jit_cache(fn):
                     if o_path.exists():
                         try:
                             loaded = _load_cached()
-                        except Exception as e:
-                            # Corrupt entry: recover under the exclusive lock in
-                            # the slow path (shared lock can't safely delete).
-                            _quarantine_corrupt(e)
+                        except Exception:
+                            # A shared reader cannot unlink the entry: another
+                            # shared reader may still be loading it. The
+                            # exclusive slow path rechecks and repairs it.
+                            pass
                         else:
                             cache[cache_key] = loaded
                             hits += 1
@@ -361,8 +540,9 @@ def jit_cache(fn):
                         if o_path.exists():
                             try:
                                 loaded = _load_cached()
-                            except Exception as e:
-                                _quarantine_corrupt(e)
+                            except Exception:
+                                # Repair only after the exclusive lock below.
+                                pass
                             else:
                                 cache[cache_key] = loaded
                                 hits += 1
@@ -394,17 +574,30 @@ def jit_cache(fn):
             # compile a second time.
             lock.__enter__()
         except RuntimeError as e:
-            # Lock acquisition timed out (heavy contention or stuck holder).
-            # Fall back to in-process compile, no disk write. Better to do
-            # the work twice than to fail the test.
+            # Lock acquisition timed out (heavy contention, stuck holder, or
+            # a filesystem where flock semantics don't hold). DeepGEMM-style
+            # degraded path: compile unlocked and publish no-clobber — if a
+            # peer already published this key we simply lose the race and
+            # keep our in-process result; if nobody did, the artifact is
+            # banked for everyone. Correctness never depended on the lock.
             warnings.warn(
                 f"DLKernel cache: lock timeout for key {sha}: {e}; "
-                f"falling back to in-process compile without disk cache",
+                f"falling back to unlocked compile + no-clobber publish",
                 RuntimeWarning,
                 stacklevel=2,
             )
             misses += 1
             compiled_fn = fn(*args, **kwargs)
+            note_local_compile(sha)
+            try:
+                _export_artifact(compiled_fn, o_path)
+            except Exception as export_err:
+                warnings.warn(
+                    f"DLKernel cache: export failed for key {sha}: {export_err} "
+                    f"(this key will recompile every run)",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             cache[cache_key] = compiled_fn
             return compiled_fn
         try:
@@ -420,19 +613,15 @@ def jit_cache(fn):
 
             misses += 1
             compiled_fn = fn(*args, **kwargs)
-            # Export to a private temp file, then atomically rename into
-            # place: a process killed mid-export (xdist worker OOM-kill,
-            # timeout) must never leave a truncated .o at the final path —
-            # the advisory flock dies with the process, and a persistent
-            # cache (CI keeps one in $HOME) would then fail every future
-            # run on this key with "Symbols not found: __tvm_ffi_func".
-            tmp_path = o_path.with_suffix(f".o.tmp.{os.getpid()}")
+            note_local_compile(sha)
+            # Export to a private temp file, then publish atomically:
+            # correctness never depends on the advisory lock. A process
+            # killed mid-export (xdist worker OOM-kill, timeout) cannot
+            # leave a truncated .o at the final path, and a concurrent
+            # publisher on a host where flock semantics don't hold simply
+            # loses the no-clobber race and loads the winner's artifact.
             try:
-                compiled_fn.export_to_c(
-                    object_file_path=str(tmp_path),
-                    function_name=EXPORT_FUNC_NAME,
-                )
-                os.replace(tmp_path, o_path)
+                _export_artifact(compiled_fn, o_path)
             except Exception as e:
                 warnings.warn(
                     f"DLKernel cache: export failed for key {sha}: {e} "
@@ -440,10 +629,6 @@ def jit_cache(fn):
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
             cache[cache_key] = compiled_fn
             return compiled_fn
         finally:
@@ -455,10 +640,16 @@ def jit_cache(fn):
         hits = 0
         misses = 0
 
+    def cache_discard(*args, **kwargs):
+        """Evict one in-process entry so a materializer exercises disk state."""
+        cache.pop(_memory_key(args, kwargs), None)
+
     def cache_info():
         return CacheInfo(hits=hits, misses=misses, maxsize=None, currsize=len(cache))
 
     wrapper.cache = cache
+    wrapper.cache_request = cache_request
+    wrapper.cache_discard = cache_discard
     wrapper.cache_clear = cache_clear
     wrapper.cache_info = cache_info
     return wrapper

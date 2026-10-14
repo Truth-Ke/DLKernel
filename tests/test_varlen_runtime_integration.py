@@ -30,9 +30,7 @@ def _run_varlen_case(leaf: str, rows: int) -> None:
     cu_seqlens = torch.arange(experts + 1, device="cuda", dtype=torch.int32) * rows
     if leaf.startswith("m-"):
         A = torch.randint(-2, 3, (experts * rows, width), device="cuda").to(torch.bfloat16)
-        weights = torch.randint(-2, 3, (experts, width, width), device="cuda").to(
-            torch.bfloat16
-        )
+        weights = torch.randint(-2, 3, (experts, width, width), device="cuda").to(torch.bfloat16)
         output = gemm(A, weights.mT, cu_seqlens_m=cu_seqlens)
         reference = torch.bmm(A.reshape(experts, rows, width).float(), weights.mT.float())
         reference = reference.reshape(experts * rows, width)
@@ -55,13 +53,13 @@ def _run_varlen_case(leaf: str, rows: int) -> None:
 
 
 @requires_sm90
-@pytest.mark.parametrize(
-    "leaf,rows", [("m-low", 64), ("k-high", 2048)]
-)
+@pytest.mark.parametrize("leaf,rows", [("m-low", 64), ("k-high", 2048)])
 def test_varlen_custom_op_numerics_and_second_process_cache(tmp_path, leaf, rows):
     env = {
         **os.environ,
         "DLKERNEL_CACHE_DIR": str(tmp_path / "dlkernel"),
+        "DLKERNEL_ARTIFACT_CACHE_DIR": str(tmp_path / "dlkernel-artifacts"),
+        "PYTHONPATH": str(Path(__file__).resolve().parent.parent),
         "TRITON_CACHE_DIR": str(tmp_path / "triton"),
         "CUTE_DSL_CACHE_DIR": str(tmp_path / "cute"),
         "DLKERNEL_CACHE_ENABLED": "1",

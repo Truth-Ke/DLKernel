@@ -31,10 +31,17 @@ Design notes:
 * **Failure semantics**: a failed pool compile is never trusted — the
   consumer falls through to an in-process compile so the real exception
   surfaces with a local traceback.
+* **Attribution contract**: ``_pool_worker`` returns
+  ``(err, compiled_shas)``. On success the worker drains its in-process
+  compile ledger (:func:`DLKernel.cache.jit.drain_local_compiles`) so the
+  result carries exactly which jit-cache keys that worker compiled;
+  :class:`CompilePool` accumulates them in ``compiled_by_pool`` as futures
+  complete. Callers (e.g. :func:`DLKernel.cache.precompile.materialize`)
+  count authored compiles from these ledgers — never from filesystem
+  existence/mtime diffs, which double-count under concurrency.
 
 Env knobs: ``DLKERNEL_ASYNC_COMPILE_START=spawn`` (disable the fork sidecar),
-``DLKERNEL_COMPILE_WORKERS`` (shared-executor size, default 16).
-"""
+``DLKERNEL_COMPILE_WORKERS`` (shared-executor size, default 16)."""
 
 from __future__ import annotations
 
@@ -46,6 +53,7 @@ import os
 import pickle
 from concurrent.futures import Future, ProcessPoolExecutor
 from multiprocessing import get_context
+from pathlib import Path
 from typing import NamedTuple, Optional
 
 
@@ -259,10 +267,33 @@ def _pool_initializer(dlkernel_arch: Optional[str], cute_dsl_arch: Optional[str]
 
 
 def _pool_worker(
-    mod_name: str, qualname: str, key_b64: str, o_path: str, payloads_b64: str = ""
-) -> Optional[str]:
-    """Compile one key. Returns None on success, error string on failure."""
+    mod_name: str,
+    qualname: str,
+    key_b64: str,
+    o_path: str,
+    payloads_b64: str = "",
+    extra_source_dirs: tuple[str, ...] = (),
+) -> tuple[Optional[str], list[str]]:
+    """Compile one key.
+
+    Returns ``(err, compiled_shas)``: ``err`` is None on success, else an
+    error string (with the worker-side stack tail for worker-only failures).
+    ``compiled_shas`` is the worker's in-process compile ledger, drained via
+    :func:`DLKernel.cache.jit.drain_local_compiles` — the exact set of
+    jit-cache keys this worker compiled for this task, so the parent can
+    attribute produced artifacts to its pool without inferring anything
+    from the filesystem. Error paths report no compiled keys.
+    """
+    drain_local_compiles = None
+    original_extra_source_dirs = None
     try:
+        from DLKernel.cache import jit as _jit
+        from DLKernel.cache.jit import drain_local_compiles
+
+        # A long-lived worker handles multiple tasks. A failed prior task may
+        # have compiled a nested key before raising; it must not be attributed
+        # to this task or any later successful task.
+        drain_local_compiles()
         # Honor the submitter's cache root: the jit_cache wrapper recomputes
         # its export path from the live CACHE_DIR, and this worker (forked
         # from a sidecar that snapshotted the env at start) may disagree with
@@ -283,11 +314,21 @@ def _pool_worker(
         obj = importlib.import_module(mod_name)
         for part in qualname.split("."):
             obj = getattr(obj, part)
+        # The forkserver/spawn worker does not inherit dynamic registrations
+        # made in the submitter. Restore them for this task before resolving
+        # its fingerprint; a shared worker may serve a different job next.
+        original_extra_source_dirs = list(_state.EXTRA_SOURCE_DIRS)
+        _state.EXTRA_SOURCE_DIRS[:] = [Path(path) for path in extra_source_dirs]
+        _jit._compute_source_fingerprint.cache_clear()
         args, kwargs = pickle.loads(base64.b64decode(key_b64))
+        # A long-lived worker may have this key in memory from an earlier
+        # cache root or source namespace. It still has to publish this task's
+        # requested disk object.
+        obj.cache_discard(*args, **kwargs)
         obj(*args, **kwargs)  # jit_cache wrapper: compiles + exports .o
         if not os.path.exists(o_path):
-            return "compile succeeded but .o was not exported"
-        return None
+            return "compile succeeded but .o was not exported", []
+        return None, drain_local_compiles()
     except Exception as e:
         # The consumer will recompile in-process for a first-class traceback,
         # but a worker-only failure (env/serialization skew) never reproduces
@@ -297,7 +338,13 @@ def _pool_worker(
 
         frames = traceback.format_exception(type(e), e, e.__traceback__)
         tail = "".join(frames[-4:]).strip().replace("\n", " | ")
-        return f"{type(e).__name__}: {e} [worker: {tail[-600:]}]"
+        return f"{type(e).__name__}: {e} [worker: {tail[-600:]}]", []
+    finally:
+        if drain_local_compiles is not None:
+            drain_local_compiles()
+        if original_extra_source_dirs is not None:
+            _state.EXTRA_SOURCE_DIRS[:] = original_extra_source_dirs
+            _jit._compute_source_fingerprint.cache_clear()
 
 
 def _make_executor(jobs: int) -> ProcessPoolExecutor:
@@ -329,8 +376,7 @@ def get_shared_executor() -> ProcessPoolExecutor:
 
     Reuses the active :class:`CompilePool`'s executor when one exists (the
     pytest ``--async-compile`` session pool); otherwise lazily creates a
-    process-wide executor sized by ``DLKERNEL_COMPILE_WORKERS`` (default 16).
-    Deliberately ignores :class:`suppress_pool` — suppression turns off the
+    process-wide executor sized by ``DLKERNEL_COMPILE_WORKERS`` (default 16).    Deliberately ignores :class:`suppress_pool` — suppression turns off the
     *defer-on-miss* behavior of jit_cache, not access to compile workers.
     """
     global _shared_executor
@@ -339,8 +385,7 @@ def get_shared_executor() -> ProcessPoolExecutor:
     if _shared_executor is None:
         import atexit
 
-        _shared_executor = _make_executor(int(os.environ.get("DLKERNEL_COMPILE_WORKERS", "16")))
-        # Explicit teardown: without this, the executor is GC'd during
+        _shared_executor = _make_executor(int(os.environ.get("DLKERNEL_COMPILE_WORKERS", "16")))        # Explicit teardown: without this, the executor is GC'd during
         # interpreter shutdown after its weakref machinery is already gone,
         # printing a spurious "Exception ignored in weakref_cb".
         atexit.register(_shared_executor.shutdown, wait=False, cancel_futures=True)
@@ -395,6 +440,26 @@ class CompilePool:
         # sha -> (o_path, lock_path)
         self._external: dict[str, tuple[str, str]] = {}
         self.n_submitted = 0
+        # Shas compiled by this pool's workers, accumulated from each
+        # finished task's worker-reported compile ledger. Exact attribution
+        # of pool-produced artifacts — consumed by precompile.materialize.
+        self.compiled_by_pool: set[str] = set()
+        # Keep each worker result tied to its submission. Scoped precompile
+        # calls may reuse this pool, so its cumulative set alone cannot
+        # attribute a compile to the current call.
+        self._compiled_by_task: dict[str, set[str]] = {}
+
+    def compiled_after(self, submission_marker: int) -> set[str]:
+        """Return compiled keys from tasks submitted after ``submission_marker``.
+
+        Take the marker from ``n_submitted`` before starting a scoped batch.
+        A pre-existing future that finishes during that batch belongs to its
+        original submitter, even if its result is first polled by the batch.
+        """
+        authored: set[str] = set()
+        for sha in list(self._futures)[submission_marker:]:
+            authored.update(self._compiled_by_task.get(sha, ()))
+        return authored
 
     def mark_external(self, sha: str, o_path: str, lock_path: str) -> None:
         """Record that some other process is compiling ``sha`` right now."""
@@ -418,9 +483,12 @@ class CompilePool:
     ) -> None:
         if sha in self._futures:
             return
+        import DLKernel.cache as _state
+
+        extra_source_dirs = tuple(str(Path(path).resolve()) for path in _state.EXTRA_SOURCE_DIRS)
         with _neutral_main():
             self._futures[sha] = self._executor.submit(
-                _pool_worker, mod, qualname, key_b64, o_path, payloads_b64
+                _pool_worker, mod, qualname, key_b64, o_path, payloads_b64, extra_source_dirs
             )
         self.n_submitted += 1
 
@@ -469,9 +537,11 @@ class CompilePool:
         if not fut.done():
             return "pending", None
         try:
-            err = fut.result()
+            err, compiled = fut.result()
         except Exception as e:  # BrokenProcessPool etc.
-            err = f"pool worker died: {type(e).__name__}: {e}"
+            err, compiled = f"pool worker died: {type(e).__name__}: {e}", []
+        self._compiled_by_task[sha] = set(compiled)
+        self.compiled_by_pool.update(compiled)
         return ("done", None) if err is None else ("failed", err)
 
     def stats(self) -> dict:
@@ -481,7 +551,7 @@ class CompilePool:
             if not f.done() or f.cancelled():
                 continue
             exc = f.exception()
-            err = f"{type(exc).__name__}: {exc}" if exc is not None else f.result()
+            err = f"{type(exc).__name__}: {exc}" if exc is not None else f.result()[0]
             if err:
                 errors.append((sha, err))
         return {

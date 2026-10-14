@@ -658,8 +658,6 @@ def test_bench_budget_override_is_gated_on_the_varlen_key_hook(monkeypatch):
     not leak: a dense tune keeps the historical 200 ms / 200-call protocol even
     when the environment asks for a shorter cold-start sweep.
     """
-    import torch
-
     from DLKernel.autotuner import _DEFAULT_BENCH_TIMED_CALLS, _DEFAULT_BENCH_WARMUP_MS, Autotuner
 
     tuner = Autotuner(lambda *a, **k: None, [], [AutotuneConfig(tile_m=128)])
@@ -763,6 +761,26 @@ def test_varlen_selector_accepts_canonical_sm_arch_override(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_winner_cache_ignores_object_cache_dir(tmp_path, monkeypatch):
+    """``FileCacheManager`` (winner JSONs) keys off ``DLKERNEL_CACHE_DIR`` only.
+
+    ``DLKERNEL_ARTIFACT_CACHE_DIR`` exists so multi-process workloads can share
+    one ``.o`` store while keeping tuning measurements hermetic; if it ever
+    leaked into the winner cache, per-job benchmark isolation would silently
+    break. Pure path logic — no CUDA.
+    """
+    from DLKernel.autotuner import FileCacheManager
+
+    tune_root = tmp_path / "tune"
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tune_root))
+    monkeypatch.setenv("DLKERNEL_ARTIFACT_CACHE_DIR", str(tmp_path / "shared-objects"))
+
+    manager = FileCacheManager("deadbeef00")
+
+    assert manager.cache_dir.startswith(str(tune_root)), manager.cache_dir
+    assert "shared-objects" not in manager.cache_dir
+
+
 @pytest.fixture
 def _cpu_tuning(monkeypatch, tmp_path):
     """Disable GPU-only setup while exercising the host-side tuner contract."""
@@ -811,8 +829,11 @@ def test_autotuner_required_cache_rejects_varlen_miss(
     cu = torch.tensor([0, 4], dtype=torch.int32)
     with pytest.raises(RuntimeError, match="Missing autotune cache"):
         if positional:
-            tuner(x, cu if direction == "cu_seqlens_m" else None,
-                  cu if direction == "cu_seqlens_k" else None)
+            tuner(
+                x,
+                cu if direction == "cu_seqlens_m" else None,
+                cu if direction == "cu_seqlens_k" else None,
+            )
         else:
             tuner(x, **{direction: cu})
 

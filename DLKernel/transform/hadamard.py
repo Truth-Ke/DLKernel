@@ -332,7 +332,7 @@ class HadamardTransformPlan:
         N: int,
         ept: int | None = None,
         rows_per_block: int | None = None,
-        tail_direct_store_enabled: bool | None = None,
+        tail_direct_store_enabled: bool = True,
     ):
         # ── Sizes
         assert 2 <= N <= _MAX_N, f"Hadamard requires 2 <= last dim <= {_MAX_N}"
@@ -401,9 +401,6 @@ class HadamardTransformPlan:
         # When `TailDirectStorePlan.is_feasible` says yes we skip that last smem
         # round trip and store directly to gmem with a custom TiledCopy while
         # preserving coalesced vector stores.
-        if tail_direct_store_enabled is None:
-            tail_direct_store_enabled = os.getenv("DLKERNEL_HADAMARD_TAIL_DIRECT_STORE", "1") != "0"
-
         # Compute bit orders without tail direct store first, so feasibility can
         # be checked on `bit_orders[-2]` (the order before the final stage,
         # which is identical in both schedules).
@@ -618,8 +615,15 @@ class HadamardTransform:
         ept: int | None = None,
         rows_per_block: int | None = None,
         persistent: bool = False,
+        tail_direct_store_enabled: bool = True,
     ):
-        self.plan = HadamardTransformPlan(dtype, N, ept=ept, rows_per_block=rows_per_block)
+        self.plan = HadamardTransformPlan(
+            dtype,
+            N,
+            ept=ept,
+            rows_per_block=rows_per_block,
+            tail_direct_store_enabled=tail_direct_store_enabled,
+        )
         self.persistent = persistent
         self.async_load = persistent
         self.use_shuffle = N <= 128  # slightly faster to use shuffles than smem for small N
@@ -801,13 +805,18 @@ class HadamardTransform:
 
     @staticmethod
     @jit_cache
-    def compile(dtype, N, persistent: bool = False):
+    def compile(dtype, N, persistent: bool, tail_direct_store_enabled: bool):
         batch_sym = cute.sym_int()
         div = math.gcd(N, 128 // dtype.width)
         x_cute = fake_tensor(dtype, (batch_sym, N), div)
         out_cute = fake_tensor(dtype, (batch_sym, N), div)
         return cute.compile(
-            HadamardTransform(dtype, N, persistent=persistent),
+            HadamardTransform(
+                dtype,
+                N,
+                persistent=persistent,
+                tail_direct_store_enabled=tail_direct_store_enabled,
+            ),
             x_cute,
             out_cute,
             Float32(0.0),
@@ -818,6 +827,13 @@ class HadamardTransform:
 
 
 # ─── Autograd, public API ──────────────────────────────────────────
+
+
+def _get_compiled_hadamard(dtype, N: int, persistent: bool):
+    # The effective flag changes the generated schedule and therefore belongs
+    # in the jit_cache request, including capture/precompile requests.
+    tail_direct_store_enabled = os.getenv("DLKERNEL_HADAMARD_TAIL_DIRECT_STORE", "1") != "0"
+    return HadamardTransform.compile(dtype, N, persistent, tail_direct_store_enabled)
 
 
 @cute_op(
@@ -837,7 +853,7 @@ def _hadamard_transform_fwd(x: Tensor, out: Tensor, scale: float) -> None:
     assert 2 <= N <= _MAX_N, f"Hadamard transform supports last dimension in [2, {_MAX_N}]"
     dtype = torch2cute_dtype_map[x.dtype]
     persistent = _should_use_persistent(x, N)
-    compiled = HadamardTransform.compile(dtype, N, persistent)
+    compiled = _get_compiled_hadamard(dtype, N, persistent)
     num_sms = _get_num_sms(x.device) if persistent else 0
     compiled(x, out, scale, num_sms)
 

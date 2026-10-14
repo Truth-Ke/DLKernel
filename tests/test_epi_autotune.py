@@ -33,7 +33,13 @@ def _cfg(tile_m, tile_n, cluster_m=1, pingpong=False):
 
 @pytest.fixture()
 def small_space(monkeypatch, tmp_path):
-    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))  # hermetic disk cache
+    import DLKernel.cache
+
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))  # hermetic winner cache
+    # The artifact dir is captured from DLKERNEL_ARTIFACT_CACHE_DIR at package
+    # import, so a setenv here is a no-op; patch the live attribute that
+    # get_cache_path() reads on every call instead.
+    monkeypatch.setattr(DLKernel.cache, "CACHE_DIR", str(tmp_path / "artifacts"))
     cfgs = [_cfg(128, 128), _cfg(128, 256), _cfg(128, 192, pingpong=_cap() in (9, 12))]
     monkeypatch.setattr(epi_autotune, "_config_space", lambda mod, device: cfgs)
     monkeypatch.setattr(epi_autotune, "_MOD_TUNERS", {})

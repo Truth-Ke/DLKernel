@@ -213,3 +213,38 @@ def pytest_runtest_call(item):
                 outcome.force_exception(e)
         else:
             outcome.force_result(None)
+
+
+# ---------------------------------------------------------------------------
+# Pool-shippable jit_cache stub (shared test support)
+#
+# Module-level on purpose: pool workers and bare subprocesses resolve tasks
+# by (module, qualname), so exercising the real submit -> CompilePending ->
+# poll -> load path needs an importable module-level stub — function-local
+# ones silently fall back to in-process compilation. Import as
+# ``import conftest`` with the tests directory on sys.path; the export
+# payload tags this module's authorship so tests can prove an artifact came
+# from a worker.
+# ---------------------------------------------------------------------------
+
+from pathlib import Path as _Path
+
+from DLKernel.cache import jit_cache as _jit_cache
+
+
+class _PlaceholderCompiled:
+    def __init__(self, key: str):
+        self.key = key
+
+    def export_to_c(self, object_file_path, function_name):
+        _Path(object_file_path).write_bytes(b"pool-shipped-stub")
+
+    def __call__(self, *args, **kwargs):
+        pass
+
+
+def compile_stub(key: str):
+    return _PlaceholderCompiled(key)
+
+
+compile_stub = _jit_cache(compile_stub)
