@@ -983,3 +983,74 @@ def test_gemm_policy_keeps_split_k_legality_separate_from_shortlist(monkeypatch)
     ]
     # Occupancy is a shortlist concern; this shape is not occupancy-starved.
     assert policy.shortlist(prepared, named, {"split_k": None}) == base
+
+
+def test_tune_cache_lock_times_out_and_recovers(tmp_path, monkeypatch):
+    """A frozen lock holder (alive but not moving) must not wedge the tuner:
+    the disk-cache flock is bounded (LOCK_NB + timeout -> RuntimeError,
+    flashinfer-aligned), and killing the holder lets the next call through.
+    RED evidence: repro_flock_wedge.py froze a victim indefinitely at
+    autotuner.py:463 before this change."""
+    import subprocess
+    import sys
+    import time
+
+    import DLKernel.cache.jit as jit
+    from DLKernel.autotuner import AutotuneConfig, TunePolicy, autotune
+
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("DLKERNEL_TUNE_LOCK_TIMEOUT_S", "2")
+
+    class P(TunePolicy):
+        def make_key(self, args, kwargs, default_key):
+            return ("lock-timeout",)
+
+    @autotune(
+        configs=[AutotuneConfig(config=1), AutotuneConfig(config=2)],
+        key=[],
+        policy=P(),
+        cache_results=True,
+    )
+    def victim_fn(x, config=None):
+        return x * config
+
+    real_lock = jit.FileLock
+    paths = []
+
+    class SpyLock(real_lock):
+        def __init__(self, *a, **k):
+            if a:
+                paths.append(str(a[0]))
+            super().__init__(*a, **k)
+
+    monkeypatch.setattr(jit, "FileLock", SpyLock)
+    assert victim_fn(3) == 6  # discover: bench + publish, records the lock path
+    lock_path = paths[-1]
+    for p in tmp_path.rglob("*.autotune.json"):  # 让下一次调用重新走冷路径
+        p.unlink()
+
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, sys, time; f = open(sys.argv[1], 'a+'); "
+            "fcntl.flock(f.fileno(), fcntl.LOCK_EX); print('HELD', flush=True); "
+            "time.sleep(3600)",
+            lock_path,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "HELD"
+        victim_fn.cache.clear()  # 进程内 winner 也要清,才走磁盘路径
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="Timed out"):
+            victim_fn(3)
+        dt = time.monotonic() - t0
+        assert 1.5 <= dt <= 15, f"lock timeout fired at {dt:.1f}s"
+    finally:
+        holder.kill()
+        holder.wait()
+
+    assert victim_fn(3) == 6  # 持锁者死亡 → flock 释放 → 正常完成

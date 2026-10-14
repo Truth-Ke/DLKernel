@@ -1362,3 +1362,54 @@ def test_merge_tensor_helper():
 # ---------------------------------------------------------------------------
 # Smoke: module imports / re-imports stay consistent
 # ---------------------------------------------------------------------------
+
+
+def test_materialize_stall_guard_fires_on_wedged_worker(
+    isolated_object_cache, tmp_path, monkeypatch
+):
+    """A wedged compile worker trips the rotation loop's stall guard.
+
+    Wedge = the pool pretends every submit is deferred, poll never resolves,
+    and no artifact lands (precompile.py: "stall guard against a wedged
+    worker" — orthogonal to the per-key flock timeout covered elsewhere).
+    Teeth: the guard fires after ~stall_timeout_s (not the 600s default),
+    names the outstanding count, publishes no partial .o, and never falls
+    back to an in-process compile. Negative control: the same spec with a
+    live pool materializes normally under the same tight timeout.
+    """
+    import time as _time
+    from pathlib import Path
+
+    import DLKernel.cache
+    from DLKernel.cache import jit_cache
+    from DLKernel.cache.async_compile import CompilePool
+    from DLKernel.cache.capture import CompileCaptured, capture_compiles
+    from DLKernel.cache.precompile import materialize
+
+    compiled = []
+
+    @jit_cache
+    def _stub_kernel(key):
+        compiled.append(key)
+        return _PlaceholderCompiled()
+
+    with capture_compiles() as captured:
+        with pytest.raises(CompileCaptured):
+            _stub_kernel("wedge")
+    specs = captured.tasks()
+    assert len(specs) == 1
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(CompilePool, "submit", lambda self, *a, **k: True)
+        mp.setattr(CompilePool, "poll", lambda self, sha: ("pending", None))
+        t0 = _time.monotonic()
+        with pytest.raises(RuntimeError, match=r"materialize stalled.*1 outstanding"):
+            materialize(specs, stall_timeout_s=0.5)
+        dt = _time.monotonic() - t0
+    assert 0.4 <= dt <= 5.0, f"guard fired at {dt:.2f}s — outside the stall window"
+    assert compiled == [], "wedge must not fall back to an in-process compile"
+    assert not list(tmp_path.rglob("*.o")), "no partial artifact may be published"
+
+    # Negative control: live pool, same tight timeout — guard stays silent.
+    n = materialize(specs, stall_timeout_s=0.5)
+    assert n == 1 and compiled == ["wedge"]

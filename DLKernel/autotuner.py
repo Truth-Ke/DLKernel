@@ -456,11 +456,19 @@ class Autotuner:
         # Serialize the expensive benchmark and re-check after acquiring the
         # lock so only one rank searches the candidate set.
         lock_path = os.path.join(cache.cache_dir, f"{file_name}.lock")
+        # Aligned with flashinfer's FileLock sites (LOCK_NB poll + timeout ->
+        # raise; none of their 16 lock-using files waits unbounded): the lock
+        # spans the whole bench, so the default must exceed the slowest
+        # legitimate bench, not cache I/O. Tunable for tests.
+        from DLKernel.cache.jit import FileLock as _FileLock
+
+        lock_timeout = float(
+            os.environ.get(f"{PACKAGE_NAME.upper()}_TUNE_LOCK_TIMEOUT_S", "600")
+        )
         _tune_trace(
             f"DLKERNEL_TUNE_DISK_MISS fn={fn.__name__} key={_key_digest(tuning_key)}"
         )
-        with open(lock_path, "a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        with _FileLock(Path(lock_path), exclusive=True, timeout=lock_timeout):
             path = cache.get_file(file_name)
             if path and not force_update:
                 load_cached(path)
