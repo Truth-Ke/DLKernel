@@ -23,6 +23,7 @@ from DLKernel.blockscaled.operand import (
 )
 from DLKernel.gemm_default_epi import GemmDefaultSm100
 from DLKernel.blockscaled.quantize import to_blocked
+from DLKernel import TuneMode
 
 
 def _skip_if_not_sm100():
@@ -1238,8 +1239,8 @@ def test_mxfp8_split_k(batched, split_k, split_k_mode):
     B_op = BlockScaledOperand.from_parts(W_q, W_sc, "mxfp8").mT  # B = (..., K, N) K-contig view
 
     ref = gemm_blockscaled_ref(A_op, B_op)
-    base = gemm(A_op, B_op, tuned=False)  # plain (split_k=1) MXFP8 kernel
-    out = gemm(A_op, B_op, split_k=split_k, split_k_mode=mode, tuned=False)
+    base = gemm(A_op, B_op, tune_mode=TuneMode.STATIC)  # plain (split_k=1) MXFP8 kernel
+    out = gemm(A_op, B_op, split_k=split_k, split_k_mode=mode, tune_mode=TuneMode.STATIC)
     assert out.shape == ((L, M, N) if batched else (M, N))
 
     # f32 partials accumulation -> split-K is no less accurate than the plain kernel.
@@ -1251,7 +1252,7 @@ def test_mxfp8_split_k(batched, split_k, split_k_mode):
 
     if mode != SplitKMode.PARALLEL:  # arrival-order reduction is not deterministic
         for _ in range(3):
-            out2 = gemm(A_op, B_op, split_k=split_k, split_k_mode=mode, tuned=False)
+            out2 = gemm(A_op, B_op, split_k=split_k, split_k_mode=mode, tune_mode=TuneMode.STATIC)
             assert torch.equal(out, out2), "serial split-K is not bitwise deterministic"
 
 
@@ -1278,7 +1279,7 @@ def test_mxfp8_split_k_staged_rejected():
             BlockScaledOperand.from_parts(W_q, W_sc, "mxfp8").mT,
             split_k=2,
             split_k_mode=SplitKMode.SEPARATE,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
 
 

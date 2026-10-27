@@ -1,20 +1,19 @@
 # Copyright (c) 2025, Tri Dao
 import math
-from typing import Optional, Literal
+from typing import Literal
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-from torch.amp import custom_fwd, custom_bwd
-
 import triton
 import triton.language as tl
+from torch import Tensor, nn
+from torch.amp import custom_bwd, custom_fwd
 
 from DLKernel.cross_entropy import cross_entropy, cross_entropy_fwd_out
-from DLKernel.epilogue.scaled_exp import scaled_exp_target_epi
-from DLKernel.epilogue.library import identity_epi, lse_target_epi
 from DLKernel.epilogue.frontend import gemm_epilogue
+from DLKernel.epilogue.library import identity_epi, lse_target_epi
+from DLKernel.epilogue.scaled_exp import scaled_exp_target_epi
+from DLKernel.gemm_config import TuneMode
 from DLKernel.gemm_interface import gemm, gemm_add, gemm_add_inplace
 from DLKernel.linear import linear_fwd_convert_type
 from DLKernel.operand_transform import a_transform
@@ -24,7 +23,7 @@ from DLKernel.operand_transform.host import transform_a_operand
 def linear_cross_entropy_func(
     x: Tensor,  # (..., d)
     weight: Tensor,  # (V, d)
-    bias: Optional[Tensor],  # (V,) or None
+    bias: Tensor | None,  # (V,) or None
     target: Tensor,  # (...,), int or long
     ignore_index: int = -100,
     reduction: Literal["none", "mean", "sum"] = "mean",
@@ -39,7 +38,7 @@ def linear_cross_entropy_func(
 def linear_cross_entropy_func_ref(
     x: Tensor,  # (..., d)
     weight: Tensor,  # (V, d)
-    bias: Optional[Tensor],  # (V,) or None
+    bias: Tensor | None,  # (V,) or None
     target: Tensor,  # (...,), int or long
     ignore_index: int = -100,
     reduction: Literal["none", "mean", "sum"] = "mean",
@@ -54,10 +53,10 @@ def chunked_linear_cross_entropy_fwd(
     target: Tensor,  # (B*L,)
     chunk_size: int = 4096,
     ignore_index: int = -100,
-    tuned: bool = True,
+    tune_mode: TuneMode = TuneMode.TUNED,
     need_dx: bool = True,
     need_dw: bool = True,
-) -> tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+) -> tuple[Tensor, Tensor | None, Tensor | None, Tensor | None, Tensor | None]:
     """
     Chunked forward pass for linear cross entropy.
 
@@ -124,10 +123,10 @@ def chunked_linear_cross_entropy_fwd(
             last_x_chunk = x_chunk
         elif i == 0:
             # First chunk: dw = dlogits.T @ x_chunk
-            gemm(dlogits_chunk.T, x_chunk, out=dw, tuned=tuned)
+            gemm(dlogits_chunk.T, x_chunk, out=dw, tune_mode=tune_mode)
         else:
             # Middle chunks: dw += dlogits.T @ x_chunk
-            gemm_add_inplace(dlogits_chunk.T, x_chunk, dw, tuned=tuned)
+            gemm_add_inplace(dlogits_chunk.T, x_chunk, dw, tune_mode=tune_mode)
     return loss, dx, dw, last_dlogits_chunk, last_x_chunk
 
 
@@ -142,7 +141,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         ignore_index: int = -100,
         reduction: Literal["mean", "sum"] = "mean",
         chunk_size: int = 4096,
-        tuned: bool = True,
+        tune_mode: TuneMode = TuneMode.TUNED,
     ):
         """
         Forward pass computes loss and stores dx and dw for backward.
@@ -159,7 +158,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
             target.reshape(-1),
             chunk_size,
             ignore_index,
-            tuned=tuned,
+            tune_mode=tune_mode,
             need_dx=need_dx,
             need_dw=need_dw,
         )
@@ -169,7 +168,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         ctx.batch_shape = batch_shape
         ctx.ignore_index = ignore_index
         ctx.reduction = reduction
-        ctx.tuned = tuned
+        ctx.tune_mode = tune_mode
         return loss_sum if loss_scale is None else loss_sum * loss_scale
 
     @staticmethod
@@ -182,7 +181,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
         dloss is a scalar.
         """
         dx, dw, last_dlogits_chunk, last_x_chunk, loss_scale = ctx.saved_tensors
-        tuned = ctx.tuned
+        tune_mode = ctx.tune_mode
         if loss_scale is not None:
             dloss = dloss * loss_scale
         if dx is not None:
@@ -198,7 +197,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
                 last_x_chunk,
                 out_dtype=ctx.weight_dtype,
                 alpha=dloss,
-                tuned=tuned,
+                tune_mode=tune_mode,
             )
         else:
             # Add last chunk's contribution with dloss scaling
@@ -206,7 +205,12 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
             # We use alpha=dloss, beta=dloss
             if ctx.weight_dtype == dw.dtype:
                 gemm_add_inplace(
-                    last_dlogits_chunk.T, last_x_chunk, dw, alpha=dloss, beta=dloss, tuned=tuned
+                    last_dlogits_chunk.T,
+                    last_x_chunk,
+                    dw,
+                    alpha=dloss,
+                    beta=dloss,
+                    tune_mode=tune_mode,
                 )
             else:
                 dw = gemm_add(
@@ -216,7 +220,7 @@ class ChunkedLinearCrossEntropyFunction(torch.autograd.Function):
                     alpha=dloss,
                     beta=dloss,
                     out_dtype=ctx.weight_dtype,
-                    tuned=tuned,
+                    tune_mode=tune_mode,
                 )
         return dx, dw, None, None, None, None, None
 
@@ -442,7 +446,7 @@ def lce_glue(
         )
 
 
-def _pick_tile_n1(V: int) -> Optional[int]:
+def _pick_tile_n1(V: int) -> int | None:
     # gemm1's tile_N is the k-offset granularity: it must divide V (the
     # sum_exp/k partials are per full tile) and be a multiple of 64 (the
     # strip is m64-resolved). 192 measured best at Llama vocab/d; 256 covers
@@ -454,7 +458,7 @@ def _pick_tile_n1(V: int) -> Optional[int]:
 
 
 def scaled_exp_lce_supported(
-    x: Tensor, weight: Tensor, chunk_size: Optional[int], reduction: str
+    x: Tensor, weight: Tensor, chunk_size: int | None, reduction: str
 ) -> bool:
     """Eligibility for the scaled-exp pipeline: SM90 (the A-transform RS
     mainloop), bf16 compute, V % 128 (the dw strip GEMM's tile_M over the
@@ -485,9 +489,9 @@ def scaled_exp_linear_cross_entropy_fwd(
     *,
     need_dx: bool = True,
     need_dw: bool = True,
-    grad_scale: Optional[Tensor] = None,  # fp32 scalar folded into dx/dw (e.g. 1/num_valid)
-    tile_n1: Optional[int] = None,
-) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    grad_scale: Tensor | None = None,  # fp32 scalar folded into dx/dw (e.g. 1/num_valid)
+    tile_n1: int | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor | None]:
     """Chunked scaled-exp forward. Returns (loss, dx, dw) over M_pad >= M rows
     (the last chunk is padded to a 128 multiple with ignored rows: their x is
     zeroed and their v is 0, so loss/dx pad rows are 0 and dw is exact) —
@@ -624,8 +628,8 @@ def _lce_scaled_exp_fwd_op(
     ignore_index: int,
     need_dx: bool,
     need_dw: bool,
-    grad_scale: Optional[Tensor],
-    tile_n1: Optional[int],
+    grad_scale: Tensor | None,
+    tile_n1: int | None,
 ) -> list[Tensor]:
     """The whole chunked scaled-exp forward as ONE custom op, so torch.compile
     records a single graph node instead of tracing the host chunk loop
@@ -668,7 +672,7 @@ def _scaled_exp_lce_loss_only(x: Tensor, weight: Tensor, target: Tensor, ignore_
     # online-LSE partials (host-finalized) and the exact target logit only.
     # Ignored rows' target_logit is never written (ColVecSelect skips
     # out-of-range indices); torch.where discards the uninitialized lanes.
-    res = lse_target_epi(x, weight.mT, store_d=False, target=target, tuned=False)
+    res = lse_target_epi(x, weight.mT, store_d=False, target=target, tune_mode=TuneMode.STATIC)
     return torch.where(target != ignore_index, res["lse"] - res["target_logit"], 0.0)
 
 
@@ -683,7 +687,7 @@ class ScaledExpLinearCrossEntropyFunction(torch.autograd.Function):
         ignore_index: int = -100,
         reduction: Literal["mean", "sum"] = "mean",
         chunk_size: int = 4096,
-        tile_n1: Optional[int] = None,
+        tile_n1: int | None = None,
     ):
         ctx.weight_dtype = weight.dtype
         # read before the autocast convert: the converted tensors are non-leaves
@@ -733,7 +737,7 @@ def scaled_exp_linear_cross_entropy(
     chunk_size: int = 4096,
     ignore_index: int = -100,
     reduction: Literal["mean", "sum"] = "mean",
-    tile_n1: Optional[int] = None,
+    tile_n1: int | None = None,
 ) -> Tensor:
     """Linear cross entropy through the scaled-exp fused-backward pipeline
     (see the section comment above). Same contract as
@@ -760,8 +764,8 @@ def chunked_linear_cross_entropy(
     chunk_size: int = 4096,
     ignore_index: int = -100,
     reduction: Literal["mean", "sum"] = "mean",
-    tuned: bool = True,
-    use_scaled_exp: Optional[bool] = None,
+    tune_mode: TuneMode = TuneMode.TUNED,
+    use_scaled_exp: bool | None = None,
 ) -> Tensor:
     """
     Chunked linear cross entropy with automatic differentiation support.
@@ -773,7 +777,7 @@ def chunked_linear_cross_entropy(
         chunk_size: Size of chunks to process
         ignore_index: Index to ignore in loss computation
         reduction: Type of reduction to apply
-        tuned: Whether to use tuned kernels
+        tune_mode: How a tune-cache miss resolves (see TuneMode)
         use_scaled_exp: route through the scaled-exp fused-backward pipeline.
             None (default) auto-selects it when eligible (SM90, bf16, V % 128
             == 0, ...; see scaled_exp_lce_supported); True asserts
@@ -799,7 +803,7 @@ def chunked_linear_cross_entropy(
             target.reshape(-1),
             chunk_size,
             ignore_index,
-            tuned=tuned,
+            tune_mode=tune_mode,
             need_dx=False,
             need_dw=False,
         )
@@ -808,7 +812,7 @@ def chunked_linear_cross_entropy(
             return loss_sum
         return loss_sum / (target != ignore_index).sum().float()
     loss = ChunkedLinearCrossEntropyFunction.apply(
-        x, weight, target, ignore_index, reduction, chunk_size, tuned
+        x, weight, target, ignore_index, reduction, chunk_size, tune_mode
     )
     return loss
 
@@ -821,10 +825,10 @@ class LinearCrossEntropy(nn.Linear):
         bias: bool = False,
         ignore_index: int = -100,
         reduction: Literal["none", "mean", "sum"] = "mean",
-        chunk_size: Optional[int] = None,
+        chunk_size: int | None = None,
         inplace_backward: bool = False,
-        tuned: bool = True,
-        use_scaled_exp: Optional[bool] = None,
+        tune_mode: TuneMode = TuneMode.TUNED,
+        use_scaled_exp: bool | None = None,
         device=None,
         dtype=None,
     ) -> None:
@@ -833,7 +837,7 @@ class LinearCrossEntropy(nn.Linear):
         self.reduction = reduction
         self.chunk_size = chunk_size
         self.inplace_backward = inplace_backward
-        self.tuned = tuned
+        self.tune_mode = tune_mode
         self.use_scaled_exp = use_scaled_exp
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
@@ -855,7 +859,7 @@ class LinearCrossEntropy(nn.Linear):
                 chunk_size=self.chunk_size,
                 ignore_index=self.ignore_index,
                 reduction=self.reduction,
-                tuned=self.tuned,
+                tune_mode=self.tune_mode,
                 use_scaled_exp=self.use_scaled_exp,
             )
         else:

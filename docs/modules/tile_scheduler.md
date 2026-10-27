@@ -111,7 +111,7 @@ varlen 下调度器与 `VarlenManager`(varlen_utils.py:28)是同一参数族的�
 | 设备侧工厂 | gemm_sm90.py:1029-1031(SM100 :1268-1274) | `partial(Cls.create, params, sched_data, sched_pipeline)`,SM100 另传 `throttle_barrier`;kernel 内 `TileSchedulerCls()` 即实例(:1062/:1297) |
 | 调度 smem | gemm_sm90.py:968-987 | persistent 时建 `make_sched_pipeline`(:1939),分配 `(4, sched_stage)` Int32,RESERVED 分区、16 B 对齐(:977-986 注释) |
 
-`max_active_clusters` 由 `get_max_active_clusters`(cute_dsl_utils.py:79)按 cluster size 查询 HardwareInfo。三角调度要求 `cluster_shape_k == 1` 且方形 cluster tile(:1090-1091)。
+`max_active_clusters` 由 `get_max_active_clusters`(cute_dsl_utils.py:128)按 cluster size 查询 HardwareInfo。三角调度要求 `cluster_shape_k == 1` 且方形 cluster tile(:1090-1091)。
 
 ## 参考
 

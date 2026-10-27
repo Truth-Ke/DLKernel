@@ -126,7 +126,8 @@ import 顺序约束:三个 monkey-patch 必须先于任何 CuTe DSL 使用者执
 
 - 进程级补丁第三处:TVM-FFI 参数转换器(:34-53),`cutlass.Constexpr[T]` 字段发射为 `ConstNone`(:39-41),带 `_fields` 的 tuple 重定向到自身类型注解(:44-50)。
 - dtype 映射 `torch2cute_dtype_map`(:56),含 packed fp4 的 dlpack 逻辑 K(:58-59)。
-- 设备查询:`get_device_multiprocessor_count` :74、`get_max_active_clusters` :79、`get_device_capacity` :115(`DLKERNEL_ARCH` 可覆盖)、`get_compile_target_capacity` :132(编译目标与调度架构分离,CI 代理腿依赖它)。
+- 设备查询:`get_device_multiprocessor_count` :74、`get_max_active_clusters` :128、`get_device_capacity` :178(`DLKERNEL_ARCH` 可覆盖)、`get_compile_target_capacity` :196(编译目标与调度架构分离,CI 代理腿依赖它)。
+- SM 预算(`set_num_sms` :89 / `get_num_sms` :111,DeepGEMM DeviceRuntime 语义):进程级 cap,`0` 恢复默认;有设备时校验 `0 < n ≤ 物理 SM 数`。生效点两处——启发式 `sm_count_for` 的波数分母、持久 kernel 的 launch grid(`get_max_active_clusters` 按整 cluster 截断;occupancy 查询在 `_max_active_clusters_hw` :117 单独缓存,cap 不进缓存键,恢复默认后立即生效)。
 - DSL 协议胶水:`mlir_namedtuple`(:248)给 NamedTuple 补全 JitArgument 四协议(:263-266),`ParamsBase`(:270)给 dataclass 同款;`TileSchedulerArguments`、`VarlenArguments` 等全部参数类型靠它们进出 jit 边界。
 
 `compile_utils.py` 是无张量编译的 fake 工厂:`make_fake_tensor`(:8,sym stride + divisibility 折算对齐,:17-22)、`div_for_dtype`(:36,16 B 对齐换算)、`fake_batched`(:41,batch-first 约定)、`make_fake_stream`(:56)。每个 `_compile_*` 函数用它构造 fake 输入再 `cute.compile`,见 [caching_and_parallel_compilation.md](./caching_and_parallel_compilation.md)。

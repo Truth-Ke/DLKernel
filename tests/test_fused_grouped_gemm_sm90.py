@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from DLKernel import moe_down_proj_dact, moe_up_proj_act
+from DLKernel import moe_down_proj_dact, moe_up_proj_act, TuneMode
 from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
 from DLKernel.gemm_base import GemmBase
 
@@ -98,6 +98,11 @@ def _interleave_rows(t, experts, intermediate):
         .transpose(1, 2)
         .reshape(experts, 2 * intermediate, *trailing)
     )
+
+
+def _interleaved_to_concat(t, intermediate):
+    """Feature-dim inverse of the interleaved storage: [g0, u0, g1, u1, ...] -> [gate; up]."""
+    return torch.cat((t[..., 0::2], t[..., 1::2]), dim=-1)
 
 
 def _gated_forward(activation, gate, up):
@@ -329,7 +334,7 @@ def _run_moe_up_down(
 ):
     """One gather-mode up->down MoE round trip against the fp32 oracle.
 
-    Runs both primitives at ``tuned=False`` with scaled per-dtype tolerances
+    Runs both primitives at ``tune_mode=TuneMode.STATIC`` with scaled per-dtype tolerances
     and returns the kernel outputs for case-specific follow-up assertions.
     ``bias_dtype``: "activation" (default), a torch dtype (fp32 exercises the
     wide-bias epilogue port), or None (bias-free). ``token_indices=None``
@@ -372,7 +377,7 @@ def _run_moe_up_down(
         token_indices=token_indices,
         gate_up_bias=kernel_bias,
         store_preact=store_preact,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     gather_indices = (
         token_indices
@@ -394,7 +399,7 @@ def _run_moe_up_down(
         token_indices=token_indices,
         router_weights=scores,
         compute_router_weight_grad=with_scores,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     expected_dh, expected_a, expected_ds = _down_reference(
         grad_output, down_weight, down_preact, offsets, gather_indices, scores, activation
@@ -458,7 +463,7 @@ def test_moe_role_fullgraph_reference(activation, gather, reduce):
             token_indices=idx,
             gate_up_bias=b13,
             store_preact=True,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
         d_h, weighted_postact, d_score = moe_down_proj_dact(
             go,
@@ -469,7 +474,7 @@ def test_moe_role_fullgraph_reference(activation, gather, reduce):
             token_indices=idx,
             router_weights=sc,
             compute_router_weight_grad=reduce,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
         return preact, postact, d_h, weighted_postact, d_score
 
@@ -552,7 +557,7 @@ def test_moe_down_unpack_contract(monkeypatch):
             activation="swiglu",
             router_weights=router_weights if flag else None,
             compute_router_weight_grad=flag,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
 
     def install(fake):
@@ -595,7 +600,9 @@ def test_moe_zero_contraction_up_bias():
     gate_up_bias = torch.ones(1, 4, dtype=torch.bfloat16)
     offsets = torch.tensor([0, 2], dtype=torch.int32)
     with pytest.raises(ValueError, match="contraction"):
-        moe_up_proj_act(x, gate_up_weight, offsets, gate_up_bias=gate_up_bias, tuned=False)
+        moe_up_proj_act(
+            x, gate_up_weight, offsets, gate_up_bias=gate_up_bias, tune_mode=TuneMode.STATIC
+        )
 
 
 def test_moe_zero_contraction_down_recompute():
@@ -612,7 +619,7 @@ def test_moe_zero_contraction_down_recompute():
             offsets,
             router_weights=torch.zeros(2),
             compute_router_weight_grad=True,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
 
 
@@ -645,7 +652,9 @@ def test_moe_expert_offsets_host_contract(monkeypatch):
         return ref_preact.clone(), ref_postact.clone()
 
     monkeypatch.setattr(GemmBase, "gemm_with_activation", classmethod(spy), raising=False)
-    postact, preact = moe_up_proj_act(x, gate_up_weight, offsets, activation="swiglu", tuned=False)
+    postact, preact = moe_up_proj_act(
+        x, gate_up_weight, offsets, activation="swiglu", tune_mode=TuneMode.STATIC
+    )
     assert len(calls) == 1
     cls, kwargs = calls[0]
     assert cls is GemmMoeSm90, "the role must call the class entry on its own class"
@@ -662,7 +671,7 @@ def test_moe_expert_offsets_host_contract(monkeypatch):
                 gate_up_weight,
                 torch.tensor(bad, dtype=torch.int32),
                 activation="swiglu",
-                tuned=False,
+                tune_mode=TuneMode.STATIC,
             )
     assert len(calls) == 1  # no illegal input reached the backend
 
@@ -779,7 +788,7 @@ def test_moe_role_multi_tile_shapes():
     """Tile-crossing shapes: K spanning >=3 k-tiles, and dS summing >=2 output tiles.
 
     SM90 plain-16 tile_k is 64 (GemmSm90._setup_tiled_mma): hidden=208 spans
-    4 k-tiles in both projections. The default tuned=False config is (128,
+    4 k-tiles in both projections. The default tune_mode=TuneMode.STATIC config is (128,
     192) pingpong, so intermediate=256 makes the down GEMM's N=256 span 2
     output tiles (2I = 512 spans 3), exercising the dS reduce sink's
     cross-tile accumulation.
@@ -814,8 +823,8 @@ def test_moe_role_multi_tile_shapes():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_moe_role_tuned_reference():
-    """tuned=True (the production path) stays correct and shares one tuning bucket.
+def test_moe_role_tuned_reference(tmp_path, monkeypatch):
+    """tune_mode=TuneMode.TUNED (the production path) stays correct and shares one tuning bucket.
 
     R=6 and R=7 over 3 experts both round up to the _MIN_AVERAGE_ROWS = 32
     bucket floor (DLKernel.varlen_selector.average_rows_bucket) with every
@@ -823,6 +832,8 @@ def test_moe_role_tuned_reference():
     first's autotuned winner instead of retuning — pinned empirically by the
     in-memory autotuner cache count.
     """
+    # TUNED sweeps persist winners; keep them inside pytest's tmp_path.
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = _require_sm90()
     from DLKernel.gemm_runtime import autotune as epi_autotune
     from DLKernel.varlen_selector import average_rows_bucket
@@ -852,7 +863,7 @@ def test_moe_role_tuned_reference():
                 activation=activation,
                 token_indices=token_indices,
                 gate_up_bias=gate_up_bias,
-                tuned=True,
+                tune_mode=TuneMode.TUNED,
             )
             expected_preact, expected_postact = _up_reference(
                 x, gate_up_weight, gate_up_bias, offsets_t, token_indices, activation
@@ -932,7 +943,7 @@ def test_moe_role_config_pinned_pingpong_k_boundary(hidden, pingpong):
             cu_seqlens_m=offsets,
             A_idx=token_indices,
             dynamic_scheduler=True,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
             config=config,
             concat_layout=("B", "bias") if gated else None,
         )
@@ -946,7 +957,7 @@ def test_moe_role_config_pinned_pingpong_k_boundary(hidden, pingpong):
             cu_seqlens_m=offsets,
             A_idx=token_indices,
             dynamic_scheduler=True,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
             config=config,
         )
         expected_dh, expected_a, expected_ds = _down_reference(
@@ -1023,7 +1034,9 @@ def test_moe_role_minted_mro_order(monkeypatch, tmp_path):
     offsets = torch.tensor([0, 2, 2, 4], device=device, dtype=torch.int32)
 
     def up(x, w13, b13, offs):
-        return moe_up_proj_act(x, w13, offs, activation="swiglu", gate_up_bias=b13, tuned=False)
+        return moe_up_proj_act(
+            x, w13, offs, activation="swiglu", gate_up_bias=b13, tune_mode=TuneMode.STATIC
+        )
 
     variants = _record_kernel_variants(monkeypatch)
     torch.compile(up, fullgraph=True)(x, gate_up_weight, gate_up_bias, offsets)
@@ -1057,7 +1070,7 @@ def test_moe_role_minted_mro_order(monkeypatch, tmp_path):
         torch.randn(2, 16, 16, device=device, dtype=torch.bfloat16),
         torch.tensor([0, 4, 6], device=device, dtype=torch.int32),
         activation="swiglu",
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     assert calls, "cold eager MoE call did not instantiate GemmMoeSm90"
 
@@ -1085,7 +1098,7 @@ def test_moe_role_cold_subprocess_identity(tmp_path):
         """
         import torch
         import torch.nn.functional as F
-        from DLKernel import moe_up_proj_act
+        from DLKernel import TuneMode, moe_up_proj_act
         from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
         from DLKernel.gemm_base import GemmBase
         from DLKernel.gemm_runtime.identity import KERNEL_VARIANT_CLASSES
@@ -1102,7 +1115,7 @@ def test_moe_role_cold_subprocess_identity(tmp_path):
         offsets = torch.tensor([0, 2], device=device, dtype=torch.int32)
         postact, preact = moe_up_proj_act(
             x, gate_up_weight, offsets, activation="swiglu", gate_up_bias=gate_up_bias,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
         assert preact.shape == (2, 16) and postact.shape == (2, 8)
         values = F.linear(x.float(), gate_up_weight[0].float()) + gate_up_bias[0].float()
@@ -1167,7 +1180,7 @@ def test_moe_role_async_compile_worker(tmp_path, monkeypatch):
                         offsets,
                         activation="geglu",
                         gate_up_layout="interleaved",
-                        tuned=False,
+                        tune_mode=TuneMode.STATIC,
                     )
                     break
                 except async_compile.CompilePending:
@@ -1335,7 +1348,7 @@ def _production_switch_case(case):
         token_indices=token_indices,
         gate_up_bias=kernel_bias,
         store_preact=True,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     expected_preact, expected_postact = _up_reference(
         x, gate_up_weight, ref_bias, offsets, gather_indices, activation
@@ -1349,7 +1362,7 @@ def _production_switch_case(case):
         token_indices=token_indices,
         router_weights=scores,
         compute_router_weight_grad=case["reduce"],
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     expected_dh, expected_a, expected_ds = _down_reference(
         grad_output, down_weight, expected_preact, offsets, gather_indices, scores, activation
@@ -1638,7 +1651,7 @@ def test_moe_interleaved_calls_and_state_holds_no_tensors():
             token_indices=idx,
             gate_up_bias=b13,
             store_preact=True,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
         dh, a_prime, ds = moe_down_proj_dact(
             go,
@@ -1649,7 +1662,7 @@ def test_moe_interleaved_calls_and_state_holds_no_tensors():
             token_indices=idx,
             router_weights=scores,
             compute_router_weight_grad=True,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
         return preact, postact, dh, a_prime, ds
 
@@ -1692,3 +1705,87 @@ def test_moe_interleaved_calls_and_state_holds_no_tensors():
     torch.cuda.synchronize()
     alive = [i for i, r in enumerate(refs) if r() is not None]
     assert not alive, f"class/registry/bound-mod state retains {len(alive)} tensor(s)"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_moe_expert_mlp_full_backward_chain(tmp_path, monkeypatch):
+    """T6 (plan v4 §5): the composed expert MLP backward — every
+    kernel-expressed gradient is derived from the primitives' own outputs and
+    compared against an fp32 autograd reference.
+
+    The dact primitive returns d_gate_up (the d_preact) in the interleaved
+    [R, 2I] preact space; the caller maps it back to the concat [gate; up]
+    storage that moe_up_proj_act consumed, then feeds it everywhere: dx =
+    d_gate_up @ w13 per expert segment, dw13 = d_gate_up^T @ x via the
+    varlen-K GEMM, db13 = the per-expert segment sum.  dw2 stays dY^T @
+    kernel postact.  The wgrad GEMMs run TUNED so the varlen-K sweep path is
+    exercised on the way.
+
+    Geometry keeps 2I (768) != hidden (512): no kernel surface shares the dx
+    shape, so a misrouted output cannot pass on shape coincidence.  Every
+    comparison runs through _assert_close_scaled, whose atol scales with the
+    oracle magnitude with no constant floor — an all-zero kernel output
+    fails wherever the oracle carries signal.
+    """
+    # TUNED sweeps persist winners; keep them inside pytest's tmp_path.
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
+    from DLKernel.gemm_interface import gemm as plain_gemm
+
+    if torch.cuda.get_device_capability(0)[0] != 9:
+        pytest.skip("SM90 only")
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    tokens, hidden, intermediate, experts = 96, 512, 384, 4
+    dtype = torch.bfloat16
+    counts = _balanced_counts(tokens, experts)
+    offsets = torch.as_tensor(_offsets_from_counts(counts), device=device, dtype=torch.int32)
+
+    x = 0.05 * torch.randn(tokens, hidden, dtype=dtype, device=device)
+    w13 = 0.05 * torch.randn(experts, 2 * intermediate, hidden, dtype=dtype, device=device)
+    b13 = 0.05 * torch.randn(experts, 2 * intermediate, dtype=dtype, device=device)
+    w2 = 0.05 * torch.randn(experts, hidden, intermediate, dtype=dtype, device=device)
+    dY = 0.05 * torch.randn(tokens, hidden, dtype=dtype, device=device)
+
+    # Kernel chain (packed expert-major rows; x rows ARE the packed routing).
+    postact, preact = moe_up_proj_act(
+        x, w13, offsets, activation="swiglu", gate_up_bias=b13, tune_mode=TuneMode.STATIC
+    )
+    d_gate_up, _, _ = moe_down_proj_dact(
+        dY, w2, preact, offsets, activation="swiglu", tune_mode=TuneMode.STATIC
+    )
+    d_gate_up = _interleaved_to_concat(d_gate_up, intermediate)
+
+    dw2 = torch.empty(experts, hidden, intermediate, dtype=dtype, device=device)
+    plain_gemm(dY.mT, postact, dw2, cu_seqlens_k=offsets, tune_mode=TuneMode.TUNED)
+    dw13 = torch.empty(experts, 2 * intermediate, hidden, dtype=dtype, device=device)
+    plain_gemm(d_gate_up.mT, x, dw13, cu_seqlens_k=offsets, tune_mode=TuneMode.TUNED)
+    dx = torch.empty_like(x)
+    for e in range(experts):
+        rows = slice(int(offsets[e]), int(offsets[e + 1]))
+        dx[rows] = d_gate_up[rows] @ w13[e]
+    db13 = torch.stack(
+        [d_gate_up[int(offsets[e]) : int(offsets[e + 1])].sum(0) for e in range(experts)]
+    )
+
+    # fp32 autograd reference over the same routing.
+    xf = x.float().requires_grad_(True)
+    w13f = w13.float().requires_grad_(True)
+    b13f = b13.float().requires_grad_(True)
+    w2f = w2.float().requires_grad_(True)
+    zs = []
+    outs = []
+    for e in range(experts):
+        rows = slice(int(offsets[e]), int(offsets[e + 1]))
+        z = xf[rows] @ w13f[e].T + b13f[e]
+        z.retain_grad()
+        zs.append(z)
+        a = torch.nn.functional.silu(z[:, :intermediate]) * z[:, intermediate:]
+        outs.append(a @ w2f[e].T)
+    torch.cat(outs, 0).backward(dY.float())
+    d_preact = torch.cat([z.grad for z in zs], 0)
+
+    _assert_close_scaled(d_gate_up, d_preact, "d_gate_up (dact)", dtype)
+    _assert_close_scaled(dx, xf.grad, "dx", dtype)
+    _assert_close_scaled(dw2, w2f.grad, "dw2", dtype)
+    _assert_close_scaled(dw13, w13f.grad, "dw13", dtype)
+    _assert_close_scaled(db13, b13f.grad, "db13", dtype)

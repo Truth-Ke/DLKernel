@@ -69,7 +69,7 @@ ops.py 的 14 个类,按资源分组:
 | 入口 | 行 | 语义 |
 |---|---|---|
 | `gemm` | frontend.py:660 | 底层:tile/cluster/persistent/varlen/transform_a/split_k/swap_ab 等全参数显式,组合限制逐条抛 ValueError |
-| `__call__` | frontend.py:1371 | eager torch 面:解析 config(默认 tuned=True 走 autotune)、分配缺失输出、sink 经 `host_finalize` 返回终值;`torch.compiler.is_compiling()` 时转单条 `dlkernel::gemm_epi`(:1465-1470) |
+| `__call__` | frontend.py:1371 | eager torch 面:解析 config(未钉 config 时走 autotune;任意模式命中实测冠军即用,miss 落 `-1` 兜底——rank 解析 config 后按该 config 切片 reduce sink 并回传视图)、分配缺失输出、sink 经 `host_finalize` 返回终值;`torch.compiler.is_compiling()` 时转单条 `dlkernel::gemm_epi`(:1465-1470) |
 | `plan` | frontend.py:1705 | 只解析+编译不 launch,返回 EpiPlan(:1876);`run()` 零 host 决策,decode / CUDA-graph 入口 |
 
 `StaticEpi`(frontend.py:1935)与 `epilogue_from_class`(:1994)给手写 GEMM 类同一 plan/run 接口,见下文逃生舱一节。
@@ -123,7 +123,7 @@ legality.py(115 行)是纯 host 规则,不触 benchmark、缓存身份与 CUDA l
 | `validate_sink_config` | legality.py:33 | 同规则的报错版;frontend.py:1073 在 plan 期调用 |
 | `prune_epilogue_configs` | legality.py:54 | 对候选 GemmConfig 逐条剪:device_capacity、gather/varlen 支持、transform_a 兼容与 padded_n 整除、blockscaled、swap_ab(仅 element 且无 sink)、acc_pair 的 tile_n 偶数与 SM90 `tile_n % 32`、sink 整除 |
 
-消费方是扫参层:GemmEpilogueTunePolicy.prepare_candidates(gemm_epilogue_tune_policy.py:66)先走 varlen policy 的结构剪枝,再调 `prune_epilogue_configs`。边界划分:epilogue 合法性只动候选集;sink 缓冲容量是调用边界契约,由 tuned 包装逐调用校验,不改候选集与胜者(legality.py:4-7)。EpiMod 进扫参的通道是 `tuned_mod_gemm`(gemm_runtime/autotune.py:375),经 `EpiMod.gemm_tuned`(frontend.py:652,函数内 import :656 断环)或 `__call__(tuned=True)`。候选枚举、评测协议、缓存键见 ./autotuning_subsystem.md。
+消费方是扫参层:GemmEpilogueTunePolicy.prepare_candidates(gemm_epilogue_tune_policy.py:66)先走 varlen policy 的结构剪枝,再调 `prune_epilogue_configs`。边界划分:epilogue 合法性只动候选集;sink 缓冲容量是调用边界契约,由 tuned 包装逐调用校验,不改候选集与胜者(legality.py:4-7)。EpiMod 进扫参的通道是 `tuned_mod_gemm`(gemm_runtime/autotune.py:375),经 `EpiMod.gemm_tuned`(frontend.py:652,函数内 import :656 断环)或 `__call__(tune_mode=TUNED/RUNNING)`。候选枚举、评测协议、缓存键见 ./autotuning_subsystem.md。
 
 ## Complex64 域件
 

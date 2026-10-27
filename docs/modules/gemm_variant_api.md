@@ -126,7 +126,7 @@ epilogue 数学分两条路离开本模块:线性族直调 `gemm_dispatch`;激�
 
 | 层 | 缓存 | 键 | 命中后 |
 |---|---|---|---|
-| eager iface plan | `_gemm_iface_plan_cache`:889(`_GemmIfacePlan`:868,6 字段) | `:1017-1037`:张量元数据 + alpha/sr 模式 + tuned/dynamic/设备 | `_gemm_execute` 带 `dispatch_plan=` 直接 launch(`:1045-1070`),跳过校验、config 解析(含 autotuner)与 dispatch 层的键 |
+| eager iface plan | `_gemm_iface_plan_cache`:889(`_GemmIfacePlan`:868,6 字段) | `:1017-1037`:张量元数据 + alpha/sr 模式 + tune_mode/dynamic/设备 | `_gemm_execute` 带 `dispatch_plan=` 直接 launch(`:1045-1070`),跳过校验、config 解析(含 autotuner)与 dispatch 层的键 |
 | dispatch plan | `gemm.py:261` | `gemm.py:459-501` | `run_gemm_plan`(见 [./gemm_dispatch.md](./gemm_dispatch.md)) |
 
 iface plan 的进入条件(`:1009-1016`):非 torch.compile、无 varlen/gather/permute/concat、非量化输出。record 点在冷路径末尾(`:1217-1225`),config 由 `gemm_tuned`:377 返回的已解析决策组装。

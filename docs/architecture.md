@@ -69,6 +69,7 @@ flowchart TB
         SM120["gemm_sm120.py"]
         DE["gemm_default_epi.py<br/>默认 epilogue 组装"]
         MOE["fused_grouped_gemm/gemm_sm90.py<br/>GemmMoeSm90 role 类"]
+        PTR["gemm_sm90_ptr_array.py<br/>指针数组 grouped GEMM(GemmSm90PtrArray 窄 fork)"]
     end
 
     subgraph SUP["支撑层（依赖边省略）"]
@@ -120,7 +121,7 @@ flowchart TB
 | 通用宿主管线 | `gemm_runtime/`(`identity.py` → `host.py`、`torch_op.py`、`autotune.py`) | 所有 epilogue/transform 共用的 plan/compile/launch 与 `dlkernel::gemm_epi` 算子 | [gemm_runtime.md](modules/gemm_runtime.md)、[epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
 | epilogue | `epilogue/`(`ops.py` → `mixin.py` → `frontend.py`/`visit.py` → `library.py` + 域模块) | 装饰 fn + EpiOp 词表 + 铸 kernel 类 + 现成 mod 库 | [epilogue.md](modules/epilogue.md)、[epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
 | A 操作数变换 | `operand_transform/`(`transform.py`/`kinds.py` → `frontend.py` → `host.py` + `formats/`) | dequant/dropout/value fn 等 A 侧变换,以 `copy_block` 挂载点接进 RS mainloop | [operand_transform.md](modules/operand_transform.md)、[epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md) |
-| SM 设备实现 | `gemm_base.py`、`gemm_sm80/90/100/120.py`、`gemm_w4.py`、`gemm_symmetric.py`、`fused_grouped_gemm/gemm_sm90.py` | `@cute.kernel` 设备代码:mainloop、epilogue 钩子、调度器消费;host 类入口在 `gemm_base.py` | [sm_device_layer.md](modules/sm_device_layer.md)、[fused_grouped_gemm.md](modules/fused_grouped_gemm.md) |
+| SM 设备实现 | `gemm_base.py`、`gemm_sm80/90/100/120.py`、`gemm_w4.py`、`gemm_symmetric.py`、`fused_grouped_gemm/gemm_sm90.py`、`gemm_sm90_ptr_array.py` | `@cute.kernel` 设备代码:mainloop、epilogue 钩子、调度器消费;host 类入口在 `gemm_base.py` | [sm_device_layer.md](modules/sm_device_layer.md)、[fused_grouped_gemm.md](modules/fused_grouped_gemm.md)、[ptr_array_grouped_gemm.md](modules/ptr_array_grouped_gemm.md) |
 | 支撑层 | `cache/`、`tile_scheduler.py`、`copy_utils.py`、`layout_utils.py`、`cute_dsl_utils.py`、`varlen_utils.py`、`gemm_config.py`、`compile_utils.py`、`autotuner.py` | 编译缓存、布局代数、拷贝 atom、`GemmConfig` 枚举、扫参框架 | [tile_scheduler.md](modules/tile_scheduler.md)、[support_layer.md](modules/support_layer.md)、[caching_and_parallel_compilation.md](modules/caching_and_parallel_compilation.md) |
 | 独立 kernel 家族 | `reduction_base.py` + `rmsnorm.py`、`softmax.py`、`cross_entropy.py`;`blockscaled/`、`distributed/all_gather_gemm.py` | 不走 GEMM 管线的归约 kernel、blockscaled 工具、AllGather+GEMM | [reduction_family.md](modules/reduction_family.md)、[blockscaled_api.md](modules/blockscaled_api.md)、[all_gather_gemm.md](modules/all_gather_gemm.md) |
 
@@ -600,6 +601,7 @@ SM 选择是 device capability major 到 kernel class 的静态映射:`gemm.py` 
 | 新打包权重格式 | 注册 DecodeFormat(formats/__init__.py:570) | qtip 系列 |
 | 新 SM 代际 | 继承基类 + sm_to_cls 登记 + GemmConfig 候选空间 | gemm_sm120.py |
 | 新归约 kernel | 继承 ReductionBase | rmsnorm/softmax |
+| 多权重池 grouped GEMM | 独立 sibling 模块:自有 plan cache + 窄 fork(不进共享文件) | gemm_sm90_ptr_array |
 
 ### 潜在问题与代价
 
@@ -608,7 +610,7 @@ SM 选择是 device capability major 到 kernel class 的静态映射:`gemm.py` 
 1. **复杂度集中在 ops.py 与键一致性上**。EpiOp 双协议约 3000 行;semantic_key、mint_key、plan-cache key、host_arg_key 四套键要人工保持一致,`frontend.py:838` 记录了 grouped-stats 宽度会别名出 stale plan 的风险。这是 fn 组合点的直接成本。
 2. **visit.py 循环变体多**。三种 fn 模式乘 SM 分支乘 f32x2 打包,正确性靠与手写 mixin 对拍(bitwise-or-1-ulp 且性能差 ≤1%,`frontend.py:152`)钉住,而非靠结构保证。
 3. **"缺席操作数 = 编译掉"迫使 library 工厂用 exec 生成源码**而非闭包(`library.py:486-511`)。签名即接口的原则在此处把实现推向了代码生成。
-4. **镜像 plan cache 模式散布四处**(`gemm.py:261`、`gemm_interface.py:889`、`gemm_interface.py:2634`、`gemm_symmetric.py:217`),与两条 host 管线并存。可观察差异在冷路径:线性族用手写 mixin,不走 fn/digest/EpiOp schema(成因记录见 [epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md))。同一模式四处实现,改 plan 语义要四处同步。
+4. **镜像 plan cache 模式散布四处**(`gemm.py:261`、`gemm_interface.py:889`、`gemm_interface.py:2634`、`gemm_symmetric.py:217`、`gemm_sm90_ptr_array.py`),与两条 host 管线并存。可观察差异在冷路径:线性族用手写 mixin,不走 fn/digest/EpiOp schema(成因记录见 [epilogue_transform_reorg.md](notes/epilogue_transform_reorg.md))。同一模式四处实现,改 plan 语义要四处同步。
 5. **MoE 校验不读 CUDA 张量内容**:offsets/indices 检查只对 CPU 张量执行,CUDA 侧靠 producer contract(`fused_grouped_gemm/gemm_sm90.py:372-394`、`:415-421`);代价是契约违约只能靠下游报错暴露。
 
 ### 有意不做的事

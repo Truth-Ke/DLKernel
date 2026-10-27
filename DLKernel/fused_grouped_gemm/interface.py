@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from torch import Tensor
 
+from DLKernel.gemm_config import TuneMode
+
 from .gemm_sm90 import GemmMoeSm90
 
 
@@ -28,7 +30,7 @@ def moe_up_proj_act(
     token_indices: Tensor | None = None,
     gate_up_bias: Tensor | None = None,
     store_preact: bool = True,
-    tuned: bool = True,
+    tune_mode: TuneMode = TuneMode.TUNED,
 ) -> tuple[Tensor, Tensor | None]:
     """Run the expert up projection with the activation fused in the epilogue.
 
@@ -53,7 +55,7 @@ def moe_up_proj_act(
         token_indices=token_indices,
         gate_up_bias=gate_up_bias,
         store_preact=store_preact,
-        tuned=tuned,
+        tune_mode=tune_mode,
     )
 
 
@@ -67,7 +69,7 @@ def moe_down_proj_dact(
     token_indices: Tensor | None = None,
     router_weights: Tensor | None = None,
     compute_router_weight_grad: bool = False,
-    tuned: bool = True,
+    tune_mode: TuneMode = TuneMode.TUNED,
 ) -> tuple[Tensor, Tensor, Tensor | None]:
     """Compute the routed activation input gradient and weighted postactivation.
 
@@ -88,7 +90,7 @@ def moe_down_proj_dact(
         token_indices=token_indices,
         router_weights=router_weights,
         compute_router_weight_grad=compute_router_weight_grad,
-        tuned=tuned,
+        tune_mode=tune_mode,
     )
 
 

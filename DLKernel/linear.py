@@ -2,14 +2,17 @@
 from functools import partial
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-
+from torch import Tensor, nn
 
 from DLKernel.gemm_base import GemmBase
-from DLKernel.gemm_interface import gemm, gemm_add_inplace
-from DLKernel.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
+from DLKernel.gemm_config import TuneMode
+from DLKernel.gemm_interface import (
+    act_to_pytorch_fn_map,
+    gated_to_pytorch_fn_map,
+    gemm,
+    gemm_add_inplace,
+)
 
 
 def _ensure_contiguous(t):
@@ -74,7 +77,7 @@ def _recompute_gated_postact(preact, activation):
 
 # --- Ops bundles: matmul function configurations ---
 # Each ops class is a namespace holding the matmul functions for a specific variant
-# (tuned/untuned, act/gated, etc.). Passed as a non-tensor arg to apply() and stored on ctx.
+# (default/STATIC, act/gated, etc.). Passed as a non-tensor arg to apply() and stored on ctx.
 
 
 class _LinearOps:
@@ -84,19 +87,21 @@ class _LinearOps:
     matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True)
 
 
-class _LinearUntunedOps(_LinearOps):
-    matmul_fwd_fn = partial(gemm, tuned=False)
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+class _LinearStaticOps(_LinearOps):
+    matmul_fwd_fn = partial(gemm, tune_mode=TuneMode.STATIC)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC)
+    matmul_bwd_dw_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, tune_mode=TuneMode.STATIC
+    )
 
 
 class _LinearActOps(_LinearOps):
     matmul_fwd_fn = GemmBase.gemm_with_activation
 
 
-class _LinearActUntunedOps(_LinearUntunedOps):
-    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, tuned=False)
+class _LinearActStaticOps(_LinearStaticOps):
+    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, tune_mode=TuneMode.STATIC)
 
 
 class _LinearGatedOps(_LinearOps):
@@ -104,11 +109,13 @@ class _LinearGatedOps(_LinearOps):
     matmul_fwd_fn = GemmBase.gemm_with_activation
 
 
-class _LinearGatedUntunedOps:
-    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, tuned=False)
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+class _LinearGatedStaticOps:
+    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, tune_mode=TuneMode.STATIC)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC)
+    matmul_bwd_dw_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, tune_mode=TuneMode.STATIC
+    )
 
 
 class _LinearGatedConcatOps(_LinearGatedOps):
@@ -120,12 +127,21 @@ class _LinearGatedConcatOps(_LinearGatedOps):
     )
 
 
-class _LinearGatedConcatUntunedOps(_LinearGatedUntunedOps):
-    matmul_fwd_fn = partial(GemmBase.gemm_with_activation, tuned=False, concat_layout=("B", "bias"))
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
+class _LinearGatedConcatStaticOps(_LinearGatedStaticOps):
+    matmul_fwd_fn = partial(
+        GemmBase.gemm_with_activation, tune_mode=TuneMode.STATIC, concat_layout=("B", "bias")
+    )
+    matmul_bwd_dx = partial(
+        gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC, concat_layout=("B",)
+    )
+    matmul_bwd_dw = partial(
+        gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC, concat_layout=("out",)
+    )
     matmul_bwd_dw_inplace = partial(
-        gemm_add_inplace, dynamic_scheduler=True, tuned=False, concat_layout=("C", "out")
+        gemm_add_inplace,
+        dynamic_scheduler=True,
+        tune_mode=TuneMode.STATIC,
+        concat_layout=("C", "out"),
     )
 
 
@@ -134,8 +150,10 @@ class _DActLinearOps(_LinearOps):
     recompute_postact = staticmethod(_recompute_act_postact)
 
 
-class _DActLinearUntunedOps(_LinearUntunedOps):
-    matmul_bwd_dx = partial(GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tuned=False)
+class _DActLinearStaticOps(_LinearStaticOps):
+    matmul_bwd_dx = partial(
+        GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tune_mode=TuneMode.STATIC
+    )
     recompute_postact = staticmethod(_recompute_act_postact)
 
 
@@ -145,9 +163,73 @@ class _DGatedLinearOps(_LinearOps):
     recompute_postact = staticmethod(_recompute_gated_postact)
 
 
-class _DGatedLinearUntunedOps(_LinearUntunedOps):
-    matmul_bwd_dx = partial(GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tuned=False)
+class _DGatedLinearStaticOps(_LinearStaticOps):
+    matmul_bwd_dx = partial(
+        GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tune_mode=TuneMode.STATIC
+    )
     recompute_postact = staticmethod(_recompute_gated_postact)
+
+
+def _mode_twin(base: type, mode: TuneMode) -> type:
+    """An ops bundle with ``tune_mode=mode`` baked into every matmul callable.
+
+    Composes along the MRO (a subclass overriding one member keeps the rest);
+    existing partials rebake their keywords, bare callables wrap afresh, and
+    non-matmul members (recompute helpers) carry through untouched.
+    """
+    members: dict = {}
+    for klass in reversed(base.__mro__):
+        for name, fn in vars(klass).items():
+            if name.startswith("__") or isinstance(fn, (staticmethod, classmethod)):
+                if not name.startswith("__"):
+                    members[name] = fn
+                continue
+            keywords = getattr(fn, "keywords", None)
+            if keywords is not None:
+                members[name] = partial(fn.func, *fn.args, **{**keywords, "tune_mode": mode})
+            elif callable(fn):
+                members[name] = partial(fn, tune_mode=mode)
+    return type(f"{base.__name__}{mode.name.title()}", (), members)
+
+
+def _prebuild_running_twins(*bases: type) -> None:
+    """Build the RUNNING twins for ``bases`` now, at module import.
+
+    ``_ops_for`` must not allocate on any call path: under
+    torch.compile(fullgraph=True) a lazily built twin traces ``_mode_twin``
+    (it walks ``vars(klass).items()``), which dynamo cannot trace. Modules
+    defining their own ops bundles call this once at module scope.
+    """
+    for base in bases:
+        _RUNNING_TWINS[base] = _mode_twin(base, TuneMode.RUNNING)
+
+
+# All RUNNING twins _ops_for can receive, built before any tracing can happen.
+# mlp.py appends its own bundles at its import.
+_RUNNING_TWINS: dict = {}
+_prebuild_running_twins(
+    _LinearOps,
+    _LinearActOps,
+    _LinearGatedOps,
+    _LinearGatedConcatOps,
+    _DActLinearOps,
+    _DGatedLinearOps,
+)
+
+
+def _ops_for(tune_mode, base: type, static_ops: type) -> type:
+    """Mode -> ops bundle.
+
+    STATIC and RUNNING bake the mode into the callables; every other value
+    (the TUNED default, legacy None) rides the bundle's own default -- the
+    pre-TuneMode behaviour: a miss is swept. RUNNING twins are pre-built at
+    import, so this is a pure selection with nothing left to trace.
+    """
+    if tune_mode == TuneMode.STATIC:
+        return static_ops
+    if tune_mode == TuneMode.RUNNING:
+        return _RUNNING_TWINS[base]
+    return base
 
 
 # --- Autograd Functions (all @staticmethod, torch.compile-compatible) ---
@@ -198,8 +280,8 @@ class LinearFunc(torch.autograd.Function):
             return dx, dweight, dbias, None, None
 
 
-def linear_func(x, weight, bias=None, fuse_grad_accum=False, tuned=True):
-    ops = _LinearOps if tuned else _LinearUntunedOps
+def linear_func(x, weight, bias=None, fuse_grad_accum=False, tune_mode=TuneMode.TUNED):
+    ops = _ops_for(tune_mode, _LinearOps, _LinearStaticOps)
     return LinearFunc.apply(x, weight, bias, fuse_grad_accum, ops)
 
 
@@ -252,9 +334,15 @@ class LinearActFunc(torch.autograd.Function):
 
 
 def linear_act_func(
-    x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False, tuned=True
+    x,
+    weight,
+    activation,
+    bias=None,
+    store_preact=True,
+    fuse_grad_accum=False,
+    tune_mode=TuneMode.TUNED,
 ):
-    ops = _LinearActOps if tuned else _LinearActUntunedOps
+    ops = _ops_for(tune_mode, _LinearActOps, _LinearActStaticOps)
     return LinearActFunc.apply(x, weight, activation, bias, store_preact, fuse_grad_accum, ops)
 
 
@@ -265,13 +353,13 @@ def linear_gated_func(
     bias=None,
     store_preact=True,
     fuse_grad_accum=False,
-    tuned=True,
+    tune_mode=TuneMode.TUNED,
     concat_layout=False,
 ):
     if concat_layout:
-        ops = _LinearGatedConcatOps if tuned else _LinearGatedConcatUntunedOps
+        ops = _ops_for(tune_mode, _LinearGatedConcatOps, _LinearGatedConcatStaticOps)
     else:
-        ops = _LinearGatedOps if tuned else _LinearGatedUntunedOps
+        ops = _ops_for(tune_mode, _LinearGatedOps, _LinearGatedStaticOps)
     return LinearActFunc.apply(x, weight, activation, bias, store_preact, fuse_grad_accum, ops)
 
 
@@ -344,13 +432,17 @@ class DActLinearFunc(torch.autograd.Function):
             return dpreact, dweight, None, None, dbias, None, None
 
 
-def act_linear_func(preact, weight, x, activation, bias=None, fuse_grad_accum=False, tuned=True):
-    ops = _DActLinearOps if tuned else _DActLinearUntunedOps
+def act_linear_func(
+    preact, weight, x, activation, bias=None, fuse_grad_accum=False, tune_mode=TuneMode.TUNED
+):
+    ops = _ops_for(tune_mode, _DActLinearOps, _DActLinearStaticOps)
     return DActLinearFunc.apply(preact, weight, x, activation, bias, fuse_grad_accum, ops)
 
 
-def gated_linear_func(preact, weight, x, activation, bias=None, fuse_grad_accum=False, tuned=True):
-    ops = _DGatedLinearOps if tuned else _DGatedLinearUntunedOps
+def gated_linear_func(
+    preact, weight, x, activation, bias=None, fuse_grad_accum=False, tune_mode=TuneMode.TUNED
+):
+    ops = _ops_for(tune_mode, _DGatedLinearOps, _DGatedLinearStaticOps)
     return DActLinearFunc.apply(preact, weight, x, activation, bias, fuse_grad_accum, ops)
 
 
@@ -374,4 +466,4 @@ class Linear(nn.Linear):
             return F.linear(input, self.weight, self.bias)
 
 
-__all__ = ["linear_func", "linear_act_func", "linear_gated_func"]
+__all__ = ["linear_act_func", "linear_func", "linear_gated_func"]

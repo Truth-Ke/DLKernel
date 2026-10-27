@@ -2,26 +2,22 @@
 
 import enum
 import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Dict, Literal, Optional, Sequence, Tuple, Type
+from typing import TYPE_CHECKING, Literal
 
 import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline
 import torch
-from cutlass import Boolean, Int32, const_expr
+from cutlass import Boolean, Int32, const_expr, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 from cutlass.utils import LayoutEnum
 from torch import Tensor
 
-import DLKernel.copy_utils as copy_utils
-import DLKernel.layout_utils as layout_utils
-import DLKernel.utils as utils
-from DLKernel import pipeline_checks
+from DLKernel import copy_utils, layout_utils, pipeline_checks, utils
 from DLKernel.blockscaled.operand import BlockScaledOperand
 from DLKernel.cute_dsl_utils import ParamsBase
 from DLKernel.epilogue.ops import DStore, EpiSmemBytes, TileLoad, TileStore, VecReduce
-from DLKernel.gemm_config import GemmConfig, SplitKMode
+from DLKernel.gemm_config import GemmConfig, SplitKMode, TuneMode
 from DLKernel.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from DLKernel.sync import Semaphore
 from DLKernel.tile_scheduler import (
@@ -238,7 +234,7 @@ class GemmBase:
         register_kernel_variant_class(token, cls)
 
     @classmethod
-    def get_kernel_variant(cls) -> Optional[str]:
+    def get_kernel_variant(cls) -> str | None:
         """The declared kernel_variant wire token, or None (the generic root).
 
         A pure declaration read — no registry access, no import. The trace
@@ -253,7 +249,7 @@ class GemmBase:
         return token
 
     @classmethod
-    def resolve_kernel_variant(cls, kernel_variant: Optional[str]) -> type:
+    def resolve_kernel_variant(cls, kernel_variant: str | None) -> type:
         """The static Gemm class for a ``kernel_variant`` token.
 
         ``None`` means the generic root and returns ``GemmBase`` itself — a
@@ -291,7 +287,7 @@ class GemmBase:
         return epilogue_mod._bind_gemm_class(cls)
 
     @classmethod
-    def _host_entry_variant(cls) -> Optional[str]:
+    def _host_entry_variant(cls) -> str | None:
         """The wire token a host class entry crosses the op boundary with.
 
         ``None`` is reserved for the generic spine: GemmBase, intermediate
@@ -346,7 +342,7 @@ class GemmBase:
         A_idx: Tensor | None = None,
         store_preact: bool = True,
         dynamic_scheduler: bool = False,
-        tuned: bool = True,
+        tune_mode: TuneMode = TuneMode.TUNED,
         config: GemmConfig | None = None,
         concat_layout: tuple | None = None,
         split_k: int | None = 1,
@@ -380,7 +376,7 @@ class GemmBase:
             A_idx=A_idx,
             store_preact=store_preact,
             dynamic_scheduler=dynamic_scheduler,
-            tuned=tuned,
+            tune_mode=tune_mode,
             config=config,
             concat_layout=concat_layout,
             split_k=split_k,
@@ -403,7 +399,7 @@ class GemmBase:
         cu_seqlens_m: Tensor | None = None,
         A_idx: Tensor | None = None,
         dynamic_scheduler: bool = True,
-        tuned: bool = True,
+        tune_mode: TuneMode = TuneMode.TUNED,
         config: GemmConfig | None = None,
         split_k: int | None = 1,
         split_k_mode: int = SplitKMode.SERIAL,
@@ -434,7 +430,7 @@ class GemmBase:
             cu_seqlens_m=cu_seqlens_m,
             A_idx=A_idx,
             dynamic_scheduler=dynamic_scheduler,
-            tuned=tuned,
+            tune_mode=tune_mode,
             config=config,
             split_k=split_k,
             split_k_mode=split_k_mode,
@@ -501,8 +497,8 @@ class GemmBase:
         return mA, mB, mD, mC, self.permute_batch_last_epi_args(epilogue_args, append_batch_if_2d)
 
     def permute_batch_last(
-        self, mT: Optional[cute.Tensor], append_batch_if_2d=False
-    ) -> Optional[cute.Tensor]:
+        self, mT: cute.Tensor | None, append_batch_if_2d=False
+    ) -> cute.Tensor | None:
         """Trace-time (l, x, y) -> (x, y, l) permute of a batched tensor.
 
         Rank-2 tensors (the varlen flattened operands, which are never
@@ -577,30 +573,30 @@ class GemmBase:
     def epilogue(
         self,
         params: EpilogueParams,
-        epi_smem_tensors: Dict[str, cute.Tensor],
-        epi_pipeline: Optional[cutlass.pipeline.PipelineAsync],
-        epi_store_pipeline: Optional[cutlass.pipeline.PipelineAsync],
-        epi_read_state: Optional[cutlass.pipeline.PipelineState],
-        epi_producer_state: Optional[cutlass.pipeline.PipelineState],
+        epi_smem_tensors: dict[str, cute.Tensor],
+        epi_pipeline: cutlass.pipeline.PipelineAsync | None,
+        epi_store_pipeline: cutlass.pipeline.PipelineAsync | None,
+        epi_read_state: cutlass.pipeline.PipelineState | None,
+        epi_producer_state: cutlass.pipeline.PipelineState | None,
         epi_tile: cute.Tile,
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor],
-        tiled_copy_t2r: Optional[cute.TiledCopy],  # Only for Sm100
+        tRS_rC: cute.Tensor | None,
+        tiled_copy_t2r: cute.TiledCopy | None,  # Only for Sm100
         tiled_copy_r2s: cute.TiledCopy,
         tRS_sD: cute.Tensor,
-        tiled_copy_s2r: Optional[cute.ThrCopy],
-        tSR_rC: Optional[cute.Tensor],
-        tSR_sC: Optional[cute.Tensor],
-        copy_D: Optional[Callable],
-        copy_C: Optional[Callable],
+        tiled_copy_s2r: cute.ThrCopy | None,
+        tSR_rC: cute.Tensor | None,
+        tSR_sC: cute.Tensor | None,
+        copy_D: Callable | None,
+        copy_C: Callable | None,
         tile_coord_mnkl: cute.Coord,
         varlen_manager: VarlenManager,
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tile_scheduler,
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
-    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+    ) -> tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         from cutlass.cute.experimental import iket
 
         has_C = const_expr(tRS_rC is not None)
@@ -973,14 +969,14 @@ class GemmBase:
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         epi_tile: cute.Tile,
-        epi_read_state: Optional[cutlass.pipeline.PipelineState],
-        epi_producer_state: Optional[cutlass.pipeline.PipelineState],
-        epi_store_pipeline: Optional[cutlass.pipeline.PipelineAsync],
+        epi_read_state: cutlass.pipeline.PipelineState | None,
+        epi_producer_state: cutlass.pipeline.PipelineState | None,
+        epi_store_pipeline: cutlass.pipeline.PipelineAsync | None,
         tile_coord_mnkl: cute.Coord,
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
-    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+    ) -> tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         """The split-K finalization protocol around an epilogue closure.
 
         ``epi_fn`` is self.epilogue with everything bound except its accumulator
@@ -1093,7 +1089,7 @@ class GemmBase:
         self,
         mA: cute.Tensor,
         mB: cute.Tensor,
-        mD: Optional[cute.Tensor],
+        mD: cute.Tensor | None,
         scheduler_args,
         varlen_args,
         epilogue_args,
@@ -1198,30 +1194,30 @@ class GemmBase:
     def epi_begin(
         self,
         params: EpilogueParams,
-        epi_smem_tensors: Dict[str, cute.Tensor],
+        epi_smem_tensors: dict[str, cute.Tensor],
         epi_tile: cute.Tile,
-        tiled_copy_t2r: Optional[cute.TiledCopy],
+        tiled_copy_t2r: cute.TiledCopy | None,
         tiled_copy_r2s: cute.TiledCopy,
         tile_coord_mnkl: cute.Coord,
         varlen_manager: VarlenManager,
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tidx: Int32,
         tRS_rD_layout=None,
-    ) -> Tuple[cute.Tensor, ...]:
+    ) -> tuple[cute.Tensor, ...]:
         return ()
 
     def epi_begin_loop(
-        self, params: EpilogueParams, epi_tensors: Tuple[cute.Tensor, ...], epi_coord: cute.Coord
-    ) -> Tuple[cute.Tensor, ...]:
+        self, params: EpilogueParams, epi_tensors: tuple[cute.Tensor, ...], epi_coord: cute.Coord
+    ) -> tuple[cute.Tensor, ...]:
         return ()
 
     def epi_visit_subtile(
         self,
         params: EpilogueParams,
-        epi_loop_tensors: Tuple[cute.Tensor, ...],
+        epi_loop_tensors: tuple[cute.Tensor, ...],
         tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Tuple[cute.Tensor, ...]:
+        tRS_rC: cute.Tensor | None = None,
+    ) -> tuple[cute.Tensor, ...]:
         return ()
 
     def epi_visit_acc(
@@ -1238,11 +1234,11 @@ class GemmBase:
     def epi_end_loop(
         self,
         params: EpilogueParams,
-        epi_tensors: Tuple[cute.Tensor, ...],
+        epi_tensors: tuple[cute.Tensor, ...],
         epi_coord: cute.Coord,
         tRS_rD: cute.Tensor,
         epi_tile: cute.Tile,
-        tiled_copy_t2r: Optional[cute.TiledCopy],
+        tiled_copy_t2r: cute.TiledCopy | None,
         tiled_copy_r2s: cute.TiledCopy,
         tile_coord_mnkl: cute.Coord,
         varlen_manager,
@@ -1254,9 +1250,9 @@ class GemmBase:
     def epi_end(
         self,
         params: EpilogueParams,
-        epi_tensors: Tuple[cute.Tensor, ...],
+        epi_tensors: tuple[cute.Tensor, ...],
         epi_tile: cute.Tile,
-        tiled_copy_t2r: Optional[cute.TiledCopy],
+        tiled_copy_t2r: cute.TiledCopy | None,
         tiled_copy_r2s: cute.TiledCopy,
         tile_coord_mnkl: cute.Coord,
         varlen_manager,
@@ -1291,17 +1287,17 @@ class GemmBase:
 
     @staticmethod
     def epi_smem_bytes(
-        args: Optional[EpilogueArguments],
-        cta_tile_shape_mnk: Tuple[int, int, int],
+        args: EpilogueArguments | None,
+        cta_tile_shape_mnk: tuple[int, int, int],
         epi_tile: cute.Tile,
-        warp_shape_mnk: Tuple[int, int, int] | None = None,
+        warp_shape_mnk: tuple[int, int, int] | None = None,
     ) -> EpiSmemBytes:
         return EpiSmemBytes()
 
     def epi_get_smem_struct(self, params: EpilogueParams):
         return cute.struct.MemRange[Int32, 0]  # Dummy struct
 
-    def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Dict[str, cute.Tensor]:
+    def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> dict[str, cute.Tensor]:
         return {}
 
     def epi_setup_aux_out(
@@ -1326,7 +1322,7 @@ class GemmBase:
         """The quantize codec op attached to the named stored output ("D" =
         the main output), or None (ComposableEpiMixin provides the generic
         implementation)."""
-        return None
+        return
 
 
 class GemmTmaBase(GemmBase):
@@ -1337,7 +1333,7 @@ class GemmTmaBase(GemmBase):
         self,
         pipeline: cutlass.pipeline.PipelineAsync,
         producer_state: cutlass.pipeline.PipelineState,
-        copy_fns: Sequence[Optional[Callable]],
+        copy_fns: Sequence[Callable | None],
         k_tile_cnt: Int32,
         k_tile_start: Int32 | int = 0,
     ) -> cutlass.pipeline.PipelineState:
@@ -1414,8 +1410,8 @@ class GemmTmaBase(GemmBase):
         a_smem_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
         varlen_k: bool,
-        a_internal_type: Optional[Type[cutlass.Numeric]] = None,
-        b_internal_type: Optional[Type[cutlass.Numeric]] = None,
+        a_internal_type: type[cutlass.Numeric] | None = None,
+        b_internal_type: type[cutlass.Numeric] | None = None,
         varlen_m_zero_fill: bool = False,
     ):
         tma_atom_a, tma_tensor_a = None, None
@@ -1447,8 +1443,8 @@ class GemmTmaBase(GemmBase):
 
     def make_tma_epilogue_atoms_and_tensors(
         self,
-        mD: Optional[cute.Tensor],
-        mC: Optional[cute.Tensor],
+        mD: cute.Tensor | None,
+        mC: cute.Tensor | None,
         epilogue_args,
         varlen_m: bool,
     ):
@@ -1495,7 +1491,7 @@ class GemmTmaBase(GemmBase):
         epi_tile: cute.Tile,
         sD: cute.Tensor,
         tile_coord_mnkl: cute.Coord,
-    ) -> Tuple[cute.Tensor, cute.Tensor]:
+    ) -> tuple[cute.Tensor, cute.Tensor]:
         gD = cute.local_tile(mD_mn, tile_shape_mn, tile_coord_mnkl[:2])  # (bM, bN)
         tDgD_for_tma_partition = cute.zipped_divide(gD, epi_tile)
         is_s2g = isinstance(
@@ -1612,9 +1608,9 @@ class GemmTmaBase(GemmBase):
     def _make_tma_epi_atoms_and_tensors(
         tensor_d: cute.Tensor,
         epi_smem_layout_staged: cute.ComposedLayout,
-        epi_tile: Tuple[int, int],
+        epi_tile: tuple[int, int],
         op_type: Literal["store", "load", "add"],
-    ) -> Tuple[cute.CopyAtom, cute.Tensor]:
+    ) -> tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for storing D or loading C."""
         assert op_type in ["load", "store", "add"]
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
@@ -1633,10 +1629,10 @@ class GemmTmaBase(GemmBase):
     def _make_tma_atoms_and_tensors(
         tensor: cute.Tensor,
         smem_layout: cute.ComposedLayout,
-        smem_tile: Tuple[int, int],
+        smem_tile: tuple[int, int],
         mcast_dim: int,
-        internal_type: Optional[Type[cutlass.Numeric]] = None,
-    ) -> Tuple[cute.CopyAtom, cute.Tensor]:
+        internal_type: type[cutlass.Numeric] | None = None,
+    ) -> tuple[cute.CopyAtom, cute.Tensor]:
         """Create TMA atoms and tensors for input tensors.
 
         ``internal_type=Int8`` with a packed-fp4 gmem tensor selects the

@@ -6,6 +6,7 @@ fn frontend must produce the same math the mixin produces.
 """
 
 import pytest
+from DLKernel import TuneMode
 from DLKernel.epilogue.ops import ColVecReduce, OnlineLSEReduce, RowVecReduce, Scalar, TileLoad
 from DLKernel.epilogue.frontend import gemm_epilogue, pack, unpack
 from DLKernel.gemm_config import cta_tile_shape_m
@@ -292,10 +293,10 @@ def test_epi_mod_add_to_output():
         _ident_ao.gemm(A, B, D, C, add_to_output=True, **kw)
     # eager __call__ surface: accumulator must be caller-provided
     D2 = D0.clone()
-    out = _ident_ao(A, B.mT, out={"D": D2}, add_to_output=True, tuned=False)
+    out = _ident_ao(A, B.mT, out={"D": D2}, add_to_output=True, tune_mode=TuneMode.STATIC)
     assert torch.equal(out["D"], D0 + delta)
     with pytest.raises(ValueError, match="out="):
-        _ident_ao(A, B.mT, add_to_output=True, tuned=False)
+        _ident_ao(A, B.mT, add_to_output=True, tune_mode=TuneMode.STATIC)
 
 
 @pytest.mark.parametrize("alpha", [0.5, 2.0])
@@ -3156,7 +3157,11 @@ def test_bind_contract_getstate_clears_runtime_caches():
     torch.random.manual_seed(40)
     A = torch.randn((128, 128), device=device, dtype=torch.bfloat16)
     B = torch.randn((128, 128), device=device, dtype=torch.bfloat16)
-    mod(A, B, tuned=False)  # eager __call__: mints a class, plans, records a recipe
+    # Pinned config: the eager non-measuring warm path (pre-TuneMode's
+    # tuned=False).  A tune_mode=STATIC cold call deliberately records NO
+    # recipe — the -1 fallback never pins (peer-published winners must
+    # stay visible, same rule as the execution plan cache).
+    mod(A, B, config=mod._default_config(A, B, None))
     assert mod._minted and mod._plan_cache and mod._call_cache, "self-check: warm"
     restored = pickle.loads(pickle.dumps(mod))
     assert restored._minted == {}, "payload must not ship minted classes"
@@ -3245,7 +3250,7 @@ def test_bind_contract_class_entry_signatures():
         ("A_idx", None),
         ("store_preact", True),
         ("dynamic_scheduler", False),
-        ("tuned", True),
+        ("tune_mode", TuneMode.TUNED),
         ("config", None),
         ("concat_layout", None),
         ("split_k", 1),
@@ -3265,7 +3270,7 @@ def test_bind_contract_class_entry_signatures():
         ("cu_seqlens_m", None),
         ("A_idx", None),
         ("dynamic_scheduler", True),
-        ("tuned", True),
+        ("tune_mode", TuneMode.TUNED),
         ("config", None),
         ("split_k", 1),
         ("split_k_mode", SplitKMode.SERIAL),

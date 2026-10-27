@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from DLKernel import TuneMode
 from DLKernel.linear_cross_entropy import (
     chunked_linear_cross_entropy,
     linear_cross_entropy_func_ref,
@@ -24,8 +25,13 @@ def _require_scaled_exp(x, weight, chunk_size, reduction="mean"):
 # @pytest.mark.parametrize("d", [768])
 @pytest.mark.parametrize("B_L", [8, 16, 24])
 @pytest.mark.parametrize("chunk_size", [16])
-def test_chunked_linear_cross_entropy(B_L, d, V, chunk_size, reduction, input_dtype):
+def test_chunked_linear_cross_entropy(
+    B_L, d, V, chunk_size, reduction, input_dtype, tmp_path, monkeypatch
+):
     """Test chunked linear cross entropy against reference implementation."""
+    # backward's dw GEMM is the plain entry: STATIC consults the tune cache;
+    # keep it out of $HOME.
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     atol, rtol = 1e-3, 1e-3
     torch.random.manual_seed(0)
@@ -42,7 +48,7 @@ def test_chunked_linear_cross_entropy(B_L, d, V, chunk_size, reduction, input_dt
     loss_pt = linear_cross_entropy_func_ref(x_pt, weight_pt, None, target, reduction=reduction)
     # Chunked implementation
     loss = chunked_linear_cross_entropy(
-        x, weight, target, chunk_size=chunk_size, reduction=reduction, tuned=False
+        x, weight, target, chunk_size=chunk_size, reduction=reduction, tune_mode=TuneMode.STATIC
     )
     assert (loss - loss_ref).abs().max() < 3 * (loss_pt - loss_ref).abs().max() + 1e-5
     loss.backward()
@@ -59,11 +65,14 @@ def test_chunked_linear_cross_entropy(B_L, d, V, chunk_size, reduction, input_dt
 @pytest.mark.parametrize("V", [1536, 2048])  # tile_n1 192 / 256
 @pytest.mark.parametrize("d", [512, 768])  # dx/dw tile_N 256 / 192
 @pytest.mark.parametrize("B_L", [128, 600, 1024])  # single chunk / ragged padded / multi-chunk
-def test_scaled_exp_linear_cross_entropy(B_L, d, V, reduction, use_scaled_exp):
+def test_scaled_exp_linear_cross_entropy(
+    B_L, d, V, reduction, use_scaled_exp, tmp_path, monkeypatch
+):
     """Scaled-exp pipeline vs fp32 reference at bf16-baseline-relative
     tolerance, across chunk shapes (incl. the padded ragged last chunk) and
     both gemm1 / grad-GEMM tile classes, with ignored targets mixed in.
     use_scaled_exp=False pins the base pipeline at the same shapes."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     chunk_size = 256
     ignore_index = -100
@@ -88,7 +97,7 @@ def test_scaled_exp_linear_cross_entropy(B_L, d, V, reduction, use_scaled_exp):
         target,
         chunk_size=chunk_size,
         reduction=reduction,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         use_scaled_exp=use_scaled_exp,
     )
     assert (loss - loss_ref).abs().max() < 3 * (loss_pt - loss_ref).abs().max() + 1e-5
@@ -101,8 +110,9 @@ def test_scaled_exp_linear_cross_entropy(B_L, d, V, reduction, use_scaled_exp):
     ).abs().max() + 1e-4
 
 
-def test_scaled_exp_linear_cross_entropy_batched():
+def test_scaled_exp_linear_cross_entropy_batched(tmp_path, monkeypatch):
     """(B, L, d) input through the public fn: grads keep the batch shape."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     B, L, d, V = 3, 100, 768, 1536
     torch.random.manual_seed(2)
@@ -124,11 +134,12 @@ def test_scaled_exp_linear_cross_entropy_batched():
     assert (weight.grad.float() - weight_ref.grad).abs().max() < 1e-2
 
 
-def test_chunked_linear_cross_entropy_torch_compile_dispatch():
+def test_chunked_linear_cross_entropy_torch_compile_dispatch(tmp_path, monkeypatch):
     """Under torch.compile the scaled-exp path records the single
     dlkernel::lce_scaled_exp_fwd custom op — the host chunk loop (mod.gemm plan
     machinery, jit-cache probes, Triton launches) never gets traced. Same
     kernels either way, so compiled grads match eager scaled-exp bitwise."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     B_L, d, V = 256, 512, 2048
     torch.random.manual_seed(3)
@@ -145,7 +156,7 @@ def test_chunked_linear_cross_entropy_torch_compile_dispatch():
     # aten's reciprocal by one fp32 ulp — covered at tolerance below.)
     def f(x, w):
         return chunked_linear_cross_entropy(
-            x, w, target, chunk_size=128, reduction="sum", tuned=False
+            x, w, target, chunk_size=128, reduction="sum", tune_mode=TuneMode.STATIC
         )
 
     x_e, w_e = x0.clone().requires_grad_(), w0.clone().requires_grad_()
@@ -159,7 +170,7 @@ def test_chunked_linear_cross_entropy_torch_compile_dispatch():
     assert torch.equal(w_c.grad, w_e.grad), "compiled dw != eager scaled-exp dw"
 
     def f_mean(x, w):
-        return chunked_linear_cross_entropy(x, w, target, chunk_size=128, tuned=False)
+        return chunked_linear_cross_entropy(x, w, target, chunk_size=128, tune_mode=TuneMode.STATIC)
 
     x_m, w_m = x0.clone().requires_grad_(), w0.clone().requires_grad_()
     f_mean(x_m, w_m).backward()
@@ -174,9 +185,10 @@ def test_chunked_linear_cross_entropy_torch_compile_dispatch():
 @pytest.mark.parametrize("reduction", ["mean", "sum"])
 @pytest.mark.parametrize("chunk_size", [256, 1024])
 def test_chunked_linear_cross_entropy_ignore_index(
-    input_dtype, reduction, chunk_size, use_scaled_exp
+    input_dtype, reduction, chunk_size, use_scaled_exp, tmp_path, monkeypatch
 ):
     """Test chunked linear cross entropy with ignore_index."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     B_L, d, V = 1024, 512, 2048
     ignore_index = V - 1
@@ -213,7 +225,7 @@ def test_chunked_linear_cross_entropy_ignore_index(
         chunk_size=chunk_size,
         ignore_index=ignore_index,
         reduction=reduction,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         use_scaled_exp=use_scaled_exp,
     )
     assert (loss - loss_ref).abs().max() < 3 * (loss_pt - loss_ref).abs().max() + 1e-5
@@ -246,7 +258,7 @@ def test_chunked_linear_cross_entropy_no_grad(reduction, chunk_size, use_scaled_
         target,
         chunk_size=chunk_size,
         reduction=reduction,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         use_scaled_exp=use_scaled_exp,
     )
     with torch.no_grad():
@@ -256,7 +268,7 @@ def test_chunked_linear_cross_entropy_no_grad(reduction, chunk_size, use_scaled_
             target,
             chunk_size=chunk_size,
             reduction=reduction,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
             use_scaled_exp=use_scaled_exp,
         )
     assert not loss_eval.requires_grad
@@ -266,9 +278,12 @@ def test_chunked_linear_cross_entropy_no_grad(reduction, chunk_size, use_scaled_
 @pytest.mark.parametrize("use_scaled_exp", [False, True])
 @pytest.mark.parametrize("frozen", ["x", "weight"])
 @pytest.mark.parametrize("chunk_size", [256, 1024])  # 1024 = single chunk (deferred-dw edge)
-def test_chunked_linear_cross_entropy_partial_grad(frozen, chunk_size, use_scaled_exp):
+def test_chunked_linear_cross_entropy_partial_grad(
+    frozen, chunk_size, use_scaled_exp, tmp_path, monkeypatch
+):
     """One input frozen: its gradient GEMMs are skipped, the other's gradient
     is unchanged vs the both-require-grad run."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     B_L, d, V = 1024, 512, 2048
     torch.random.manual_seed(0)
@@ -280,13 +295,23 @@ def test_chunked_linear_cross_entropy_partial_grad(frozen, chunk_size, use_scale
         _require_scaled_exp(x0, w0, chunk_size)
     x_full, w_full = x0.clone().requires_grad_(), w0.clone().requires_grad_()
     chunked_linear_cross_entropy(
-        x_full, w_full, target, chunk_size=chunk_size, tuned=False, use_scaled_exp=use_scaled_exp
+        x_full,
+        w_full,
+        target,
+        chunk_size=chunk_size,
+        tune_mode=TuneMode.STATIC,
+        use_scaled_exp=use_scaled_exp,
     ).backward()
 
     x = x0.clone().requires_grad_(frozen != "x")
     w = w0.clone().requires_grad_(frozen != "weight")
     chunked_linear_cross_entropy(
-        x, w, target, chunk_size=chunk_size, tuned=False, use_scaled_exp=use_scaled_exp
+        x,
+        w,
+        target,
+        chunk_size=chunk_size,
+        tune_mode=TuneMode.STATIC,
+        use_scaled_exp=use_scaled_exp,
     ).backward()
     if frozen == "x":
         assert x.grad is None

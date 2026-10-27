@@ -1,5 +1,7 @@
 # Copyright (C) 2025, Tri Dao.
 from dataclasses import replace
+from functools import partial
+import inspect
 import math
 import pytest
 import torch
@@ -30,6 +32,7 @@ from DLKernel.cute_dsl_utils import get_device_capacity
 from DLKernel.gemm_config import GemmConfig
 from DLKernel.rounding import RoundingMode
 from DLKernel.rms_final_reduce import rms_final_reduce
+from DLKernel import TuneMode
 
 torch._dynamo.config.cache_size_limit = 1024
 torch._dynamo.config.accumulated_cache_size_limit = 1024
@@ -60,7 +63,7 @@ def test_linear(in_features, out_features, has_bias, input_dtype):
         t.detach().clone().to(x.dtype).requires_grad_(True) if t is not None else None
         for t in (x, w, bias)
     ]
-    out = linear_func(x, w, bias, tuned=False)  # Disable tuning for faster test
+    out = linear_func(x, w, bias, tune_mode=TuneMode.STATIC)  # Disable tuning for faster test
     out_ref = F.linear(x_ref, w_ref, bias_ref)
     out_pt = F.linear(x_pt, w_pt, bias_pt)
     assert (out - out_ref).abs().max() < 2 * (out_pt - out_ref).abs().max() + 1e-6
@@ -174,7 +177,7 @@ def test_linear_act(in_features, out_features, has_bias, input_dtype, activation
     bias = torch.randn(out_features, device=device, requires_grad=True) if has_bias else None
     # Disable tuning for faster test
     preact, postact = linear_act_func(
-        x, w, activation, bias=bias, store_preact=store_preact, tuned=False
+        x, w, activation, bias=bias, store_preact=store_preact, tune_mode=TuneMode.STATIC
     )
     preact_ref, postact_ref = gemm_act_ref(
         x.float(), w.float().T, activation=activation, bias=bias, store_preact=store_preact
@@ -211,7 +214,7 @@ def test_gemm_with_activation_alpha(input_dtype, activation, alpha_kind, has_bia
         else torch.tensor(alpha_val, device=device, dtype=torch.float32)
     )
     preact, postact = GemmBase.gemm_with_activation(
-        A, B, bias=bias, activation=activation, alpha=alpha, tuned=False
+        A, B, bias=bias, activation=activation, alpha=alpha, tune_mode=TuneMode.STATIC
     )
     preact_ref, postact_ref = gemm_act_ref(
         A.float(), B.float(), bias=bias, activation=activation, alpha=alpha_val
@@ -229,7 +232,7 @@ def test_gemm_with_activation_alpha(input_dtype, activation, alpha_kind, has_bia
         else torch.tensor(alpha2_val, device=device, dtype=torch.float32)
     )
     _, postact2 = GemmBase.gemm_with_activation(
-        A, B, bias=bias, activation=activation, alpha=alpha2, tuned=False
+        A, B, bias=bias, activation=activation, alpha=alpha2, tune_mode=TuneMode.STATIC
     )
     _, postact2_ref = gemm_act_ref(
         A.float(), B.float(), bias=bias, activation=activation, alpha=alpha2_val
@@ -240,10 +243,10 @@ def test_gemm_with_activation_alpha(input_dtype, activation, alpha_kind, has_bia
     ).abs().max() + 1e-6
     # alpha=1.0 folds to the alpha-free epilogue: bitwise vs the no-alpha call.
     _, postact_neutral = GemmBase.gemm_with_activation(
-        A, B, bias=bias, activation=activation, alpha=1.0, tuned=False
+        A, B, bias=bias, activation=activation, alpha=1.0, tune_mode=TuneMode.STATIC
     )
     _, postact_plain = GemmBase.gemm_with_activation(
-        A, B, bias=bias, activation=activation, tuned=False
+        A, B, bias=bias, activation=activation, tune_mode=TuneMode.STATIC
     )
     assert torch.equal(postact_neutral, postact_plain)
 
@@ -271,7 +274,7 @@ def test_gemm_with_activation_grad(n, k, has_colvec_scale, colvec_reduce, input_
         activation=activation,
         colvec_scale=colvec_scale,
         colvec_reduce=colvec_reduce,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     if colvec_reduce:
         colvec_reduce_out = rest[0]
@@ -302,8 +305,10 @@ def test_gemm_with_activation_grad(n, k, has_colvec_scale, colvec_reduce, input_
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("m", [960, 1920])
 @pytest.mark.parametrize("is_concat_layout_out", [False, True])
-def test_gemm_add_inplace(m, k, n, input_dtype, is_concat_layout_out):
+def test_gemm_add_inplace(m, k, n, input_dtype, is_concat_layout_out, tmp_path, monkeypatch):
     """Test in-place GEMM with addition: C += A @ B."""
+    # STATIC consults the tune cache (heuristic fallback); keep it out of $HOME.
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
@@ -312,7 +317,7 @@ def test_gemm_add_inplace(m, k, n, input_dtype, is_concat_layout_out):
     C = torch.randn((m, n), device=device, dtype=input_dtype)
     # Save original C for reference computation
     C_og = C.clone()
-    gemm_add_inplace(A, B, C, tuned=False, concat_layout=concat)
+    gemm_add_inplace(A, B, C, tune_mode=TuneMode.STATIC, concat_layout=concat)
     C_ref = gemm_add_ref(
         A.float(),
         B.float(),
@@ -338,8 +343,9 @@ def test_gemm_add_inplace(m, k, n, input_dtype, is_concat_layout_out):
 @pytest.mark.parametrize("n", [1504, 2048])
 @pytest.mark.parametrize("k", [736, 1024])
 @pytest.mark.parametrize("m", [960, 1920])
-def test_gemm_add_out_reuses_c_storage(m, k, n, input_dtype):
+def test_gemm_add_out_reuses_c_storage(m, k, n, input_dtype, tmp_path, monkeypatch):
     """Regression test for gemm_add(..., out=C) dispatching to the in-place path."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(123)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
@@ -347,7 +353,7 @@ def test_gemm_add_out_reuses_c_storage(m, k, n, input_dtype):
     C = torch.randn((m, n), device=device, dtype=input_dtype)
     alpha = torch.tensor(0.5, device=device, dtype=torch.float32)
     C_og = C.clone()
-    out = gemm_add(A, B, C, out=C, alpha=alpha, beta=1.0, tuned=False)
+    out = gemm_add(A, B, C, out=C, alpha=alpha, beta=1.0, tune_mode=TuneMode.STATIC)
     alpha_val = alpha.item()
     C_ref = alpha_val * torch.mm(A.float(), B.float()) + C_og.float()
     C_pt = alpha_val * torch.mm(A, B) + C_og
@@ -416,9 +422,10 @@ def test_gemm_add_sm100_unaligned_epilogue_tile_n(tile_m, cluster_m, tile_n, swa
 @pytest.mark.parametrize("m", [480, 960])
 @pytest.mark.parametrize("is_concat_layout_out", [False, True])
 def test_gemm_add_inplace_alpha_beta(
-    m, k, n, input_dtype, alpha, beta, alpha_beta_type, is_concat_layout_out
+    m, k, n, input_dtype, alpha, beta, alpha_beta_type, is_concat_layout_out, tmp_path, monkeypatch
 ):
     """Test in-place GEMM with alpha/beta scaling: C = alpha * A @ B + beta * C."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(42)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
@@ -429,7 +436,9 @@ def test_gemm_add_inplace_alpha_beta(
         alpha = torch.tensor(alpha, device=device, dtype=torch.float32)
         beta = torch.tensor(beta, device=device, dtype=torch.float32)
     C_og = C.clone()
-    gemm_add_inplace(A, B, C, alpha=alpha, beta=beta, tuned=False, concat_layout=concat)
+    gemm_add_inplace(
+        A, B, C, alpha=alpha, beta=beta, tune_mode=TuneMode.STATIC, concat_layout=concat
+    )
     C_ref = gemm_add_ref(
         A.float(),
         B.float(),
@@ -495,7 +504,7 @@ def test_gemm_with_activation_gated(
         bias=bias,
         activation=activation,
         store_preact=store_preact,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         concat_layout=concat,
     )
     preact_ref, postact_ref = gemm_gated_ref(
@@ -557,7 +566,7 @@ def test_gemm_with_activation_gated_pingpong_configs(pingpong):
         preact_out=preact,
         postact_out=postact,
         store_preact=True,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         config=config,
     )
     preact_ref, postact_ref = gemm_gated_ref(
@@ -602,7 +611,7 @@ def test_gemm_with_activation_grad_gated(
         colvec_scale=colvec_scale,
         activation=activation,
         colvec_reduce=colvec_reduce,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     if colvec_reduce:
         colvec_reduce_out = rest[0]
@@ -656,10 +665,10 @@ def test_dact_linear_partial_grad(input_dtype, freeze, activation):
     ).requires_grad_(freeze_x)
     # fc1 forward
     fc1_fn = linear_gated_func if gated else linear_act_func
-    preact, postact = fc1_fn(x, w1, activation, store_preact=True, tuned=False)
+    preact, postact = fc1_fn(x, w1, activation, store_preact=True, tune_mode=TuneMode.STATIC)
     # fc2 forward + backward
     fc2_fn = gated_linear_func if gated else act_linear_func
-    out = fc2_fn(preact, w2, postact, activation=activation, tuned=False)
+    out = fc2_fn(preact, w2, postact, activation=activation, tune_mode=TuneMode.STATIC)
     dout = torch.randn_like(out)
     out.backward(dout)
     if freeze_x:
@@ -693,7 +702,7 @@ def test_linear_act_partial_grad(input_dtype, freeze, activation):
         torch.randn(fc1_out, in_features, device=device, dtype=input_dtype) / math.sqrt(in_features)
     ).requires_grad_(freeze_x)
     fc1_fn = linear_gated_func if gated else linear_act_func
-    preact, postact = fc1_fn(x, w, activation, store_preact=True, tuned=False)
+    preact, postact = fc1_fn(x, w, activation, store_preact=True, tune_mode=TuneMode.STATIC)
     # preact is the differentiable output; postact is marked non-differentiable
     dout = torch.randn_like(preact)
     preact.backward(dout)
@@ -740,7 +749,7 @@ def test_autocast(fn_name, use_compile):
 
         def body(x, w):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_func(x, w, tuned=False)
+                return linear_func(x, w, tune_mode=TuneMode.STATIC)
 
         fn = torch.compile(body, fullgraph=True) if use_compile else body
         out = fn(x, w)
@@ -748,7 +757,9 @@ def test_autocast(fn_name, use_compile):
 
         def body(x, w):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_act_func(x, w, activation="gelu_tanh_approx", tuned=False)
+                return linear_act_func(
+                    x, w, activation="gelu_tanh_approx", tune_mode=TuneMode.STATIC
+                )
 
         fn = torch.compile(body, fullgraph=True) if use_compile else body
         out, _postact = fn(x, w)
@@ -756,7 +767,7 @@ def test_autocast(fn_name, use_compile):
 
         def body(x, w):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return linear_gated_func(x, w, activation="swiglu", tuned=False)
+                return linear_gated_func(x, w, activation="swiglu", tune_mode=TuneMode.STATIC)
 
         fn = torch.compile(body, fullgraph=True) if use_compile else body
         out, _postact = fn(x, w_gated)
@@ -765,7 +776,7 @@ def test_autocast(fn_name, use_compile):
 
         def body(x, w, w2):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                return mlp_func(x, w, w2, activation="gelu_tanh_approx", tuned=False)
+                return mlp_func(x, w, w2, activation="gelu_tanh_approx", tune_mode=TuneMode.STATIC)
 
         fn = torch.compile(body, fullgraph=True) if use_compile else body
         out = fn(x, w, w2)
@@ -786,18 +797,19 @@ def test_autocast(fn_name, use_compile):
 @pytest.mark.parametrize("n", [512, 1024])
 @pytest.mark.parametrize("k", [256, 768])
 @pytest.mark.parametrize("m", [480, 960])
-def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
+def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed, tmp_path, monkeypatch):
     """Test GEMM with stochastic rounding (hw cvt.rs on SM100/SM103, sw emulation on SM90/SM120).
 
     Validates that SR produces results close to RNE (within BF16 tolerance)
     and that the output has correct shape and dtype.
     """
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype) / math.sqrt(k)
-    out_sr = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=sr_seed)
-    out_rn = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RN)
+    out_sr = gemm(A, B, tune_mode=TuneMode.STATIC, rounding_mode=RoundingMode.RS, sr_seed=sr_seed)
+    out_rn = gemm(A, B, tune_mode=TuneMode.STATIC, rounding_mode=RoundingMode.RN)
     out_ref = torch.mm(A.float(), B.float())
     assert out_sr.shape == out_rn.shape
     assert out_sr.dtype == input_dtype
@@ -810,14 +822,15 @@ def test_gemm_stochastic_rounding(m, k, n, input_dtype, sr_seed):
 @pytest.mark.parametrize("n", [512])
 @pytest.mark.parametrize("k", [256])
 @pytest.mark.parametrize("m", [480])
-def test_gemm_sr_different_seeds(m, k, n, input_dtype):
+def test_gemm_sr_different_seeds(m, k, n, input_dtype, tmp_path, monkeypatch):
     """Different SR seeds should produce different results (non-deterministic rounding)."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(0)
     A = torch.randn((m, k), device=device, dtype=input_dtype)
     B = torch.randn((k, n), device=device, dtype=input_dtype)
-    out1 = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=1)
-    out2 = gemm(A, B, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=2)
+    out1 = gemm(A, B, tune_mode=TuneMode.STATIC, rounding_mode=RoundingMode.RS, sr_seed=1)
+    out2 = gemm(A, B, tune_mode=TuneMode.STATIC, rounding_mode=RoundingMode.RS, sr_seed=2)
     # Different seeds should give different outputs (with high probability)
     assert not torch.equal(out1, out2)
 
@@ -863,7 +876,15 @@ def test_gemm_rms(m, k, n, input_dtype, has_C, has_norm_weight, premult_dtype, u
         torch.empty(m, n, device=device, dtype=premult_dtype) if premult_dtype is not None else None
     )
     fn = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
-    D, rstd = fn(A, B, C=C, norm_weight=norm_weight, premult_out=premult_out, eps=eps, tuned=False)
+    D, rstd = fn(
+        A,
+        B,
+        C=C,
+        norm_weight=norm_weight,
+        premult_out=premult_out,
+        eps=eps,
+        tune_mode=TuneMode.STATIC,
+    )
     D_ref, rstd_ref = gemm_rms_ref(
         A.float(),
         B.float(),
@@ -912,7 +933,7 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
             C=C,
             activation=activation,
             store_preact=True,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
         )
     else:
         preact = torch.empty(m, n, device=device, dtype=input_dtype)
@@ -926,7 +947,7 @@ def test_gemm_norm_act(input_dtype, k, n, has_C, activation, use_compile, swap_a
             preact_out=preact,
             postact_out=postact,
             store_preact=True,
-            tuned=False,
+            tune_mode=TuneMode.STATIC,
             config=replace(default_config(torch.device(device)), swap_ab=True),
         )
     preact_ref, postact_ref = gemm_norm_act_ref(
@@ -1019,7 +1040,7 @@ def test_gemm_norm_gated(input_dtype, k, n, activation, use_compile):
         rstd=rstd,
         activation=activation,
         store_preact=True,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     preact_ref, postact_ref = gemm_norm_act_ref(
         A.float(),
@@ -1069,11 +1090,13 @@ def test_gemm_rms_then_norm_act(input_dtype, activation, use_compile):
 
     # Step 1: fused gemm_rms with norm_weight → D_normed = (x @ W2 + residual) * w, rstd
     fn_rms = gemm_rms if not use_compile else torch.compile(gemm_rms, fullgraph=True)
-    D_normed, rstd = fn_rms(x, W2, C=residual, norm_weight=w, eps=eps, tuned=False)
+    D_normed, rstd = fn_rms(x, W2, C=residual, norm_weight=w, eps=eps, tune_mode=TuneMode.STATIC)
 
     # Step 2: fused gemm_norm_act → postact = activation((D_normed @ W1) * rstd)
     fn_norm_act = gemm_norm_act if not use_compile else torch.compile(gemm_norm_act, fullgraph=True)
-    _, postact = fn_norm_act(D_normed, W1, rstd=rstd, activation=activation, tuned=False)
+    _, postact = fn_norm_act(
+        D_normed, W1, rstd=rstd, activation=activation, tune_mode=TuneMode.STATIC
+    )
 
     # Reference: PyTorch fp32
     D_ref = x.float() @ W2.float() + residual.float()
@@ -1319,3 +1342,96 @@ def test_gemm_with_activation_grad_zero_k_rejected(activation):
     preact = torch.randn(M, width, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="K=0"):
         GemmBase.gemm_with_activation_grad(A, B, preact, activation=activation)
+
+
+# =============================================================================
+# RUNNING twins pre-built at import (torch.compile fullgraph safety)
+# =============================================================================
+
+
+def _ops_call_sites():
+    """Every (base, static_ops) pair any ``_ops_for`` call site passes.
+
+    linear.py contributes the plain/act/gated/gated-concat/dact/dgated bundles;
+    mlp.py its recompute bundles, twinned at mlp import.
+    """
+    import DLKernel.linear as linear_module
+    import DLKernel.mlp as mlp_module
+
+    return [
+        (linear_module._LinearOps, linear_module._LinearStaticOps),
+        (linear_module._LinearActOps, linear_module._LinearActStaticOps),
+        (linear_module._LinearGatedOps, linear_module._LinearGatedStaticOps),
+        (linear_module._LinearGatedConcatOps, linear_module._LinearGatedConcatStaticOps),
+        (linear_module._DActLinearOps, linear_module._DActLinearStaticOps),
+        (linear_module._DGatedLinearOps, linear_module._DGatedLinearStaticOps),
+        (mlp_module._MLPOps, mlp_module._MLPStaticOps),
+        (mlp_module._MLPGatedOps, mlp_module._MLPGatedStaticOps),
+        (mlp_module._MLPGatedConcatOps, mlp_module._MLPGatedConcatStaticOps),
+    ]
+
+
+def test_running_twins_prebuilt_at_import():
+    """Every ops bundle _ops_for can receive already has its RUNNING twin.
+
+    Regression: _ops_for built the twin lazily on first call, and the builder
+    walks vars(klass).items(), which dynamo cannot trace -- the first-ever
+    RUNNING call graph-broke under torch.compile(fullgraph=True). Twins must
+    exist as plain classes before any call, for the mlp bundles too.
+    """
+    from DLKernel.linear import _RUNNING_TWINS, _ops_for
+
+    for base, static_ops in _ops_call_sites():
+        twin = _RUNNING_TWINS[base]
+        assert isinstance(twin, type) and twin is not static_ops
+        assert twin.__name__ == f"{base.__name__}Running"
+        # Selection is unchanged: STATIC/TUNED/None pick the given bundles.
+        assert _ops_for(TuneMode.STATIC, base, static_ops) is static_ops
+        assert _ops_for(TuneMode.RUNNING, base, static_ops) is twin
+        assert _ops_for(TuneMode.TUNED, base, static_ops) is base
+        assert _ops_for(None, base, static_ops) is base
+        # The baked mode: every partial carrying tune_mode now carries RUNNING.
+        for fn in vars(twin).values():
+            if isinstance(fn, partial) and "tune_mode" in fn.keywords:
+                assert fn.keywords["tune_mode"] == TuneMode.RUNNING, base.__name__
+    # Non-mode keywords survive the rebake (concat layout must not be lost).
+    concat_base, _ = _ops_call_sites()[3]
+    concat = _RUNNING_TWINS[concat_base]
+    assert concat.matmul_fwd_fn.keywords["concat_layout"] == ("B", "bias")
+
+
+@pytest.mark.parametrize(
+    "base,static_ops",
+    _ops_call_sites(),
+    ids=[base.__name__ for base, _ in _ops_call_sites()],
+)
+def test_running_ops_selection_traces_fullgraph(base, static_ops):
+    """The RUNNING selection itself must trace: nothing left to build in _ops_for.
+
+    With a lazily built twin, the first-ever RUNNING call dies at trace time
+    (Unsupported: mappingproxy.items) under fullgraph=True. Drives _ops_for
+    directly: the GEMMs behind the bundles have no CPU kernels, so the compiled
+    body only exercises the selection, and backend="eager" keeps the check on
+    tracing rather than codegen.
+    """
+    from DLKernel.linear import _ops_for
+
+    def body(x):
+        ops = _ops_for(TuneMode.RUNNING, base, static_ops)
+        return x * 2 if ops is not None else x
+
+    x = torch.randn(4, 4)
+    out = torch.compile(body, fullgraph=True, backend="eager")(x)
+    torch.testing.assert_close(out, x * 2)
+
+
+def test_ops_for_source_has_no_twin_builder_call():
+    """_ops_for is a pure selector: its body never calls the twin builder.
+
+    Ordering-independent guard for the regression above: a lazily built twin
+    only graph-breaks on the FIRST RUNNING call, so a dynamo repro can be
+    silently blinded by an earlier eager RUNNING call in the same process.
+    """
+    import DLKernel.linear as linear_module
+
+    assert "_mode_twin" not in inspect.getsource(linear_module._ops_for)

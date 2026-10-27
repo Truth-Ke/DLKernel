@@ -158,12 +158,13 @@ from __future__ import annotations
 import hashlib
 import inspect
 import sys
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
-
-import cutlass.cute as cute
+from cutlass import cute
 
 from DLKernel.cute_dsl_utils import get_device_capacity, mlir_namedtuple, torch2cute_dtype_map
+from DLKernel.epilogue.legality import validate_sink_config
+from DLKernel.epilogue.math import F2, F16Lanes, Pair, pack, unpack  # noqa: F401  (re-exports)
 from DLKernel.epilogue.ops import (
     ColVecLoad,
     EpiOp,
@@ -174,29 +175,30 @@ from DLKernel.epilogue.ops import (
     VecLoad,
     VecReduce,
 )
-from DLKernel.epilogue.legality import validate_sink_config
-from DLKernel.epilogue.math import F2, F16Lanes, Pair, pack, unpack  # noqa: F401  (re-exports)
 from DLKernel.epilogue.visit import _EpiModMixinBase
+from DLKernel.gemm_base import GemmBase
+from DLKernel.gemm_config import (
+    SplitKMode,
+    TuneMode,
+    blockscaled_default_config,
+    cta_tile_shape_m,
+    default_config,
+)
 from DLKernel.gemm_runtime.host import (
     GemmEpiPlan,
     build_gemm_epi_plan,
     run_gemm_epi_plan,
 )
 from DLKernel.gemm_runtime.identity import (
-    GemmClassRef,
     TORCH_OP_EPI_MODS,
-    function_semantic_key as _function_semantic_key,
+    GemmClassRef,
     module_locator,
     register_local_epi_mod,
 )
-from DLKernel.gemm_config import (
-    SplitKMode,
-    blockscaled_default_config,
-    cta_tile_shape_m,
-    default_config,
+from DLKernel.gemm_runtime.identity import (
+    function_semantic_key as _function_semantic_key,
 )
 from DLKernel.gemm_tvm_ffi_utils import tensor_key
-from DLKernel.gemm_base import GemmBase
 from DLKernel.rounding import RoundingMode
 
 _EPI_MODES = {"element", "acc_pair", "packed_cd_b16x2"}
@@ -486,7 +488,7 @@ class EpiMod:
             semantic_digest=self.semantic_digest,
         )
 
-    def _bind_gemm_class(self, gemm_cls: type) -> "EpiMod":
+    def _bind_gemm_class(self, gemm_cls: type) -> EpiMod:
         """This declaration bound to the Gemm class ``gemm_cls`` (the body of
         ``GemmBase.bind_epilogue``). Fails fast on a non-class argument.
 
@@ -580,8 +582,8 @@ class EpiMod:
         # Split-K (SERIAL/PARALLEL) per-tile flag + partials workspace; None (and
         # constexpr'd away) for split_k == 1 compiles. Mirrors GemmDefaultEpilogue.
         arg_specs += [
-            ("split_k_semaphore", Optional[cute.Tensor]),
-            ("split_k_workspace", Optional[cute.Tensor]),
+            ("split_k_semaphore", cute.Tensor | None),
+            ("split_k_workspace", cute.Tensor | None),
         ]
         Args = NamedTuple("EpilogueArguments", arg_specs)
         Args.__new__.__defaults__ = (None,) * len(arg_specs)
@@ -634,8 +636,8 @@ class EpiMod:
                 "_epi_mod_rounding": rounding,
                 "_epi_mod_vectorize": self.vectorize,
                 "_extra_param_fields": (
-                    ("split_k_semaphore", Optional[cute.Tensor], None),
-                    ("split_k_workspace", Optional[cute.Tensor], None),
+                    ("split_k_semaphore", cute.Tensor | None, None),
+                    ("split_k_workspace", cute.Tensor | None, None),
                 ),
                 "_epi_mod_class_semantic_key": class_semantic_key,
                 "EpilogueArguments": Args,
@@ -649,13 +651,13 @@ class EpiMod:
         self._minted[key] = cls
         return cls
 
-    def gemm_tuned(self, A, B, D, C=None, *, epi_args: dict, b_kn: bool = False):
+    def gemm_tuned(self, A, B, D, C=None, *, epi_args: dict, b_kn: bool = False, tune_mode=None):
         """Autotuned gemm(): config-space sweep via DLKernel.gemm_runtime.autotune (lazy
         import — this module sits below gemm_config in the import graph).
         Returns TunedModGemm(plan, config, sinks); see tuned_mod_gemm."""
         from DLKernel.gemm_runtime.autotune import tuned_mod_gemm
 
-        return tuned_mod_gemm(self, A, B, D, C, epi_args=epi_args, b_kn=b_kn)
+        return tuned_mod_gemm(self, A, B, D, C, epi_args=epi_args, b_kn=b_kn, tune_mode=tune_mode)
 
     def gemm(
         self,
@@ -669,7 +671,7 @@ class EpiMod:
         tile_N: int = 256,
         cluster_M: int = 2,
         cluster_N: int = 1,
-        tile_K: Optional[int] = None,
+        tile_K: int | None = None,
         pingpong: bool = False,
         persistent: bool = True,
         is_dynamic_persistent: bool = False,
@@ -1377,8 +1379,8 @@ class EpiMod:
         out=None,  # {name: buffer} incl. "D"; missing entries are allocated
         out_dtype=None,
         store_d=True,
-        config=None,  # explicit GemmConfig pins; None + tuned=True autotunes
-        tuned=True,
+        config=None,  # explicit GemmConfig pins; None + non-STATIC tune_mode autotunes
+        tune_mode: TuneMode = TuneMode.TUNED,
         dynamic_scheduler=False,
         cu_seqlens_m=None,
         A_idx=None,
@@ -1478,7 +1480,7 @@ class EpiMod:
                 out_dtype=out_dtype,
                 store_d=store_d,
                 config=config,
-                tuned=tuned,
+                tune_mode=tune_mode,
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,
                 SFA=SFA,
@@ -1521,7 +1523,7 @@ class EpiMod:
                 # constants in practice; a recreated equal config just
                 # re-records (correct, one extra cold pass).
                 None if config is None else id(config),
-                tuned,
+                tune_mode,
                 dynamic_scheduler,
                 tensor_key(cu_seqlens_m),
                 tensor_key(A_idx),
@@ -1586,8 +1588,14 @@ class EpiMod:
         lead = self._lead_shape(A, cu_seqlens_m, A_idx)
         n = B.shape[-1] if n_override is None else n_override
         use_tuner = (
-            tuned
-            and config is None
+            # STATIC goes through the tuner too (plan v4 §1: a W hit uses the
+            # measured winner for every mode); a miss resolves via the -1
+            # delegation to the low-level gemm — never a sweep, never a loop.
+            # The delegation honors config-shaped sinks: the analytical
+            # ranker's config (or, when the family is uncovered, the mod's
+            # default config) gets the worst-case buffers sliced to it and
+            # TunedModGemm.sinks hands the views back.
+            config is None
             and rounding_mode == RoundingMode.RN
             and epi_key_overrides is None
             and not add_to_output  # the reduce-add D mint is not swept
@@ -1636,33 +1644,34 @@ class EpiMod:
                 transform_a=transform_a,
                 transform_sf=transform_sf,
                 transform_operands=transform_operands,
+                tune_mode=tune_mode,
             )
             sink_bufs = {name: res.sinks[name] for name in owned_sinks}
             cfg_used, plan_used = res.config, res.plan
         else:
-            ctx = dict(
-                A=A,
-                B_d=B_d,
-                C=C,
-                D=D,
-                out=out,
-                operands=dict(operands),
-                n=n,
-                lead=lead,
-                b_kn=b_kn,
-                cu_seqlens_m=cu_seqlens_m,
-                A_idx=A_idx,
-                SFA=SFA,
-                SFB=SFB,
-                bs_format_a=bs_format_a,
-                bs_format_b=bs_format_b,
-                rounding_mode=rounding_mode,
-                epi_key_overrides=epi_key_overrides,
-                concat_layout=concat_layout,
-                transform_a=transform_a,
-                transform_sf=transform_sf,
-                add_to_output=add_to_output,
-            )
+            ctx = {
+                "A": A,
+                "B_d": B_d,
+                "C": C,
+                "D": D,
+                "out": out,
+                "operands": dict(operands),
+                "n": n,
+                "lead": lead,
+                "b_kn": b_kn,
+                "cu_seqlens_m": cu_seqlens_m,
+                "A_idx": A_idx,
+                "SFA": SFA,
+                "SFB": SFB,
+                "bs_format_a": bs_format_a,
+                "bs_format_b": bs_format_b,
+                "rounding_mode": rounding_mode,
+                "epi_key_overrides": epi_key_overrides,
+                "concat_layout": concat_layout,
+                "transform_a": transform_a,
+                "transform_sf": transform_sf,
+                "add_to_output": add_to_output,
+            }
             if config is not None:
                 cfg = config
             elif SFA is not None:
@@ -1670,14 +1679,24 @@ class EpiMod:
                     A.shape[-2], n, device_capacity=get_device_capacity(A.device)[0]
                 )
             else:
-                cfg = self._default_config(A, B, transform_a)
+                # TuneMode fallback / STATIC miss: the analytical ranker first
+                # (mirrors gemm_interface's config=None chain — SM90 varlen
+                # only; gather/dense stay uncovered), then the mod default.
+                cfg = None
+                if A_idx is None and get_device_capacity(A.device)[0] == 9:
+                    from DLKernel import gemm_heuristic as _gemm_heuristic
+
+                    _desc = _gemm_heuristic.desc_from_call(A, B, D, cu_seqlens_m, None)
+                    cfg = _gemm_heuristic.rank(_desc, _gemm_heuristic.sm90_candidates(_desc))
+                if cfg is None:
+                    cfg = self._default_config(A, B, transform_a)
             if needs_transform_operands:
                 # tile_K None resolves inside bundle() to the 16-bit kernel
                 # default, mirrored by fake_bundle at trace.
                 ctx["A_bundle"] = transform_a.bundle(A, transform_operands, cfg.tile_m, cfg.tile_k)
             _, _, plan_used, sink_bufs = self._iface_execute(cfg, dynamic_scheduler, ctx)
             cfg_used = cfg
-        if ck is not None:
+        if ck is not None and cfg_used is not None:
             # Record the launch recipe for identical-metadata replays. Sink
             # shapes come from the winning config's buffers (tuned sweeps
             # allocate worst-case; the recipe stores the exact live shape).
@@ -1759,29 +1778,29 @@ class EpiMod:
                         "runtime operands: pass transform_operands={name: tensor}"
                     )
                 A_bundle = transform_a.bundle(A, transform_operands, cfg.tile_m, cfg.tile_k)
-        ctx = dict(
-            A=A,
-            A_bundle=A_bundle,
-            B_d=B_d,
-            C=C,
-            D=D,
-            out=out,
-            operands=dict(operands),
-            n=n,
-            lead=self._lead_shape(A, cu_seqlens_m, A_idx),
-            b_kn=b_kn,
-            cu_seqlens_m=cu_seqlens_m,
-            A_idx=A_idx,
-            SFA=SFA,
-            SFB=SFB,
-            bs_format_a=bs_format_a,
-            bs_format_b=bs_format_b,
-            rounding_mode=rounding_mode,
-            epi_key_overrides=epi_key_overrides,
-            transform_a=transform_a,
-            transform_sf=transform_sf,
-            add_to_output=add_to_output,
-        )
+        ctx = {
+            "A": A,
+            "A_bundle": A_bundle,
+            "B_d": B_d,
+            "C": C,
+            "D": D,
+            "out": out,
+            "operands": dict(operands),
+            "n": n,
+            "lead": self._lead_shape(A, cu_seqlens_m, A_idx),
+            "b_kn": b_kn,
+            "cu_seqlens_m": cu_seqlens_m,
+            "A_idx": A_idx,
+            "SFA": SFA,
+            "SFB": SFB,
+            "bs_format_a": bs_format_a,
+            "bs_format_b": bs_format_b,
+            "rounding_mode": rounding_mode,
+            "epi_key_overrides": epi_key_overrides,
+            "transform_a": transform_a,
+            "transform_sf": transform_sf,
+            "add_to_output": add_to_output,
+        }
         _, _, gemm_plan, sink_bufs = self._iface_execute(cfg, dyn, ctx, _launch=False)
         return EpiPlan(
             gemm_plan=gemm_plan,
@@ -1881,7 +1900,7 @@ class EpiPlan:
     the metadata plan() saw; that promise is the caller's (an interface layer
     holding this plan keys for it)."""
 
-    __slots__ = ("gemm_plan", "config", "out_names", "b_kn", "scratch", "swapped")
+    __slots__ = ("b_kn", "config", "gemm_plan", "out_names", "scratch", "swapped")
 
     def __init__(self, *, gemm_plan, config, out_names, b_kn, scratch, swapped=False):
         self.gemm_plan = gemm_plan

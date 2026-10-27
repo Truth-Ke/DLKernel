@@ -9,6 +9,7 @@ import torch
 from DLKernel.epilogue.ops import ColVecReduce, RowVecReduce
 from DLKernel.gemm_config import GemmConfig
 from DLKernel.epilogue.frontend import gemm_epilogue
+from DLKernel import TuneMode
 
 torch.manual_seed(0)
 
@@ -166,9 +167,11 @@ def test_batched_3d():
     torch.testing.assert_close(res["D"].float(), ref, atol=2e-2, rtol=2e-2)
 
 
-def test_eager_tuned_smoke():
-    """tuned=True rides DLKernel.gemm_runtime.autotune (sweep once per metadata class,
+def test_eager_tuned_smoke(tmp_path, monkeypatch):
+    """tune_mode=TuneMode.TUNED rides DLKernel.gemm_runtime.autotune (sweep once per metadata class,
     warm replay after); numerics must match the pinned-config call."""
+    # TUNED sweeps persist winners; keep them inside pytest's tmp_path.
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     A, B = _inputs(m=256, n=512, k=256)
     bias = torch.randn(1, B.shape[-1], device="cuda", dtype=torch.float32)
     res = _bias_double(A, B, bias=bias)  # tuned

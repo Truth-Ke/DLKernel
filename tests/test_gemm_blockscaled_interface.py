@@ -25,6 +25,7 @@ from DLKernel.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
 from DLKernel.blockscaled.utils import blockscaled_quantize, scale_blocked_for_cublas
 from DLKernel.blockscaled.utils import blockscaled_quantize_dim0
 from DLKernel.gemm_base import GemmBase
+from DLKernel import TuneMode
 from DLKernel.gemm_interface import (
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
@@ -79,7 +80,7 @@ def test_blockscaled_gemm(fmt, batched, shape_mnk):
     _skip_if_not_sm100()
     m, n, k = shape_mnk
     A, B = _quantized_operands(fmt, m, n, k, batched)
-    out = gemm(A, B, tuned=False)
+    out = gemm(A, B, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(A, B)
     expected_shape = (2, m, n) if batched else (m, n)
     assert out.shape == expected_shape and out.dtype == torch.bfloat16
@@ -92,7 +93,7 @@ def test_blockscaled_gemm_out_dtype(out_dtype):
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
-    out = gemm(A, B, out_dtype=out_dtype, tuned=False)
+    out = gemm(A, B, out_dtype=out_dtype, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(A, B, out_dtype=out_dtype)
     assert out.dtype == out_dtype
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
@@ -106,7 +107,7 @@ def test_blockscaled_gemm_alpha_and_preallocated_out():
     A, B = _quantized_operands("nvfp4", m, n, k, batched=False)
     alpha = 0.125
     out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-    ret = gemm(A, B, out=out, alpha=alpha, tuned=False)
+    ret = gemm(A, B, out=out, alpha=alpha, tune_mode=TuneMode.STATIC)
     assert ret is out
     ref = gemm_blockscaled_ref(A, B, alpha=alpha)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
@@ -118,14 +119,14 @@ def test_blockscaled_gemm_sf_slice():
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
-    out_ref = gemm(A, B, tuned=False)
+    out_ref = gemm(A, B, tune_mode=TuneMode.STATIC)
     # SFA living inside a larger buffer (extra rk columns), sliced back out
     sfa = A.scale
     rm, rk = sfa.shape[0], sfa.shape[1]
     big = torch.zeros(rm, rk + 3, 32, 4, 4, device="cuda", dtype=sfa.dtype)
     big[:, :rk] = sfa
     A_slice = BlockScaledOperand.from_parts(A.qdata, big[:, :rk], A.format)
-    out_slice = gemm(A_slice, B, tuned=False)
+    out_slice = gemm(A_slice, B, tune_mode=TuneMode.STATIC)
     assert torch.equal(out_ref, out_slice)
 
 
@@ -151,7 +152,7 @@ def test_blockscaled_gemm_major_modes(a_major, b_major):
         bq = bq.contiguous()  # (k, n) with N contiguous -> (n, k) n-major after .mT
         assert bq.stride() == (n, 1)
         B = BlockScaledOperand.from_parts(bq, B.scale, B.format, quant_dim=-2)
-    out = gemm(A, B, tuned=False)
+    out = gemm(A, B, tune_mode=TuneMode.STATIC)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"A={a_major}-major B={b_major}-major: rel_err={rel}"
 
@@ -184,7 +185,7 @@ def test_blockscaled_gemm_varlen_m(seqlens_m, fmt):
     B = qb.permute(2, 1, 0)  # (n, k[/2], L) -> (L, K[/2], N) with K contiguous
     A_op = BlockScaledOperand.from_parts(qa, SFA, fmt)
     B_op = BlockScaledOperand.from_parts(B, SFB, fmt, quant_dim=-2)
-    out = gemm(A_op, B_op, cu_seqlens_m=cu_seqlens_m, tuned=False)
+    out = gemm(A_op, B_op, cu_seqlens_m=cu_seqlens_m, tune_mode=TuneMode.STATIC)
 
     cu = cu_seqlens_m.tolist()
     ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
@@ -211,7 +212,7 @@ def test_blockscaled_gemm_varlen_k(seqlens_k):
     # the (total_k, n) row-major view and gemm_tuned's .mT restores n-major.
     A_op = BlockScaledOperand.from_parts(qa, SFA, "mxfp8")
     B_op = BlockScaledOperand.from_parts(qb.t(), SFB, "mxfp8", quant_dim=-2)
-    out = gemm(A_op, B_op, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    out = gemm(A_op, B_op, cu_seqlens_k=cu_seqlens_k, tune_mode=TuneMode.STATIC)
     assert out.shape == (num_experts, m, n)
 
     ref = torch.stack([a_ref_list[i] @ b_ref_list[i].T for i in range(num_experts)])
@@ -224,7 +225,7 @@ def test_blockscaled_gemm_vs_cublas():
     _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
-    out = gemm(A, B, tuned=False)
+    out = gemm(A, B, tune_mode=TuneMode.STATIC)
     sfa_flat = scale_blocked_for_cublas(A.scale.unsqueeze(0), m, k // 32)
     sfw_flat = scale_blocked_for_cublas(B.scale.unsqueeze(0), n, k // 32)
     out_cublas = torch._scaled_mm(
@@ -249,7 +250,7 @@ def test_blockscaled_gemm_bad_sf_layout_rejected():
         BlockScaledOperand.from_parts(A.qdata, A.scale.flatten(-3), A.format)
     # SF on only one operand must be rejected
     with pytest.raises(AssertionError, match="both"):
-        gemm(A, B.qdata, tuned=False)
+        gemm(A, B.qdata, tune_mode=TuneMode.STATIC)
 
 
 def test_blockscaled_gemm_torch_compile():
@@ -257,13 +258,13 @@ def test_blockscaled_gemm_torch_compile():
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
-    ref = gemm(A, B, tuned=False)
+    ref = gemm(A, B, tune_mode=TuneMode.STATIC)
 
     @torch.compile(dynamic=False, fullgraph=True)
     def f(qa, sfa, b, sfw):
         a_op = BlockScaledOperand.from_parts(qa, sfa, "mxfp8_e4m3")
         b_op = BlockScaledOperand.from_parts(b, sfw, "mxfp8_e4m3", quant_dim=-2)
-        return gemm(a_op, b_op, tuned=False)
+        return gemm(a_op, b_op, tune_mode=TuneMode.STATIC)
 
     out = f(A.qdata, A.scale, B.qdata, B.scale)
     assert torch.equal(out, ref)
@@ -288,12 +289,12 @@ def test_blockscaled_gemm_add(fmt, batched):
         assert err <= 2 * ulp, f"{fmt} {what} batched={batched}: max_err={err} > 2*ulp={2 * ulp}"
 
     alpha, beta = 0.5, 2.0
-    out = gemm_add(A, B, C, alpha=alpha, beta=beta, tuned=False)
+    out = gemm_add(A, B, C, alpha=alpha, beta=beta, tune_mode=TuneMode.STATIC)
     ref = (alpha * ref_mm + beta * C.float()).to(torch.bfloat16)
     _max_err_within_2ulp(out, ref, "gemm_add")
     # In-place accumulate (add_to_output path, beta=1)
     acc = C.clone()
-    gemm_add_inplace(A, B, acc, tuned=False)
+    gemm_add_inplace(A, B, acc, tune_mode=TuneMode.STATIC)
     ref2 = (ref_mm + C.float()).to(torch.bfloat16)
     _max_err_within_2ulp(acc, ref2, "gemm_add_inplace")
 
@@ -306,7 +307,9 @@ def test_blockscaled_gemm_with_activation(fmt, activation):
     m, n, k = 512, 512, 512
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
-    preact, postact = GemmBase.gemm_with_activation(A, B, activation=activation, tuned=False)
+    preact, postact = GemmBase.gemm_with_activation(
+        A, B, activation=activation, tune_mode=TuneMode.STATIC
+    )
     assert preact.dtype == torch.bfloat16 and postact.dtype == torch.bfloat16
     if activation == "swiglu":
         gate, up = ref_mm[..., ::2], ref_mm[..., 1::2]
@@ -334,7 +337,7 @@ def test_blockscaled_gemm_with_activation_bias_no_preact():
     bias = torch.randn(n, dtype=torch.float32, device="cuda")
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
     preact, postact = GemmBase.gemm_with_activation(
-        A, B, bias=bias, activation="relu", store_preact=False, tuned=False
+        A, B, bias=bias, activation="relu", store_preact=False, tune_mode=TuneMode.STATIC
     )
     assert preact is None
     ref_post = F.relu(ref_mm + bias).to(torch.bfloat16)
@@ -354,7 +357,7 @@ def test_blockscaled_gemm_with_activation_grad(fmt, activation):
     preact = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
     dout_ref = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
     dx, postact = GemmBase.gemm_with_activation_grad(
-        A, B, preact, activation=activation, tuned=False
+        A, B, preact, activation=activation, tune_mode=TuneMode.STATIC
     )
     assert dx.dtype == torch.bfloat16 and postact.dtype == torch.bfloat16
     assert dx.shape == (m, n) and postact.shape == (m, n)
@@ -385,7 +388,7 @@ def test_blockscaled_gemm_with_activation_grad_gated(fmt, scale_reduce):
         activation=activation,
         colvec_scale=colvec_scale,
         colvec_reduce=scale_reduce,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     assert dx.shape == (m, 2 * n) and postact.shape == (m, n)
     gate = preact.float()[..., ::2].requires_grad_(True)
@@ -415,7 +418,7 @@ def test_blockscaled_gemm_rms(fmt):
     norm_weight = torch.randn(n, device="cuda", dtype=torch.bfloat16)
     premult_out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
     out, rstd = gemm_rms(
-        A, B, norm_weight=norm_weight, premult_out=premult_out, eps=eps, tuned=False
+        A, B, norm_weight=norm_weight, premult_out=premult_out, eps=eps, tune_mode=TuneMode.STATIC
     )
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
     rstd_ref = torch.rsqrt(ref_mm.square().mean(dim=-1) + eps)
@@ -435,7 +438,7 @@ def test_blockscaled_gemm_norm_act(fmt, activation):
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
     rstd = torch.rand(m, device="cuda", dtype=torch.float32) + 0.5
     preact, postact = gemm_norm_act(
-        A, B, rstd=rstd, activation=activation, store_preact=True, tuned=False
+        A, B, rstd=rstd, activation=activation, store_preact=True, tune_mode=TuneMode.STATIC
     )
     ref_mm = gemm_blockscaled_ref(A, B, out_dtype=torch.float32)
     pre_ref = ref_mm * rstd[:, None]
@@ -476,7 +479,7 @@ def test_blockscaled_gemm_rms_norm_act_per_tensor_scale():
 
     def frms(a, b):
         premult = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-        out, rstd = gemm_rms(a, b, premult_out=premult, eps=eps, tuned=False)
+        out, rstd = gemm_rms(a, b, premult_out=premult, eps=eps, tune_mode=TuneMode.STATIC)
         return out, rstd, premult
 
     for fn in (frms, torch.compile(frms, dynamic=False, fullgraph=True)):
@@ -491,7 +494,12 @@ def test_blockscaled_gemm_rms_norm_act_per_tensor_scale():
 
     def fna(a, b):
         return gemm_norm_act(
-            a, b, rstd=rstd_in, activation="gelu_tanh_approx", store_preact=True, tuned=False
+            a,
+            b,
+            rstd=rstd_in,
+            activation="gelu_tanh_approx",
+            store_preact=True,
+            tune_mode=TuneMode.STATIC,
         )
 
     for fn in (fna, torch.compile(fna, dynamic=False, fullgraph=True)):
@@ -554,7 +562,7 @@ def test_blockscaled_gemm_tuned(fmt):
     _skip_if_not_sm100()
     m, n, k = 512, 512, 512
     A, B = _quantized_operands(fmt, m, n, k, batched=False)
-    out = gemm(A, B, tuned=True)
+    out = gemm(A, B, tune_mode=TuneMode.TUNED)
     ref = gemm_blockscaled_ref(A, B)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"{fmt} tuned: rel_err={rel}"
@@ -576,7 +584,7 @@ def test_blockscaled_gemm_training_orientations():
     dY = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
 
     def check(A, B, truth, label, quant_tol):
-        out = gemm(A, B, tuned=False)
+        out = gemm(A, B, tune_mode=TuneMode.STATIC)
         ref = gemm_blockscaled_ref(A, B)  # exact dequant reference
         rel_kernel = (out.float() - ref.float()).abs().max() / ref.float().abs().max()
         assert rel_kernel < 5e-3, f"{label}: kernel vs dequant-ref rel={rel_kernel}"
@@ -607,11 +615,11 @@ def test_tuple_operand_rejected():
     m, n, k = 256, 256, 256
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
     with pytest.raises(TypeError, match="BlockScaledOperand"):
-        gemm((A.qdata, A.scale), (B.qdata, B.scale), tuned=False)
+        gemm((A.qdata, A.scale), (B.qdata, B.scale), tune_mode=TuneMode.STATIC)
     with pytest.raises(TypeError, match="no longer accepted"):
-        gemm(A, [B.qdata, B.scale], tuned=False)
+        gemm(A, [B.qdata, B.scale], tune_mode=TuneMode.STATIC)
     with pytest.raises(TypeError, match="no longer accepted"):
-        gemm_add((A.qdata, A.scale), B, torch.zeros(m, n, device="cuda"), tuned=False)
+        gemm_add((A.qdata, A.scale), B, torch.zeros(m, n, device="cuda"), tune_mode=TuneMode.STATIC)
 
 
 def test_nvfp4_per_tensor_scale_folding():
@@ -632,7 +640,7 @@ def test_nvfp4_per_tensor_scale_folding():
         w, "nvfp4", per_tensor_scale=nvfp4_per_tensor_scale(w.float().abs().amax())
     )
     assert xq.per_tensor_scale is not None and xq.per_tensor_scale.item() != 1.0
-    out = gemm(xq, wq.mT, tuned=False)
+    out = gemm(xq, wq.mT, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(xq, wq.mT)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"per-tensor-scale folding: rel_err={rel}"
@@ -641,7 +649,7 @@ def test_nvfp4_per_tensor_scale_folding():
     rel_hp = (out.float() - hp).abs().max().item() / hp.abs().max().item()
     assert rel_hp < 0.2, f"per-tensor scales appear dropped: rel_err vs hp = {rel_hp}"
     # Explicit alpha composes multiplicatively with the folded per-tensor scales.
-    out_a = gemm(xq, wq.mT, alpha=0.5, tuned=False)
+    out_a = gemm(xq, wq.mT, alpha=0.5, tune_mode=TuneMode.STATIC)
     ref_a = gemm_blockscaled_ref(xq, wq.mT, alpha=0.5)
     rel_a = (out_a.float() - ref_a.float()).abs().max().item() / ref_a.float().abs().max().item()
     assert rel_a < 5e-3, f"per-tensor-scale+alpha: rel_err={rel_a}"
@@ -658,19 +666,23 @@ def test_square_weight_orientation():
     w = torch.randn(k, k, device="cuda", dtype=torch.bfloat16) * k**-0.5
     xq = BlockScaledOperand.quantize(x, "mxfp8_e4m3")
     wq = BlockScaledOperand.quantize(w, "mxfp8_e4m3")
-    out = gemm(xq, wq.mT, tuned=False)
+    out = gemm(xq, wq.mT, tune_mode=TuneMode.STATIC)
     ref = xq.dequantize(torch.float32) @ wq.dequantize(torch.float32).T
     rel = (out.float() - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 5e-3, f"square-weight orientation: rel_err={rel}"
     # forgetting the .mT: B arrives quantized along its last dim (not K) -> rejected
     with pytest.raises(ValueError, match="B must be quantized along dim -2"):
-        gemm(xq, wq, tuned=False)
+        gemm(xq, wq, tune_mode=TuneMode.STATIC)
     # stray transpose on A: quantized along dim -2 (not K) -> rejected
     with pytest.raises(ValueError, match="A must be quantized along its last dim"):
-        gemm(BlockScaledOperand.quantize(x.mT.contiguous(), "mxfp8_e4m3").mT, wq.mT, tuned=False)
+        gemm(
+            BlockScaledOperand.quantize(x.mT.contiguous(), "mxfp8_e4m3").mT,
+            wq.mT,
+            tune_mode=TuneMode.STATIC,
+        )
     # quantize(dim=-2) builds the (K, N) B operand directly
     b_direct = BlockScaledOperand.quantize(w, "mxfp8_e4m3", dim=-2)
-    out2 = gemm(xq, b_direct, tuned=False)
+    out2 = gemm(xq, b_direct, tune_mode=TuneMode.STATIC)
     ref2 = xq.dequantize(torch.float32) @ b_direct.dequantize(torch.float32)
     rel2 = (out2.float() - ref2).abs().max().item() / ref2.abs().max().item()
     assert rel2 < 5e-3, f"quantize(dim=-2) B operand: rel_err={rel2}"
@@ -683,10 +695,10 @@ def test_uint8_scale_view_construction():
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("nvfp4", m, n, k, batched=False)
-    ref = gemm(A, B, tuned=False)
+    ref = gemm(A, B, tune_mode=TuneMode.STATIC)
     A_u8 = BlockScaledOperand.from_parts(A.qdata, A.scale.view(torch.uint8), "nvfp4")
     assert A_u8.scale.dtype == torch.float8_e4m3fn  # canonicalized at construction
-    out = gemm(A_u8, B, tuned=False)
+    out = gemm(A_u8, B, tune_mode=TuneMode.STATIC)
     assert torch.equal(out, ref)
 
 
@@ -742,7 +754,7 @@ def test_blockscaled_gemm_mixed(fmt_pair):
     m, n, k = 256, 512, 512
     A = _mixed_operand(fmt_a, m, k, seed=0)
     W = _mixed_operand(fmt_b, n, k, seed=1)
-    out = gemm(A, W.mT, tuned=False)
+    out = gemm(A, W.mT, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(A, W.mT)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"{fmt_a} x {fmt_b}: rel_err={rel}"
@@ -769,7 +781,7 @@ def test_mixed_unpack_alignment_rejected(unpack_side, unpack_fmt, offset_bytes, 
     # Populate the pointer-agnostic plan cache before the offset-only case. The
     # compiled argument signature must still reject the misaligned replacement.
     if row_pad_bytes == 0:
-        gemm(A, W.mT, tuned=False)
+        gemm(A, W.mT, tune_mode=TuneMode.STATIC)
         torch.cuda.synchronize()
     if unpack_side == "a":
         A = _relayout_packed_operand(A, offset_bytes, row_pad_bytes)
@@ -781,7 +793,7 @@ def test_mixed_unpack_alignment_rejected(unpack_side, unpack_fmt, offset_bytes, 
         assert unpack_qdata.stride(0) == 272
 
     with pytest.raises(ValueError) as exc_info:
-        gemm(A, W.mT, tuned=False)
+        gemm(A, W.mT, tune_mode=TuneMode.STATIC)
     assert "32" in str(exc_info.value)
     assert "cudaError" not in str(exc_info.value)
     torch.cuda.synchronize()
@@ -804,7 +816,7 @@ def test_mixed_unpack_aligned_padded_numeric(unpack_side, unpack_fmt):
     unpack_qdata = A.qdata if unpack_side == "a" else W.qdata
     assert unpack_qdata.data_ptr() % 32 == 0
     assert all(stride == 1 or stride % 32 == 0 for stride in unpack_qdata.stride())
-    out = gemm(A, W.mT, tuned=False)
+    out = gemm(A, W.mT, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(A, W.mT)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"aligned padded {unpack_fmt} on {unpack_side}: rel_err={rel}"
@@ -821,7 +833,7 @@ def test_mixed_fp4_unpack_k_granule_rejected():
     A = _mixed_operand("mxfp4", m, k, seed=0)
     W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
     with pytest.raises((ValueError, AssertionError)):
-        gemm(A, W.mT, tuned=False)
+        gemm(A, W.mT, tune_mode=TuneMode.STATIC)
 
 
 def test_mixed_format_pairs():
@@ -838,9 +850,9 @@ def test_mixed_format_pairs():
     A4, B4 = _quantized_operands("nvfp4", m, n, k, batched=False)
     # nvfp4's mxf4nvf4 kind requires nvfp4 on both operands
     with pytest.raises(ValueError, match="cannot pair"):
-        gemm(A8, B4, tuned=False)
+        gemm(A8, B4, tune_mode=TuneMode.STATIC)
     with pytest.raises(ValueError, match="cannot pair"):
-        gemm(A4, B8, tuned=False)
+        gemm(A4, B8, tune_mode=TuneMode.STATIC)
     # mixed packed-fp4 pairs are legal: pair legality maps to kind::mxf8f6f4
     from DLKernel.blockscaled.operand import (
         MXFP4,
@@ -905,7 +917,7 @@ def test_fp6_k_granule_rejected():
     b6 = BlockScaledOperand.quantize(w, "mxfp6_e3m2_packed")
     assert a6.qdata.shape == (m, 3 * k // 4)  # packed 6-bit storage
     with pytest.raises(AssertionError, match="divisible by 128"):
-        gemm(a6, b6.mT, tuned=False)
+        gemm(a6, b6.mT, tune_mode=TuneMode.STATIC)
 
 
 def test_blockscaled_out_dtype_reserved():
@@ -918,14 +930,14 @@ def test_blockscaled_out_dtype_reserved():
     from DLKernel.blockscaled.operand import MXFP8_E4M3
 
     for out_dtype in (MXFP8_E4M3, "mxfp8_e4m3"):
-        res = gemm(A, B, out_dtype=out_dtype, tuned=False)
+        res = gemm(A, B, out_dtype=out_dtype, tune_mode=TuneMode.STATIC)
         assert isinstance(res, BlockScaledOperand) and res.format.name == "mxfp8_e4m3"
     with pytest.raises(NotImplementedError, match="only supported by DLKernel.gemm"):
         GemmBase.gemm_with_activation(
-            A, B, activation="relu", postact_dtype="mxfp8_e4m3", tuned=False
+            A, B, activation="relu", postact_dtype="mxfp8_e4m3", tune_mode=TuneMode.STATIC
         )
     with pytest.raises(ValueError, match="unknown blockscaled format"):
-        gemm(A, B, out_dtype="fp8", tuned=False)
+        gemm(A, B, out_dtype="fp8", tune_mode=TuneMode.STATIC)
 
 
 def test_e5m2_from_parts_kernel():
@@ -945,7 +957,7 @@ def test_e5m2_from_parts_kernel():
     ).squeeze(0)
     xq = BlockScaledOperand.from_parts(x.to(torch.float8_e5m2), unit_sf(m), "mxfp8_e5m2")
     wq = BlockScaledOperand.from_parts(w.to(torch.float8_e5m2), unit_sf(n), "mxfp8_e5m2")
-    out = gemm(xq, wq.mT, tuned=False)
+    out = gemm(xq, wq.mT, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(xq, wq.mT)
     rel = (out.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
     assert rel < 5e-3, f"e5m2: rel_err={rel}"
@@ -976,7 +988,7 @@ def test_gemm_with_activation_per_tensor_scale_alpha(activation):
 
     def f(a, b):
         return GemmBase.gemm_with_activation(
-            a, b, bias=bias, activation=activation, alpha=alpha, tuned=False
+            a, b, bias=bias, activation=activation, alpha=alpha, tune_mode=TuneMode.STATIC
         )
 
     for fn in (f, torch.compile(f, dynamic=False, fullgraph=True)):
@@ -996,11 +1008,11 @@ def test_blockscaled_gemm_torch_compile_container():
     _skip_if_not_sm100()
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8", m, n, k, batched=False)
-    ref = gemm(A, B, tuned=False)
+    ref = gemm(A, B, tune_mode=TuneMode.STATIC)
 
     @torch.compile(dynamic=False, fullgraph=True)
     def f(a, b):
-        return gemm(a, b, tuned=False)
+        return gemm(a, b, tune_mode=TuneMode.STATIC)
 
     out = f(A, B)
     assert torch.equal(out, ref)
@@ -1017,7 +1029,7 @@ def test_blockscaled_quantize_in_graph():
     def f(x, w):
         xq = BlockScaledOperand.quantize(x, "mxfp8_e4m3")
         wq = BlockScaledOperand.quantize(w, "mxfp8_e4m3")
-        return gemm(xq, wq.mT, tuned=False)
+        return gemm(xq, wq.mT, tune_mode=TuneMode.STATIC)
 
     ref = f(x, w)
     out = torch.compile(f, dynamic=False, fullgraph=True)(x, w)

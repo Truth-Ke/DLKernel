@@ -68,7 +68,7 @@ class EpilogueArguments(NamedTuple):
 
 ### 重建过程
 
-`_namedtuple_new_from_mlir_values(self, values)`（`DLKernel/cute_dsl_utils.py:176`）：
+`_namedtuple_new_from_mlir_values(self, values)`（`DLKernel/cute_dsl_utils.py:239`）：
 
 1. 遍历编译期模板（`self`）的字段；
 2. `None` 与 `StaticTypes`（int、bool、str、Constexpr 等）原样保留；

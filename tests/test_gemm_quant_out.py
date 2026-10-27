@@ -19,6 +19,7 @@ from DLKernel.gemm_interface import gemm
 from DLKernel.blockscaled import BlockScaledFormat, BlockScaledOperand
 from DLKernel.blockscaled.quantize import dequant_operand, unpack_scale_blocked_to_2d
 from DLKernel.cute_dsl_utils import get_compile_target_capacity, get_device_capacity
+from DLKernel import TuneMode
 
 
 if get_device_capacity()[0] not in (10, 11, 12):
@@ -116,7 +117,7 @@ def test_quant_out_exact(fmt, mnk):
     _, _, vec = fmt_props(fmt)
     A = torch.randn(m, k, dtype=torch.bfloat16, device=device)
     B = torch.eye(k, n, dtype=torch.bfloat16, device=device)
-    res = gemm(A, B, out_dtype=fmt, tuned=False)
+    res = gemm(A, B, out_dtype=fmt, tune_mode=TuneMode.STATIC)
     assert isinstance(res, BlockScaledOperand) and res.format.name == fmt
     ref_x = A.float() @ B.float()
     q_ref, sf_ref, scale_ref = quant_ref(ref_x, fmt)
@@ -148,7 +149,7 @@ def test_quant_out_random(fmt, alpha, bias, mnk):
     A = torch.randn(m, k, dtype=torch.bfloat16, device=device) / k**0.25
     B = torch.randn(k, n, dtype=torch.bfloat16, device=device) / k**0.25
     rowvec = torch.randn(n, dtype=torch.bfloat16, device=device) if bias else None
-    res = gemm(A, B, bias=rowvec, alpha=alpha, out_dtype=fmt, tuned=False)
+    res = gemm(A, B, bias=rowvec, alpha=alpha, out_dtype=fmt, tune_mode=TuneMode.STATIC)
 
     ref = alpha * (A.float() @ B.float())
     if bias:
@@ -172,7 +173,7 @@ def test_quant_out_batched():
     l, m, n, k = 2, 256, 256, 128
     A = torch.randn(l, m, k, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(l, k, n, dtype=torch.bfloat16, device="cuda") / k**0.5
-    res = gemm(A, B, out_dtype="mxfp8_e4m3", tuned=False)
+    res = gemm(A, B, out_dtype="mxfp8_e4m3", tune_mode=TuneMode.STATIC)
     out, out_sf = res.qdata, res.scale
     assert out.shape == (l, m, n) and out_sf.shape[0] == l
     vec = 32
@@ -193,7 +194,7 @@ def test_quant_out_nvfp4_per_tensor_scale():
     B = torch.eye(k, n, dtype=torch.bfloat16, device="cuda")
     ref = A.float() @ B.float()
     pts = (ref.abs().max() / (448.0 * 6.0)).item()
-    res = gemm(A, B, out_dtype="nvfp4", out_per_tensor_scale=pts, tuned=False)
+    res = gemm(A, B, out_dtype="nvfp4", out_per_tensor_scale=pts, tune_mode=TuneMode.STATIC)
     assert res.per_tensor_scale is not None and res.per_tensor_scale.item() == pytest.approx(pts)
     q_ref, sf_ref, scale_ref = quant_ref(ref, "nvfp4", norm_const=1.0 / pts)
     sf_2d = unpack_scale_blocked_to_2d(res.scale.unsqueeze(0), m, n // vec)[0]
@@ -212,7 +213,7 @@ def test_quant_out_blockscaled_input():
     B_hp = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") / k**0.5
     opA = BlockScaledOperand.quantize(A_hp, "nvfp4")
     opB = BlockScaledOperand.quantize(B_hp, "nvfp4")
-    res = gemm(opA, opB.mT, out_dtype="nvfp4", tuned=False)
+    res = gemm(opA, opB.mT, out_dtype="nvfp4", tune_mode=TuneMode.STATIC)
 
     a_deq = dequant_operand(opA.qdata) * unpack_scale_blocked_to_2d(
         opA.scale.unsqueeze(0), m, k // 16
@@ -240,7 +241,7 @@ def test_quant_out_blockscaled_input_mx():
     B_hp = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * row_b / k**0.5
     opA = BlockScaledOperand.quantize(A_hp, "mxfp8_e4m3")
     opB = BlockScaledOperand.quantize(B_hp, "mxfp8_e4m3")
-    res = gemm(opA, opB.mT, out_dtype="mxfp8_e4m3", tuned=False)
+    res = gemm(opA, opB.mT, out_dtype="mxfp8_e4m3", tune_mode=TuneMode.STATIC)
 
     a_deq = opA.qdata.float() * unpack_scale_blocked_to_2d(opA.scale.unsqueeze(0), m, k // 32)[
         0
@@ -263,9 +264,9 @@ def test_quant_out_preallocated():
     out = torch.empty(m, n, dtype=torch.float8_e4m3fn, device="cuda")
     out_sf = torch.empty(m // 128, n // 128, 32, 4, 4, dtype=torch.float8_e8m0fnu, device="cuda")
     container = BlockScaledOperand.from_parts(out, out_sf, "mxfp8_e4m3")
-    res = gemm(A, B, out=container, out_dtype="mxfp8_e4m3", tuned=False)
+    res = gemm(A, B, out=container, out_dtype="mxfp8_e4m3", tune_mode=TuneMode.STATIC)
     assert res.qdata is out and res.scale is out_sf
-    ref = gemm(A, B, out_dtype="mxfp8_e4m3", tuned=False)
+    ref = gemm(A, B, out_dtype="mxfp8_e4m3", tune_mode=TuneMode.STATIC)
     assert torch.equal(out.view(torch.uint8), ref.qdata.view(torch.uint8))
     assert torch.equal(out_sf.view(torch.uint8), ref.scale.view(torch.uint8))
 
@@ -280,7 +281,7 @@ def test_quant_out_varlen_k():
     total_k = sum(seqk)
     A = (torch.randn(total_k, m, dtype=torch.bfloat16, device="cuda") / 4).T  # m-major
     B = torch.randn(total_k, n, dtype=torch.bfloat16, device="cuda") / 4  # n-major
-    res = gemm(A, B, out_dtype="mxfp8_e4m3", cu_seqlens_k=cu_k, tuned=False)
+    res = gemm(A, B, out_dtype="mxfp8_e4m3", cu_seqlens_k=cu_k, tune_mode=TuneMode.STATIC)
     out, out_sf = res.qdata, res.scale
     assert out.shape == (L, m, n) and out_sf.shape == (L, 2, 4, 32, 4, 4)
     for b in range(L):
@@ -306,7 +307,7 @@ def test_quant_out_varlen_m(fmt):
     total_m = sum(seqm)
     A = torch.randn(total_m, k, dtype=torch.bfloat16, device="cuda") / 4
     B = torch.randn(L, k, n, dtype=torch.bfloat16, device="cuda") / 4
-    res = gemm(A, B, out_dtype=fmt, cu_seqlens_m=cu_m, tuned=False)
+    res = gemm(A, B, out_dtype=fmt, cu_seqlens_m=cu_m, tune_mode=TuneMode.STATIC)
     out, out_sf = res.qdata, res.scale
     exp_rm = ceil_div(total_m, 128) + (L - 1)
     assert out_sf.shape == (1, exp_rm, ceil_div(n, 4 * vec), 32, 4, 4)
@@ -336,14 +337,16 @@ def test_quant_out_varlen_m_chain():
     k1, n1, n2 = 256, 512, 256
     A = torch.randn(total_m, k1, dtype=torch.bfloat16, device="cuda") / 4
     W1 = torch.randn(L, k1, n1, dtype=torch.bfloat16, device="cuda") / 4
-    x1_op = gemm(A, W1, out_dtype="nvfp4", cu_seqlens_m=cu_m, tuned=False)
+    x1_op = gemm(A, W1, out_dtype="nvfp4", cu_seqlens_m=cu_m, tune_mode=TuneMode.STATIC)
 
     W2 = torch.randn(L, n1, n2, dtype=torch.bfloat16, device="cuda") / 16
     w2_ops = [BlockScaledOperand.quantize(W2[b].t().contiguous(), "nvfp4") for b in range(L)]
     qw2 = torch.stack([op.qdata for op in w2_ops])
     sfw2 = torch.stack([op.scale for op in w2_ops])
     w2_op = BlockScaledOperand.from_parts(qw2, sfw2, "nvfp4")
-    out2 = gemm(x1_op, w2_op.mT, out_dtype=torch.bfloat16, cu_seqlens_m=cu_m, tuned=False)
+    out2 = gemm(
+        x1_op, w2_op.mT, out_dtype=torch.bfloat16, cu_seqlens_m=cu_m, tune_mode=TuneMode.STATIC
+    )
 
     exp_rm = ceil_div(total_m, 128) + (L - 1)
     sf_all = unpack_scale_blocked_to_2d(x1_op.scale, exp_rm * 128, n1 // 16)[0].float()
@@ -387,7 +390,7 @@ def test_quant_out_col_exact():
     _, _, vec = fmt_props(fmt)
     A = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
     B = torch.eye(k, n, dtype=torch.bfloat16, device="cuda")
-    res = gemm(A, B, out_dtype=fmt, out_quant_dim=-2, tuned=False)
+    res = gemm(A, B, out_dtype=fmt, out_quant_dim=-2, tune_mode=TuneMode.STATIC)
     assert res.quant_dim == -2
     ref = A.float() @ B.float()
     sf_ref, scale_ref = col_quant_ref(ref, fmt)
@@ -406,7 +409,7 @@ def test_quant_out_col_random():
     l, m, n, k = 2, 200, 512, 256
     A = torch.randn(l, m, k, dtype=torch.bfloat16, device="cuda") / 4
     B = torch.randn(l, k, n, dtype=torch.bfloat16, device="cuda") / 4
-    res = gemm(A, B, out_dtype="mxfp8_e4m3", out_quant_dim=-2, tuned=False)
+    res = gemm(A, B, out_dtype="mxfp8_e4m3", out_quant_dim=-2, tune_mode=TuneMode.STATIC)
     out, out_sf = res.qdata, res.scale
     assert out_sf.shape == (l, n // 128, 2, 32, 4, 4)
     for li in range(l):
@@ -430,7 +433,9 @@ def test_quant_out_transposed(fmt):
     _, _, vec = fmt_props(fmt)
     A = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
     B = torch.eye(k, n, dtype=torch.bfloat16, device="cuda")
-    res = gemm(A, B, out_dtype=fmt, out_quant_dim=-2, out_transposed=True, tuned=False)
+    res = gemm(
+        A, B, out_dtype=fmt, out_quant_dim=-2, out_transposed=True, tune_mode=TuneMode.STATIC
+    )
     assert isinstance(res, BlockScaledOperand) and res.qdata.shape[0] == n
     ref_t = (A.float() @ B.float()).T.contiguous()  # (n, m)
     q_ref, sf_ref, _ = quant_ref(ref_t, fmt)
@@ -438,7 +443,7 @@ def test_quant_out_transposed(fmt):
     assert torch.equal(sf_2d.view(torch.uint8), sf_ref), "SF bytes mismatch"
     torch.testing.assert_close(out_values(res.qdata), q_ref, rtol=0, atol=0)
     if fmt == "mxfp8_e4m3":
-        res_col = gemm(A, B, out_dtype=fmt, out_quant_dim=-2, tuned=False)
+        res_col = gemm(A, B, out_dtype=fmt, out_quant_dim=-2, tune_mode=TuneMode.STATIC)
         assert torch.equal(res.scale.view(torch.uint8), res_col.scale.view(torch.uint8))
         assert torch.equal(
             res.qdata.view(torch.uint8).T.contiguous(), res_col.qdata.view(torch.uint8)
@@ -473,7 +478,7 @@ def test_quant_out_regression_no_sfd():
     m, n, k = 256, 256, 128
     A = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(k, n, dtype=torch.bfloat16, device="cuda")
-    out = gemm(A, B, tuned=False)
+    out = gemm(A, B, tune_mode=TuneMode.STATIC)
     ref = A.float() @ B.float()
     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
 
@@ -496,9 +501,16 @@ def test_quant_out_stochastic_rounding(fmt):
     B = torch.randn(k, n, dtype=torch.bfloat16, device=device) / k**0.25
 
     def run_rs(seed):
-        return gemm(A, B, out_dtype=fmt, tuned=False, rounding_mode=RoundingMode.RS, sr_seed=seed)
+        return gemm(
+            A,
+            B,
+            out_dtype=fmt,
+            tune_mode=TuneMode.STATIC,
+            rounding_mode=RoundingMode.RS,
+            sr_seed=seed,
+        )
 
-    res_rn = gemm(A, B, out_dtype=fmt, tuned=False)
+    res_rn = gemm(A, B, out_dtype=fmt, tune_mode=TuneMode.STATIC)
     res1, res1b, res2 = run_rs(7), run_rs(7), run_rs(8)
     # The SF/rescale path is rounding-mode invariant: bytes bit-equal to RN.
     assert torch.equal(res1.scale.view(torch.uint8), res_rn.scale.view(torch.uint8))

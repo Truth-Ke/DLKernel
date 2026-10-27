@@ -6,6 +6,7 @@ import torch._dynamo
 
 from DLKernel.mlp import MLP
 from DLKernel.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
+from DLKernel import TuneMode
 
 torch._dynamo.config.cache_size_limit = 64
 
@@ -21,7 +22,12 @@ def test_mlp(in_features, hidden_features, dtype, activation, use_compile):
     torch.random.manual_seed(0)
     batch = 256
     mlp = MLP(
-        in_features, hidden_features, activation=activation, device=device, dtype=dtype, tuned=False
+        in_features,
+        hidden_features,
+        activation=activation,
+        device=device,
+        dtype=dtype,
+        tune_mode=TuneMode.STATIC,
     )
     if gated:
         assert mlp.fc1.out_features == 2 * hidden_features
@@ -58,7 +64,9 @@ def test_mlp_zero_stride_grad(dtype, activation, use_compile):
     device = "cuda"
     gated = activation in gated_to_pytorch_fn_map
     torch.random.manual_seed(0)
-    mlp = MLP(512, 512, activation=activation, device=device, dtype=dtype, tuned=False)
+    mlp = MLP(
+        512, 512, activation=activation, device=device, dtype=dtype, tune_mode=TuneMode.STATIC
+    )
     w1_ref = mlp.fc1.weight.detach().clone().float()
     w2_ref = mlp.fc2.weight.detach().clone().float()
     if use_compile:
@@ -88,7 +96,9 @@ def test_mlp_recompute(dtype, activation, use_compile):
     gated = activation in gated_to_pytorch_fn_map
     torch.random.manual_seed(0)
     batch, dim, hidden = 256, 512, 512
-    mlp = MLP(dim, hidden, activation=activation, device=device, dtype=dtype, tuned=False)
+    mlp = MLP(
+        dim, hidden, activation=activation, device=device, dtype=dtype, tune_mode=TuneMode.STATIC
+    )
     x = torch.randn(batch, dim, device=device, dtype=dtype, requires_grad=True)
     dout = torch.randn(batch, dim, device=device, dtype=dtype)
     # Standard forward/backward
@@ -149,7 +159,7 @@ def test_mlp_recompute_partial_grad(dtype, activation, freeze):
         activation=activation,
         device=device,
         dtype=dtype,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         recompute=True,
     )
     x = torch.randn(batch, dim, device=device, dtype=dtype)
@@ -208,7 +218,7 @@ def test_mlp_concat_layout(dtype, activation, recompute, use_compile):
         activation=activation,
         device=device,
         dtype=dtype,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         recompute=recompute,
         concat_layout=True,
     )
@@ -269,7 +279,7 @@ def test_mlp_concat_layout_bias_fwd(dtype, activation, has_bias1, has_bias2, bia
         bias2=has_bias2,
         device=device,
         dtype=dtype,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         concat_layout=True,
     )
     # Override bias dtype to test both bf16 (Python permute) and fp32 (kernel layout permute)
@@ -310,7 +320,7 @@ def test_mlp_concat_layout_fuse_grad_accum(dtype, activation, recompute):
         activation=activation,
         device=device,
         dtype=dtype,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         recompute=recompute,
         concat_layout=True,
         fuse_grad_accum=True,
@@ -327,7 +337,7 @@ def test_mlp_concat_layout_fuse_grad_accum(dtype, activation, recompute):
         activation=activation,
         device=device,
         dtype=dtype,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         recompute=recompute,
         concat_layout=True,
         fuse_grad_accum=False,

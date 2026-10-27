@@ -75,7 +75,56 @@ def get_device_multiprocessor_count(device_id: int = 0) -> int:
     return cutlass.utils.HardwareInfo(device_id).get_device_multiprocessor_count()
 
 
+# --- SM budget runtime (DeepGEMM DeviceRuntime::set_num_sms semantics) -----
+#
+# A process-wide cap on how many SMs persistent kernels and the analytical
+# heuristic may use.  ``0`` means "the device's full count" (restore-default),
+# exactly like DeepGEMM: get_num_sms() only touches the device property when
+# the override is unset.  Validated against the physical count so a typo
+# cannot silently over/under-subscribe the GPU.
+
+_SM_COUNT_OVERRIDE: int = 0
+
+
+def set_num_sms(num_sms: int) -> None:
+    """Cap the SM budget used by persistent-kernel grids and heuristics.
+
+    ``set_num_sms(0)`` restores the device default.  Values must satisfy
+    ``0 < num_sms <= physical SM count`` otherwise (DeepGEMM asserts the
+    same; note small budgets can leave cluster-2 configs with no legal
+    grid).
+    """
+    global _SM_COUNT_OVERRIDE
+    num_sms = int(num_sms)
+    if num_sms < 0:
+        raise ValueError(f"num_sms must be >= 0, got {num_sms}")
+    if num_sms > 0:
+        if torch.cuda.is_available():
+            physical = get_device_multiprocessor_count(torch.cuda.current_device())
+            if num_sms > physical:
+                raise ValueError(f"num_sms {num_sms} exceeds the device's {physical} SMs")
+        # GPU-blind callers (DLKERNEL_ARCH cross-compile): accept the value
+        # unvalidated; the physical check runs where a device exists.
+    _SM_COUNT_OVERRIDE = num_sms
+
+
+def get_num_sms(device_id: int = 0) -> int:
+    """Effective SM budget: the ``set_num_sms`` override, else the device's."""
+    return _SM_COUNT_OVERRIDE or get_device_multiprocessor_count(device_id)
+
+
 @lru_cache
+def _max_active_clusters_hw(
+    cluster_size: int,
+    device_capacity: Tuple[int, int],
+    device_id: int,
+) -> int:
+    # The expensive driver occupancy query.  Deliberately independent of
+    # _SM_COUNT_OVERRIDE: the override must not be baked into a cached value
+    # (set_num_sms(0) would then never restore the uncapped count).
+    return cutlass.utils.HardwareInfo(device_id).get_max_active_clusters(cluster_size=cluster_size)
+
+
 def get_max_active_clusters(
     cluster_size: int,
     device_capacity: Tuple[int, int] | None = None,
@@ -86,15 +135,21 @@ def get_max_active_clusters(
     if device_capacity[0] < 9:
         if cluster_size != 1:
             raise ValueError("SM8x kernels do not support CTA clusters; cluster_size must be 1")
-        return get_device_multiprocessor_count(device_id)
-    return cutlass.utils.HardwareInfo(device_id).get_max_active_clusters(cluster_size=cluster_size)
+        return min(get_device_multiprocessor_count(device_id), get_num_sms(device_id))
+    hw = _max_active_clusters_hw(cluster_size, device_capacity, device_id)
+    if _SM_COUNT_OVERRIDE:
+        # Cap whole clusters: a partial cluster cannot be scheduled.
+        hw = min(hw, _SM_COUNT_OVERRIDE // cluster_size)
+    return hw
 
 
 def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
     """Parse arch string (e.g. 'sm_90', 'sm90', '90', 'sm_100a') to (major, minor) tuple."""
     match = re.match(r"^(?:sm_?)?(\d+)(\d)([af]?)$", arch_str.strip(), re.IGNORECASE)
     if not match:
-        raise ValueError(f"Invalid DLKERNEL_ARCH format: {arch_str!r} (expected e.g. '90', 'sm_90')")
+        raise ValueError(
+            f"Invalid DLKERNEL_ARCH format: {arch_str!r} (expected e.g. '90', 'sm_90')"
+        )
     major, minor, _ = match.groups()
     return int(major), int(minor)
 
@@ -109,6 +164,16 @@ def _get_device_capacity_cached(device: torch.device = None) -> Tuple[int, int]:
     arch_override = os.environ.get("DLKERNEL_ARCH")
     if arch_override is not None:
         return _parse_arch_str(arch_override)
+    if device is None or device.type in ("cpu", "meta"):
+        # cpu/meta devices (meta tensors through prunes/prefill) have no
+        # capability of their own: the LOCAL card answers, as DeepGEMM's
+        # runtime does.  DLKERNEL_ARCH stays a GPU-less cross-compile escape.
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_capability(torch.cuda.current_device())
+        raise RuntimeError(
+            "DLKernel: no CUDA device visible and DLKERNEL_ARCH is unset -- "
+            "set it (e.g. '90') for CPU-only compilation"
+        )
     return torch.cuda.get_device_capability(device)
 
 

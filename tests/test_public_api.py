@@ -11,6 +11,8 @@ No GPU, no JIT. Three tiers, per the flashinfer house style:
   locks the positional/keyword-only boundary and every default value.
 * Tier 3 — the remaining names (norm, softmax, classes, transforms) are pinned
   for existence only: the Tier-1 ``__all__`` lock already catches removal.
+* Schema lock — every registered ``torch.ops.dlkernel.*`` op whose schema
+  carries ``tune_mode`` defaults it to TUNED (0), same as the Python signs.
 
 Changing a signature on purpose means updating one table row here — the
 flashinfer convention (contract tables are two-line diffs per added param).
@@ -18,11 +20,13 @@ flashinfer convention (contract tables are two-line diffs per added param).
 
 import importlib
 import inspect
+import re
 
 import pytest
 import torch
 
 import DLKernel
+from DLKernel import TuneMode
 from DLKernel.fused_grouped_gemm import interface as _fgg_interface
 from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
 
@@ -30,6 +34,7 @@ _ALL_NAMES = {
     "MLP",
     "RMSNorm",
     "RoundingMode",
+    "TuneMode",
     "LinearCrossEntropy",
     "chunked_linear_cross_entropy",
     "cross_entropy",
@@ -38,6 +43,7 @@ _ALL_NAMES = {
     "gemm",
     "gemm_add",
     "gemm_symmetric",
+    "get_num_sms",
     "gemm_with_activation",
     "gemm_with_activation_grad",
     "hadamard_transform",
@@ -47,6 +53,7 @@ _ALL_NAMES = {
     "moe_down_proj_dact",
     "moe_up_proj_act",
     "rmsnorm",
+    "set_num_sms",
     "softmax",
 }
 
@@ -62,6 +69,9 @@ _OWNERS = {
     "MLP": _mod("mlp"),
     "RMSNorm": _mod("rmsnorm"),
     "RoundingMode": _mod("rounding"),
+    "get_num_sms": _mod("cute_dsl_utils"),
+    "set_num_sms": _mod("cute_dsl_utils"),
+    "TuneMode": _mod("gemm_config"),
     "chunked_linear_cross_entropy": _mod("linear_cross_entropy"),
     "LinearCrossEntropy": _mod("linear_cross_entropy"),
     "cross_entropy": _mod("cross_entropy"),
@@ -100,7 +110,7 @@ _TIER2_PARAMS = {
         "A_idx",
         "batch_idx_permute",
         "dynamic_scheduler",
-        "tuned",
+        "tune_mode",
         "rounding_mode",
         "sr_seed",
         "concat_layout",
@@ -121,7 +131,7 @@ _TIER2_PARAMS = {
         "A_idx",
         "batch_idx_permute",
         "dynamic_scheduler",
-        "tuned",
+        "tune_mode",
         "concat_layout",
         "split_k",
         "split_k_mode",
@@ -141,7 +151,7 @@ _TIER2_PARAMS = {
         "A_idx",
         "store_preact",
         "dynamic_scheduler",
-        "tuned",
+        "tune_mode",
         "config",
         "concat_layout",
         "split_k",
@@ -161,7 +171,7 @@ _TIER2_PARAMS = {
         "cu_seqlens_m",
         "A_idx",
         "dynamic_scheduler",
-        "tuned",
+        "tune_mode",
         "config",
         "split_k",
         "split_k_mode",
@@ -188,7 +198,7 @@ _TIER2_PARAMS = {
         "bs_format_a",
         "bs_format_b",
     ),
-    "linear_func": ("x", "weight", "bias", "fuse_grad_accum", "tuned"),
+    "linear_func": ("x", "weight", "bias", "fuse_grad_accum", "tune_mode"),
     "linear_act_func": (
         "x",
         "weight",
@@ -196,7 +206,7 @@ _TIER2_PARAMS = {
         "bias",
         "store_preact",
         "fuse_grad_accum",
-        "tuned",
+        "tune_mode",
     ),
     "linear_gated_func": (
         "x",
@@ -205,7 +215,7 @@ _TIER2_PARAMS = {
         "bias",
         "store_preact",
         "fuse_grad_accum",
-        "tuned",
+        "tune_mode",
         "concat_layout",
     ),
     "cross_entropy": (
@@ -243,7 +253,7 @@ _TIER2_PARAMS = {
         "chunk_size",
         "ignore_index",
         "reduction",
-        "tuned",
+        "tune_mode",
         "use_scaled_exp",
     ),
 }
@@ -257,7 +267,7 @@ _UP_PARAMS = (
     "token_indices",
     "gate_up_bias",
     "store_preact",
-    "tuned",
+    "tune_mode",
 )
 _UP_DEFAULTS = {
     "activation": "swiglu",
@@ -265,7 +275,7 @@ _UP_DEFAULTS = {
     "token_indices": None,
     "gate_up_bias": None,
     "store_preact": True,
-    "tuned": True,
+    "tune_mode": TuneMode.TUNED,
 }
 _DOWN_PARAMS = (
     "grad_output",
@@ -276,14 +286,14 @@ _DOWN_PARAMS = (
     "token_indices",
     "router_weights",
     "compute_router_weight_grad",
-    "tuned",
+    "tune_mode",
 )
 _DOWN_DEFAULTS = {
     "activation": "swiglu",
     "token_indices": None,
     "router_weights": None,
     "compute_router_weight_grad": False,
-    "tuned": True,
+    "tune_mode": TuneMode.TUNED,
 }
 _ACTIVATIONS = {
     "swiglu",
@@ -320,6 +330,62 @@ def test_signature_contract(name):
         v.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
         for v in params.values()
     ), f"{name} must stay free of *args/**kwargs (the lock must stay probeable)"
+
+
+# The registered torch.ops.dlkernel ops whose schema carries ``tune_mode`` —
+# exactly the GEMM family of gemm_interface.py. A deliberate re-flip of the
+# default edits this one row.
+_TUNE_MODE_OPS = frozenset(
+    {
+        "gemm",
+        "gemm_out",
+        "gemm_add",
+        "gemm_add_out",
+        "gemm_add_inplace",
+        "gemm_act_out",
+        "gemm_gated_out",
+        "gemm_dact_out",
+        "gemm_dgated_out",
+        "gemm_rms_out",
+        "gemm_norm_act_out",
+        "gemm_norm_gated_out",
+        "gemm_quant_out",
+    }
+)
+
+
+def test_torch_op_schemas_default_tune_mode_to_tuned():
+    """Every dlkernel op with ``tune_mode`` in its schema defaults it to
+    TUNED (0), like the Python signatures. A schema left at RUNNING (2) sends
+    direct ``torch.ops.dlkernel.*`` calls that omit the mode silently into
+    RUNNING — the schema string, not the Python default, is the wire."""
+    registered = {
+        schema.name.split("::", 1)[1]
+        for schema in torch._C._jit_get_all_schemas()
+        if schema.name.startswith("dlkernel::")
+        and any(arg.name == "tune_mode" for arg in schema.arguments)
+    }
+    assert registered == _TUNE_MODE_OPS, (
+        "the tune_mode op set drifted; update _TUNE_MODE_OPS if intentional"
+    )
+    want = str(int(TuneMode.TUNED))
+    for name in sorted(registered):
+        schema = str(getattr(torch.ops.dlkernel, name).default._schema)
+        found = re.findall(r"\btune_mode=(-?\d+)", schema)
+        assert found == [want], (
+            f"dlkernel::{name}: schema default tune_mode={found} != {want}; "
+            "schema and Python signature diverged"
+        )
+
+
+@pytest.mark.parametrize("fname", ["gemm", "gemm_add"])
+def test_python_signature_default_tune_mode_is_tuned(fname):
+    """The Python half of the same contract: the public entries still default
+    to TUNED, so a re-flip cannot slip past this lock from either side."""
+    default = inspect.signature(getattr(DLKernel, fname)).parameters["tune_mode"].default
+    assert default == TuneMode.TUNED, (
+        f"{fname}: Python default tune_mode={default!r} re-flipped; update this lock"
+    )
 
 
 @pytest.mark.parametrize(

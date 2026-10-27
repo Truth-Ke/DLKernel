@@ -5,6 +5,7 @@ import torch
 
 from DLKernel.cute_dsl_utils import get_device_capacity
 from DLKernel.gemm import gemm as dlkernel_gemm
+from DLKernel import TuneMode
 from DLKernel.gemm_interface import (
     gemm,
     gemm_ref,
@@ -179,7 +180,11 @@ def test_gemm_varlen_k(
     dynamic_scheduler,
     gather_A,
     permute_batch,
+    tmp_path,
+    monkeypatch,
 ):
+    # STATIC consults the tune cache (heuristic fallback); keep it out of $HOME.
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(42)
     seq_lens = torch.randint(50, 300, (num_groups,), device="cpu")
@@ -207,7 +212,7 @@ def test_gemm_varlen_k(
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         dynamic_scheduler=dynamic_scheduler,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     assert out.shape == (num_groups, m, n)
     out_ref = gemm_ref(
@@ -231,7 +236,10 @@ def test_gemm_varlen_k_with_zero_lengths(
     n,
     input_dtype,
     gather_A,
+    tmp_path,
+    monkeypatch,
 ):
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(42)
     seq_lens = torch.tensor([150, 64, 0, 200, 0], device="cpu", dtype=torch.int32)
@@ -250,7 +258,7 @@ def test_gemm_varlen_k_with_zero_lengths(
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         dynamic_scheduler=False,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     assert out.shape == (num_groups, m, n)
     out_ref = gemm_ref(
@@ -288,7 +296,10 @@ def test_gemm_add_varlen_k(
     C_major,
     dynamic_scheduler,
     gather_A,
+    tmp_path,
+    monkeypatch,
 ):
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(42)
     seq_lens = torch.randint(50, 300, (num_groups,), device="cpu")
@@ -321,7 +332,7 @@ def test_gemm_add_varlen_k(
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     assert out.shape == (num_groups, m, n)
     out_ref = gemm_add_ref(
@@ -362,7 +373,10 @@ def test_gemm_add_inplace_varlen_k(
     beta_is_tensor,
     dynamic_scheduler,
     gather_A,
+    tmp_path,
+    monkeypatch,
 ):
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(42)
     seq_lens = torch.randint(50, 300, (num_groups,), device="cpu")
@@ -393,7 +407,7 @@ def test_gemm_add_inplace_varlen_k(
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
     )
     alpha_val = alpha.item() if torch.is_tensor(alpha) else alpha
     beta_val = beta.item() if torch.is_tensor(beta) else beta
@@ -429,12 +443,15 @@ def test_gemm_add_inplace_varlen_k(
 @pytest.mark.parametrize("n", [512])
 @pytest.mark.parametrize("m", [1024])
 @pytest.mark.parametrize("num_groups", [3])
-def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype, gather_A, pre_allocate_out):
+def test_gemm_varlen_k_concat_out_m(
+    num_groups, m, n, input_dtype, gather_A, pre_allocate_out, tmp_path, monkeypatch
+):
     """Test varlen_k GEMM with concat_layout={"out"} (MoE dweight backward).
 
     Covers sonic-moe's down_projection_backward_weight call: cu_seqlens_k + A_idx
     (gather) + concat_layout=("out",) + pre-allocated out= buffer.
     """
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     device = "cuda"
     torch.random.manual_seed(0)
     seq_lens = torch.randint(100, 200, (num_groups,), device=device)
@@ -457,7 +474,7 @@ def test_gemm_varlen_k_concat_out_m(num_groups, m, n, input_dtype, gather_A, pre
         out=out_buf,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         concat_layout=concat_layout,
     )
     out_ref = gemm_ref(
@@ -488,7 +505,8 @@ def _make_cu_seqlens_k(L, total_k, device="cuda"):
 
 
 @pytest.mark.parametrize("zero_dim", ["total_k", "M", "N"])
-def test_gemm_varlen_k_empty(zero_dim):
+def test_gemm_varlen_k_empty(zero_dim, tmp_path, monkeypatch):
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     L, M, total_k, N = 4, 4096, 4096, 4096
     if zero_dim == "total_k":
         total_k = 0
@@ -500,14 +518,15 @@ def test_gemm_varlen_k_empty(zero_dim):
     A = torch.randn(M, total_k, device="cuda", dtype=torch.bfloat16)
     A = A.T.contiguous().T  # m-major as required by varlen_k
     B = torch.randn(total_k, N, device="cuda", dtype=torch.bfloat16)
-    out = gemm(A, B, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    out = gemm(A, B, cu_seqlens_k=cu_seqlens_k, tune_mode=TuneMode.STATIC)
     assert out.shape == (L, M, N)
     if total_k == 0:
         assert torch.all(out == 0)
 
 
 @pytest.mark.parametrize("zero_dim", ["total_k", "M", "N"])
-def test_gemm_add_varlen_k_empty(zero_dim):
+def test_gemm_add_varlen_k_empty(zero_dim, tmp_path, monkeypatch):
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     L, M, total_k, N = 4, 4096, 4096, 4096
     if zero_dim == "total_k":
         total_k = 0
@@ -520,7 +539,7 @@ def test_gemm_add_varlen_k_empty(zero_dim):
     A = A.T.contiguous().T
     B = torch.randn(total_k, N, device="cuda", dtype=torch.bfloat16)
     C = torch.randn(L, M, N, device="cuda", dtype=torch.bfloat16)
-    out = gemm_add(A, B, C, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    out = gemm_add(A, B, C, cu_seqlens_k=cu_seqlens_k, tune_mode=TuneMode.STATIC)
     assert out.shape == (L, M, N)
     if total_k == 0:
         assert torch.equal(out, C)

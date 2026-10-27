@@ -25,6 +25,8 @@ from DLKernel.fused_grouped_gemm import (
     moe_up_proj_act,
 )
 from DLKernel.gemm_base import gemm_with_activation, gemm_with_activation_grad
+from DLKernel.cute_dsl_utils import get_num_sms, set_num_sms
+from DLKernel.gemm_config import TuneMode
 from DLKernel.gemm_interface import gemm, gemm_add
 from DLKernel.gemm_symmetric import gemm_symmetric
 from DLKernel.linear import linear_act_func, linear_func, linear_gated_func
@@ -43,6 +45,7 @@ __all__ = [
     "LinearCrossEntropy",
     "RMSNorm",
     "RoundingMode",
+    "TuneMode",
     "chunked_linear_cross_entropy",
     "cross_entropy",
     "cross_entropy_bwd",
@@ -52,6 +55,7 @@ __all__ = [
     "gemm_symmetric",
     "gemm_with_activation",
     "gemm_with_activation_grad",
+    "get_num_sms",
     "hadamard_transform",
     "linear_act_func",
     "linear_func",
@@ -59,5 +63,6 @@ __all__ = [
     "moe_down_proj_dact",
     "moe_up_proj_act",
     "rmsnorm",
+    "set_num_sms",
     "softmax",
 ]

@@ -11,6 +11,7 @@ import io
 
 import pytest
 import torch
+from DLKernel import TuneMode
 
 from DLKernel.blockscaled.operand import (
     BLOCKSCALED_FORMAT_REGISTRY,
@@ -520,7 +521,7 @@ def test_origin_main_byte_fp6_pickle_migrates_without_reinterpretation():
     from DLKernel.gemm_interface import gemm
 
     with pytest.raises(ValueError, match="byte-per-element.*host-side compatibility"):
-        gemm(loaded, loaded.mT, tuned=False)
+        gemm(loaded, loaded.mT, tune_mode=TuneMode.STATIC)
 
 
 def test_feature_head_packed_fp6_pickle_migrates_to_versioned_name():

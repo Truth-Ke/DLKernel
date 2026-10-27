@@ -36,7 +36,6 @@ TransformAOperand bundle from the resolved config.
 from __future__ import annotations
 
 import ast
-from typing import Optional
 
 import torch
 
@@ -44,6 +43,8 @@ from DLKernel.blockscaled.operand import BlockScaledFormat
 from DLKernel.gemm_config import GemmConfig, cta_tile_shape_m, default_config
 from DLKernel.gemm_runtime.identity import (
     TORCH_OP_EPI_MODS as _EPI_REGISTRY,
+)
+from DLKernel.gemm_runtime.identity import (
     TORCH_OP_TRANSFORM_MODS as _TA_REGISTRY,
 )
 from DLKernel.rounding import RoundingMode
@@ -121,7 +122,7 @@ def _gemm_epi(digest: str, ins: list[torch.Tensor], outs: list[torch.Tensor], me
         out=out,
         store_d=m["store_d"],
         config=cfg,
-        tuned=m["tuned"],
+        tune_mode=m["tune_mode"],
         cu_seqlens_m=named.get("cu_seqlens_m"),
         A_idx=named.get("A_idx"),
         SFA=_sf_decode(named.get("SFA"), m.get("bs_format_a")),
@@ -195,7 +196,7 @@ def _gemm_epi_f_fake(digest, ins, meta):
 _CONFIG_FIELDS = tuple(GemmConfig.__dataclass_fields__)
 
 
-def _config_meta(cfg: Optional[GemmConfig]) -> Optional[dict]:
+def _config_meta(cfg: GemmConfig | None) -> dict | None:
     """Field->value dict for ``meta`` (the op body rebuilds ``GemmConfig(**it)``).
 
     Reads the fields one at a time on purpose. ``cfg.__dict__`` is a *dict
@@ -219,7 +220,7 @@ def compile_call(
     out_dtype,
     store_d,
     config,
-    tuned,
+    tune_mode,
     cu_seqlens_m,
     A_idx,
     SFA,
@@ -244,12 +245,13 @@ def compile_call(
     ``ins`` under ``ta__<name>`` and the op body hands them back to
     ``__call__`` as ``transform_operands`` (the bundle is rebuilt there from
     the config the op resolves — same deterministic path as this trace)."""
-    cfg: Optional[GemmConfig] = config
+    cfg: GemmConfig | None = config
     if mod.sinks and cfg is None:
         # Partials are graph-allocated before the op runs, so the tiling must
         # be fixed here — no runtime autotune under compile with sinks.
         cfg = default_config(A.device)
-        tuned = False
+        # The pinned config legitimately bypasses auto-selection (v4 §1);
+        # the caller's tune_mode rides through unchanged.
     caller_owned = bool(out) or any(operands.get(name) is not None for name in mod.sinks)
     sink_names = tuple(name for name in mod.sinks if operands.get(name) is None)
 
@@ -288,7 +290,7 @@ def compile_call(
             out_names=tuple(mod.outputs),
             sink_names=sink_names,
             store_d=bool(store_d),
-            tuned=bool(tuned),
+            tune_mode=int(tune_mode),
             config=_config_meta(cfg),
             rounding_mode=int(rounding_mode),
             bs_format_a=bs_format_a,

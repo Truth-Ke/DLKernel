@@ -18,6 +18,7 @@ so the tests run on SM120 only.
 """
 
 import pytest
+from DLKernel import TuneMode
 import torch
 import torch.nn.functional as F
 
@@ -64,7 +65,7 @@ def _quantized_operands(fmt, m, n, k, batched=False, seed=0):
 
 
 def _gemm_with_config(A, B, config=None, split_k=1):
-    """gemm(A, B, tuned=False) with a forced GemmConfig (the public wrapper
+    """gemm(A, B, tune_mode=TuneMode.STATIC) with a forced GemmConfig (the public wrapper
     exposes no config knob)."""
     opA, opB = _unpack_operand(A), _unpack_operand(B)
     Ad, Bd = opA.data, opB.data
@@ -116,10 +117,12 @@ def _rel_err(out, ref):
         (1024, 256, 8192),  # long K: SF pipeline over many k-tiles
     ],
 )
-def test_sm120_mxfp8_gemm(fmt, batched, shape_mnk):
+def test_sm120_mxfp8_gemm(fmt, batched, shape_mnk, tmp_path, monkeypatch):
+    # STATIC consults the tune cache (heuristic fallback); keep it out of $HOME.
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     m, n, k = shape_mnk
     A, B = _quantized_operands(fmt, m, n, k, batched)
-    out = gemm(A, B, tuned=False)
+    out = gemm(A, B, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(A, B)
     expected_shape = (2, m, n) if batched else (m, n)
     assert out.shape == expected_shape and out.dtype == torch.bfloat16
@@ -158,9 +161,10 @@ def test_sm120_mxfp8_split_k():
 
 @requires_sm120
 @pytest.mark.parametrize("seqlens_m", [[128, 128, 128], [100, 200, 150], [1, 128, 127, 129]])
-def test_sm120_mxfp8_varlen_m(seqlens_m):
+def test_sm120_mxfp8_varlen_m(seqlens_m, tmp_path, monkeypatch):
     """Grouped (varlen_m) MXFP8 GEMM: SFA is a single M-padded buffer
     (tile-aligned per-batch padding, batch dim 1); SFB stays per-expert."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     import cutlass
 
     from DLKernel.blockscaled.utils import create_blockscaled_varlen_m_operands
@@ -174,7 +178,7 @@ def test_sm120_mxfp8_varlen_m(seqlens_m):
     B = qb.permute(2, 1, 0)  # (n, k, L) -> (L, K, N) with K contiguous
     A_op = BlockScaledOperand.from_parts(qa, a_sc, "mxfp8")
     B_op = BlockScaledOperand.from_parts(B, b_sc, "mxfp8", quant_dim=-2)
-    out = gemm(A_op, B_op, cu_seqlens_m=cu_seqlens_m, tuned=False)
+    out = gemm(A_op, B_op, cu_seqlens_m=cu_seqlens_m, tune_mode=TuneMode.STATIC)
 
     cu = cu_seqlens_m.tolist()
     ref = torch.cat([a_ref_dq[cu[i] : cu[i + 1]] @ b_ref_dq[i].T for i in range(num_experts)])
@@ -183,14 +187,15 @@ def test_sm120_mxfp8_varlen_m(seqlens_m):
 
 
 @requires_sm120
-def test_sm120_mxfp8_vs_cublas():
+def test_sm120_mxfp8_vs_cublas(tmp_path, monkeypatch):
     """Bit-exact comparison against torch._scaled_mm (cuBLAS MXFP8 path).
     Both consume the same fp8 values and e8m0 scales with f32 accumulation, so
     any scale mis-application (wrong k-block, wrong row, stale smem stage)
     shows up as a hard mismatch."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     m, n, k = 512, 512, 512
     A, B = _quantized_operands("mxfp8_e4m3", m, n, k)
-    out = gemm(A, B, tuned=False)
+    out = gemm(A, B, tune_mode=TuneMode.STATIC)
     sfa_flat = scale_blocked_for_cublas(A.scale.unsqueeze(0), m, k // 32)
     sfw_flat = scale_blocked_for_cublas(B.scale.unsqueeze(0), n, k // 32)
     out_cublas = torch._scaled_mm(
@@ -202,20 +207,21 @@ def test_sm120_mxfp8_vs_cublas():
 
 
 @requires_sm120
-def test_sm120_mxfp8_gemm_add():
+def test_sm120_mxfp8_gemm_add(tmp_path, monkeypatch):
     """Epilogue frontend (alpha/beta + C) with blockscaled operands."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     m, n, k = 256, 256, 512
     A, B = _quantized_operands("mxfp8_e4m3", m, n, k)
     C = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
     alpha, beta = 0.5, 2.0
-    out = gemm_add(A, B, C, alpha=alpha, beta=beta, tuned=False)
+    out = gemm_add(A, B, C, alpha=alpha, beta=beta, tune_mode=TuneMode.STATIC)
     ref = alpha * gemm_blockscaled_ref(A, B, out_dtype=torch.float32) + beta * C.float()
     rel = (out.float() - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 5e-3, f"gemm_add: rel_err={rel}"
 
     acc = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
     ref2 = gemm_blockscaled_ref(A, B, out_dtype=torch.float32) + acc.float()
-    gemm_add_inplace(A, B, acc, tuned=False)
+    gemm_add_inplace(A, B, acc, tune_mode=TuneMode.STATIC)
     rel = (acc.float() - ref2).abs().max().item() / ref2.abs().max().item()
     assert rel < 5e-3, f"gemm_add_inplace: rel_err={rel}"
 
@@ -242,7 +248,9 @@ def test_sm120_mxfp8_gemm_with_activation(activation):
         "relu": F.relu,
         "gelu_tanh_approx": lambda x: F.gelu(x, approximate="tanh"),
     }[activation]
-    preact, postact = GemmBase.gemm_with_activation(A, B, activation=activation, tuned=False)
+    preact, postact = GemmBase.gemm_with_activation(
+        A, B, activation=activation, tune_mode=TuneMode.STATIC
+    )
     ref_post = act_fn(gemm_blockscaled_ref(A, B, out_dtype=torch.float32))
     rel = (postact.float() - ref_post).abs().max().item() / max(ref_post.abs().max().item(), 1e-6)
     assert rel < 5e-3, f"gemm_with_activation {activation}: rel_err={rel}"
@@ -284,18 +292,19 @@ _MIXED_PAIRS = [
         (256, 256, 8192),  # long K: ALIGN8B + SF pipeline over many k-tiles
     ],
 )
-def test_sm120_mixed_fp4_fp8_gemm(fmt_pair, shape_mnk):
+def test_sm120_mixed_fp4_fp8_gemm(fmt_pair, shape_mnk, tmp_path, monkeypatch):
     """Mixed-dtype blockscaled pairs (kind::mxf8f6f4, independent a/b dtype
     qualifiers — the CUTLASS C++ SM120_16x8x32_TN matrix): sub-byte operands
     ride padded tensormaps (16U4_ALIGN8B / 16U6_ALIGN16B) into byte-domain
     smem, ldsm.b4x16_p64 / b6x16_p32 unpacks into byte lanes, and fp4
     fragments are shifted <<2 into MMA position. Checked against both the
     blockscaled reference and the dequantized product."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     fmt_a, fmt_b = fmt_pair
     m, n, k = shape_mnk
     A = _mixed_operand(fmt_a, m, k, seed=0)
     W = _mixed_operand(fmt_b, n, k, seed=1)
-    out = gemm(A, W.mT, tuned=False)
+    out = gemm(A, W.mT, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(A, W.mT)
     rel = _rel_err(out, ref)
     assert rel < 5e-3, f"{fmt_a} x {fmt_b} {shape_mnk}: rel_err={rel}"
@@ -321,14 +330,15 @@ def test_sm120_mixed_fp4_fp8_tiles(tile_mn, pingpong):
 
 
 @requires_sm120
-def test_sm120_mixed_fp4_fp8_gemm_add():
+def test_sm120_mixed_fp4_fp8_gemm_add(tmp_path, monkeypatch):
     """Mixed operands through the epilogue frontend."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     m, n, k = 256, 256, 512
     A = _mixed_operand("mxfp8_e4m3", m, k, seed=0)
     W = _mixed_operand("mxfp4", n, k, seed=1)
     B = W.mT
     C = torch.randn(m, n, device="cuda", dtype=torch.bfloat16)
-    out = gemm_add(A, B, C, alpha=0.5, beta=2.0, tuned=False)
+    out = gemm_add(A, B, C, alpha=0.5, beta=2.0, tune_mode=TuneMode.STATIC)
     ref = 0.5 * gemm_blockscaled_ref(A, B, out_dtype=torch.float32) + 2.0 * C.float()
     rel = (out.float() - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 5e-3, f"mixed gemm_add: rel_err={rel}"
@@ -364,15 +374,16 @@ def test_sm120_plain_mixed_fp8_gemm(tile_m):
     "shape_mnk",
     [(256, 256, 256), (448, 320, 512), (256, 256, 8192)],
 )
-def test_sm120_same_dtype_fp4_gemm(fmt, shape_mnk):
+def test_sm120_same_dtype_fp4_gemm(fmt, shape_mnk, tmp_path, monkeypatch):
     """Same-dtype fp4 rides the dedicated packed kinds — kind::mxf4 (e8m0
     scales, sf_vec 32) / kind::mxf4nvf4 (e4m3 scales, sf_vec 16) — with
     inst K 64, regular packed fp4 smem/TMA, plain 16-bit ldmatrix, and no
     register shift. NVFP4's per-tensor scale folds into alpha at the
     interface."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     m, n, k = shape_mnk
     A, B = _quantized_operands(fmt, m, n, k)
-    out = gemm(A, B, tuned=False)
+    out = gemm(A, B, tune_mode=TuneMode.STATIC)
     ref = gemm_blockscaled_ref(A, B)
     rel = _rel_err(out, ref)
     assert rel < 5e-3, f"{fmt} {shape_mnk}: rel_err={rel}"
@@ -380,9 +391,10 @@ def test_sm120_same_dtype_fp4_gemm(fmt, shape_mnk):
 
 @requires_sm120
 @pytest.mark.parametrize("fmt_b", ["mxfp8_e4m3", "mxfp4"])
-def test_sm120_mxfp8_a_m_major(fmt_b):
+def test_sm120_mxfp8_a_m_major(fmt_b, tmp_path, monkeypatch):
     """M-major fp8 A (byte-granularity transposing ldmatrix m16n16.trans.b8):
     the scale tensor is layout-independent, only the qdata strides swap."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     m, n, k = 256, 320, 512
     A, _ = _quantized_operands("mxfp8_e4m3", m, n, k)
     W = _mixed_operand(fmt_b, n, k, seed=1)
@@ -390,7 +402,7 @@ def test_sm120_mxfp8_a_m_major(fmt_b):
     qa_mm = A.qdata.t().contiguous().t()  # (m, k) with M contiguous
     assert qa_mm.stride() == (1, m)
     A_mm = BlockScaledOperand.from_parts(qa_mm, A.scale, A.format)
-    out = gemm(A_mm, W.mT, tuned=False)
+    out = gemm(A_mm, W.mT, tune_mode=TuneMode.STATIC)
     rel = _rel_err(out, ref)
     assert rel < 5e-3, f"m-major A x {fmt_b}: rel_err={rel}"
 
@@ -404,17 +416,18 @@ def _n_major_b(W):
 
 @requires_sm120
 @pytest.mark.parametrize("fmt_a", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp6_e2m3_packed"])
-def test_sm120_b_n_major(fmt_a):
+def test_sm120_b_n_major(fmt_a, tmp_path, monkeypatch):
     """N-major fp8 B (ldmatrix.m16n16.x2.trans.b8 through a hand-built TV
     layout, see GemmSm120._nmajor_b_tiled_copy) under every A flavor that
     pairs with fp8 B (same-dtype mxfp8, mixed e5m2 x e4m3, fp4 x fp8,
     fp6 x fp8): must be bit-identical to the k-major B run on the same
     quantized operands."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     m, n, k = 256, 320, 512
     A = _mixed_operand(fmt_a, m, k, seed=0)
     W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
-    out_kmaj = gemm(A, W.mT, tuned=False)
-    out = gemm(A, _n_major_b(W), tuned=False)
+    out_kmaj = gemm(A, W.mT, tune_mode=TuneMode.STATIC)
+    out = gemm(A, _n_major_b(W), tune_mode=TuneMode.STATIC)
     assert torch.equal(out, out_kmaj), (
         f"{fmt_a} x n-major fp8 B != k-major: "
         f"max_err={(out.float() - out_kmaj.float()).abs().max().item()}"
@@ -441,17 +454,18 @@ def test_sm120_b_n_major_tiles(tile_mn, pingpong):
 
 
 @requires_sm120
-def test_sm120_b_n_major_quant_out():
+def test_sm120_b_n_major_quant_out(tmp_path, monkeypatch):
     """N-major fp8 B under the widened 32-column warp run (vec-32 mxfp8 SFD
     output widens mma_n_warp_run to 32): the generalized _nmajor_b_tiled_copy
     issues two 16-column atom invocations per warp and _retile_b splits the
     fragment's np mode into (in-atom pair, repetition) — the quantized values
     and SF bytes must be bit-identical to the k-major B run."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     m, n, k = 256, 320, 512
     A = _mixed_operand("mxfp8_e4m3", m, k, seed=0)
     W = _mixed_operand("mxfp8_e4m3", n, k, seed=1)
-    out_kmaj = gemm(A, W.mT, out_dtype="mxfp8_e4m3", tuned=False)
-    out = gemm(A, _n_major_b(W), out_dtype="mxfp8_e4m3", tuned=False)
+    out_kmaj = gemm(A, W.mT, out_dtype="mxfp8_e4m3", tune_mode=TuneMode.STATIC)
+    out = gemm(A, _n_major_b(W), out_dtype="mxfp8_e4m3", tune_mode=TuneMode.STATIC)
     assert torch.equal(out.qdata.view(torch.uint8), out_kmaj.qdata.view(torch.uint8)), (
         "n-major quantized values != k-major"
     )
@@ -472,13 +486,14 @@ def test_sm120_fp4_b_n_major_rejected():
 
 @requires_sm120
 @pytest.mark.parametrize("seqlens_k", [[96, 160, 128], [100, 220, 65]])
-def test_sm120_mxfp8_varlen_k_poisoned_sf_pad(seqlens_k):
+def test_sm120_mxfp8_varlen_k_poisoned_sf_pad(seqlens_k, tmp_path, monkeypatch):
     """varlen_k (m-major A / n-major B, K-padded SF buffers): SF pad bytes are
     TMA-loaded but must never be consumed — the mma loop skips the
     instructions covering the ragged tail (GemmSm120.mma's
     sf_valid_insts_last_tile). Poison
     the pad with 0xFF (e8m0 NaN): any consumed pad byte NaNs whole output rows
     via NaN-scale x 0-value products."""
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     from DLKernel.blockscaled.utils import create_blockscaled_varlen_k_operands
 
     num_experts = len(seqlens_k)
@@ -489,7 +504,7 @@ def test_sm120_mxfp8_varlen_k_poisoned_sf_pad(seqlens_k):
     )
     A_op = BlockScaledOperand.from_parts(qa, SFA, "mxfp8")
     B_op = BlockScaledOperand.from_parts(qb.t(), SFB, "mxfp8", quant_dim=-2)
-    out = gemm(A_op, B_op, cu_seqlens_k=cu_seqlens_k, tuned=False)
+    out = gemm(A_op, B_op, cu_seqlens_k=cu_seqlens_k, tune_mode=TuneMode.STATIC)
     assert not out.isnan().any(), "NaN leaked from poisoned SF pad into the output"
     for i in range(num_experts):
         ref_i = a_ref_list[i] @ b_ref_list[i].T

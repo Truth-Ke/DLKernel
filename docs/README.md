@@ -39,6 +39,7 @@ DLKernel 是用 CuTe DSL 编写的 CUDA kernel 库,覆盖 LLM 推理与训练的
 | [operand_transform.md](modules/operand_transform.md) A 操作数变换 | `TransformA` 契约、`make_copy_block` 挂载点、W4/W8 打包解码格式 |
 | [sm_device_layer.md](modules/sm_device_layer.md) SM 设备实现层 | 继承树与覆写面、四代 mainloop 差异、mixin 菱形组合、SM 选择入口 |
 | [fused_grouped_gemm.md](modules/fused_grouped_gemm.md) MoE grouped GEMM | token-row gather、concat W13、dH/A′/dS 两个独立入口与调用方合同 |
+| [ptr_array_grouped_gemm.md](modules/ptr_array_grouped_gemm.md) 指针数组 grouped GEMM | 多权重池单 launch:B_ptrs、tensormap 槽、窄 fork、零传输预算与性能边界 |
 | [tile_scheduler.md](modules/tile_scheduler.md) tile 调度 | 四种持久化模式、三类调度器的覆写点、K 维分解 |
 | [support_layer.md](modules/support_layer.md) 支撑层 | copy atom 原语、pipeline 类交换、dsl 进程级补丁、归约代数、varlen 参数族 |
 | [reduction_family.md](modules/reduction_family.md) reduction 家族 | `ReductionBase` 形态、rmsnorm/softmax/cross_entropy/topk 的 host 链路 |
@@ -48,6 +49,7 @@ DLKernel 是用 CuTe DSL 编写的 CUDA kernel 库,覆盖 LLM 推理与训练的
 | [tvm_ffi_compilation.md](modules/tvm_ffi_compilation.md) TVM-FFI 编译 | 符号形状/NamedTuple/ParamsBase 参数怎么编译与缓存 |
 | [caching_and_parallel_compilation.md](modules/caching_and_parallel_compilation.md) 编译缓存与并行编译 | 三层编译栈怎么工作、--async-compile 怎么用、冷启动时间去哪了 |
 | [autotuning_subsystem.md](modules/autotuning_subsystem.md) Autotune 子系统 | tune 怎么选配置、缓存怎么复用、环境变量怎么切 |
+| [static_selection.md](modules/static_selection.md) TuneMode 与静态选择 | 三模式契约、F/W 双身份、解析兜底、离线 study/production/prefill |
 
 ### 笔记(notes/)
 

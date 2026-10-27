@@ -9,6 +9,7 @@ import torch
 from DLKernel.cute_dsl_utils import get_device_capacity
 from DLKernel.gemm import gemm as dlkernel_gemm
 from DLKernel.gemm_interface import SplitKMode, gemm, gemm_add, gemm_add_inplace, gemm_ref
+from DLKernel import TuneMode
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -54,7 +55,14 @@ def test_gemm_split_k(L, out_dtype, split_k, split_k_mode):
     A, B = _make_inputs(m, n, k, L, torch.bfloat16)
     out_ref = gemm_ref(A.float(), B.float())
     out_pt = (A.float() @ B.float()).to(out_dtype)
-    out = gemm(A, B, out_dtype=out_dtype, tuned=False, split_k=split_k, split_k_mode=split_k_mode)
+    out = gemm(
+        A,
+        B,
+        out_dtype=out_dtype,
+        tune_mode=TuneMode.STATIC,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
+    )
     # All modes accumulate raw partials in f32 and convert exactly once (the epilogue
     # runs only on the finalizing entity), so the baseline tolerance applies as-is.
     _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
@@ -62,7 +70,14 @@ def test_gemm_split_k(L, out_dtype, split_k, split_k_mode):
         return  # arrival-order reduction: not deterministic run to run by design
     # Run-to-run bitwise determinism with fresh output buffers
     runs = [
-        gemm(A, B, out_dtype=out_dtype, tuned=False, split_k=split_k, split_k_mode=split_k_mode)
+        gemm(
+            A,
+            B,
+            out_dtype=out_dtype,
+            tune_mode=TuneMode.STATIC,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
+        )
         for _ in range(DETERMINISM_RUNS)
     ]
     for r in runs:
@@ -160,7 +175,13 @@ def test_gemm_split_k_bias_alpha(split_k_mode):
     out_ref = alpha * (A.float() @ B.float()) + bias
     out_pt = (alpha * (A @ B).float() + bias).to(torch.bfloat16)
     out = gemm(
-        A, B, bias=bias, alpha=alpha, tuned=False, split_k=split_k, split_k_mode=split_k_mode
+        A,
+        B,
+        bias=bias,
+        alpha=alpha,
+        tune_mode=TuneMode.STATIC,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
     _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
 
@@ -175,7 +196,14 @@ def test_gemm_add_split_k(split_k_mode):
     out_ref = alpha * (A.float() @ B.float()) + beta * C.float()
     out_pt = alpha * (A @ B) + beta * C
     out = gemm_add(
-        A, B, C, alpha=alpha, beta=beta, tuned=False, split_k=split_k, split_k_mode=split_k_mode
+        A,
+        B,
+        C,
+        alpha=alpha,
+        beta=beta,
+        tune_mode=TuneMode.STATIC,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
     _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
 
@@ -191,12 +219,16 @@ def test_gemm_add_inplace_split_k(split_k_mode):
     out_ref = C0.float() + A.float() @ B.float()
     out_pt = C0 + A @ B
     out = C0.clone()
-    gemm_add_inplace(A, B, out, tuned=False, split_k=split_k, split_k_mode=split_k_mode)
+    gemm_add_inplace(
+        A, B, out, tune_mode=TuneMode.STATIC, split_k=split_k, split_k_mode=split_k_mode
+    )
     _assert_close_double_baseline(out, out_ref, out_pt, mult=3)
     if split_k_mode == SplitKMode.PARALLEL:
         return  # arrival-order reduction: not deterministic run to run by design
     out2 = C0.clone()
-    gemm_add_inplace(A, B, out2, tuned=False, split_k=split_k, split_k_mode=split_k_mode)
+    gemm_add_inplace(
+        A, B, out2, tune_mode=TuneMode.STATIC, split_k=split_k, split_k_mode=split_k_mode
+    )
     assert torch.equal(out, out2), "split_k result is not bitwise deterministic"
 
 
@@ -208,7 +240,9 @@ def test_gemm_split_k_staged_grid_not_inflated():
     A, B = _make_inputs(m, n, k, L, torch.bfloat16)
 
     def max_kernel_grid_z(mode):
-        return _max_gemm_grid_z(lambda: gemm(A, B, tuned=False, split_k=split_k, split_k_mode=mode))
+        return _max_gemm_grid_z(
+            lambda: gemm(A, B, tune_mode=TuneMode.STATIC, split_k=split_k, split_k_mode=mode)
+        )
 
     serial_z = max_kernel_grid_z(SplitKMode.SERIAL)
     staged_z = max_kernel_grid_z(SplitKMode.SEPARATE)
@@ -299,9 +333,9 @@ def test_gemm_split_k_one_matches_baseline():
     """split_k=1 must compile to the exact baseline kernel: bitwise-identical output."""
     m, n, k = 256, 512, 4096
     A, B = _make_inputs(m, n, k, None, torch.bfloat16)
-    out_base = gemm(A, B, tuned=False)
+    out_base = gemm(A, B, tune_mode=TuneMode.STATIC)
     for mode in SplitKMode:
-        out1 = gemm(A, B, tuned=False, split_k=1, split_k_mode=mode)
+        out1 = gemm(A, B, tune_mode=TuneMode.STATIC, split_k=1, split_k_mode=mode)
         assert torch.equal(out_base, out1)
 
 
@@ -314,13 +348,18 @@ def test_gemm_split_k_serial_staged_f32_bitwise_equal():
     m, n, k, split_k = 192, 480, 8192, 4
     A, B = _make_inputs(m, n, k, None, torch.bfloat16)
     out_serial = gemm(
-        A, B, out_dtype=torch.float32, tuned=False, split_k=split_k, split_k_mode=SplitKMode.SERIAL
+        A,
+        B,
+        out_dtype=torch.float32,
+        tune_mode=TuneMode.STATIC,
+        split_k=split_k,
+        split_k_mode=SplitKMode.SERIAL,
     )
     out_staged = gemm(
         A,
         B,
         out_dtype=torch.float32,
-        tuned=False,
+        tune_mode=TuneMode.STATIC,
         split_k=split_k,
         split_k_mode=SplitKMode.SEPARATE,
     )
@@ -339,10 +378,10 @@ def test_gemm_split_k_cluster_rounded_tiles():
     out_ref = gemm_ref(A.float(), B.float())
     out_pt = A @ B
     for mode in SplitKMode:
-        out = gemm(A, B, tuned=False, split_k=split_k, split_k_mode=mode)
+        out = gemm(A, B, tune_mode=TuneMode.STATIC, split_k=split_k, split_k_mode=mode)
         _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
         if mode != SplitKMode.PARALLEL:  # arrival-order reduction is not deterministic
-            out2 = gemm(A, B, tuned=False, split_k=split_k, split_k_mode=mode)
+            out2 = gemm(A, B, tune_mode=TuneMode.STATIC, split_k=split_k, split_k_mode=mode)
             assert torch.equal(out, out2)
 
 
@@ -359,7 +398,7 @@ def test_gemm_split_k_ragged_n_strided_out():
     for mode in SplitKMode:
         big = torch.full((m, n_alloc), 7.0, dtype=torch.bfloat16, device="cuda")
         out = big[:, :n]
-        gemm(A, B, out=out, tuned=False, split_k=split_k, split_k_mode=mode)
+        gemm(A, B, out=out, tune_mode=TuneMode.STATIC, split_k=split_k, split_k_mode=mode)
         assert (big[:, n:] == 7.0).all(), f"{mode} split-K clobbered memory next to out"
         _assert_close_double_baseline(out, out_ref, A @ B, mult=2)
 
@@ -372,7 +411,7 @@ def test_gemm_split_k_larger_than_k_tiles():
     out_ref = gemm_ref(A.float(), B.float())
     out_pt = A @ B
     for mode in SplitKMode:
-        out = gemm(A, B, tuned=False, split_k=split_k, split_k_mode=mode)
+        out = gemm(A, B, tune_mode=TuneMode.STATIC, split_k=split_k, split_k_mode=mode)
         _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
 
 
@@ -384,7 +423,7 @@ def test_gemm_split_k_m_major_out():
     out_pt = A @ B
     for mode in SplitKMode:
         out = torch.empty((n, m), dtype=torch.bfloat16, device="cuda").mT
-        gemm(A, B, out=out, tuned=False, split_k=split_k, split_k_mode=mode)
+        gemm(A, B, out=out, tune_mode=TuneMode.STATIC, split_k=split_k, split_k_mode=mode)
         _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
 
 
@@ -393,9 +432,9 @@ def test_gemm_split_k_rejects_unsupported():
     A, B = _make_inputs(m, n, k, None, torch.bfloat16)
     cu_seqlens_m = torch.tensor([0, m], dtype=torch.int32, device="cuda")
     with pytest.raises(Exception, match="split_k"):
-        gemm(A, B, cu_seqlens_m=cu_seqlens_m, tuned=False, split_k=2)
+        gemm(A, B, cu_seqlens_m=cu_seqlens_m, tune_mode=TuneMode.STATIC, split_k=2)
     with pytest.raises(Exception, match="split_k"):
-        gemm(A, B, tuned=False, split_k=2, split_k_mode="bogus")
+        gemm(A, B, tune_mode=TuneMode.STATIC, split_k=2, split_k_mode="bogus")
     from DLKernel.gemm_base import GemmBase
     from DLKernel.gemm_interface import gemm_symmetric
 
@@ -416,7 +455,9 @@ def test_gemm_add_inplace_beta_split_k(split_k_mode):
     out_ref = 0.5 * C0.float() + A.float() @ B.float()
     out_pt = 0.5 * C0 + A @ B
     out = C0.clone()
-    gemm_add_inplace(A, B, out, beta=0.5, tuned=False, split_k=4, split_k_mode=split_k_mode)
+    gemm_add_inplace(
+        A, B, out, beta=0.5, tune_mode=TuneMode.STATIC, split_k=4, split_k_mode=split_k_mode
+    )
     _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
 
 
@@ -473,7 +514,9 @@ def test_gemm_split_k_mixed_c_majorness(split_k_mode):
     C = torch.randn(n, m, dtype=torch.bfloat16, device="cuda").mT  # m-major
     out_ref = A.float() @ B.float() + 0.5 * C.float()
     out_pt = A @ B + 0.5 * C
-    out = gemm_add(A, B, C, beta=0.5, tuned=False, split_k=4, split_k_mode=split_k_mode)
+    out = gemm_add(
+        A, B, C, beta=0.5, tune_mode=TuneMode.STATIC, split_k=4, split_k_mode=split_k_mode
+    )
     _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
 
 
@@ -531,7 +574,14 @@ def test_gemm_split_k_tensor_alpha_beta(split_k_mode):
     out_ref = 0.5 * (A.float() @ B.float()) + 2.0 * C.float()
     out_pt = 0.5 * (A @ B) + 2.0 * C
     out = gemm_add(
-        A, B, C, alpha=alpha, beta=beta, tuned=False, split_k=4, split_k_mode=split_k_mode
+        A,
+        B,
+        C,
+        alpha=alpha,
+        beta=beta,
+        tune_mode=TuneMode.STATIC,
+        split_k=4,
+        split_k_mode=split_k_mode,
     )
     _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
 
@@ -550,16 +600,26 @@ def test_gemm_split_k_tf32(split_k, split_k_mode):
     A, B = _make_inputs(m, n, k, L, torch.float32)
     out_ref = gemm_ref(A.float(), B.float())  # true f32 matmul
     # The plain (split_k=1) tf32 kernel is the same-precision baseline.
-    out_pt = gemm(A, B, out_dtype=torch.float32, tuned=False)
+    out_pt = gemm(A, B, out_dtype=torch.float32, tune_mode=TuneMode.STATIC)
     out = gemm(
-        A, B, out_dtype=torch.float32, tuned=False, split_k=split_k, split_k_mode=split_k_mode
+        A,
+        B,
+        out_dtype=torch.float32,
+        tune_mode=TuneMode.STATIC,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
     _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
     if split_k_mode == SplitKMode.PARALLEL:
         return  # arrival-order reduction: not deterministic run to run by design
     for _ in range(DETERMINISM_RUNS):
         out2 = gemm(
-            A, B, out_dtype=torch.float32, tuned=False, split_k=split_k, split_k_mode=split_k_mode
+            A,
+            B,
+            out_dtype=torch.float32,
+            tune_mode=TuneMode.STATIC,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
         )
         assert torch.equal(out, out2), "split_k tf32 result is not bitwise deterministic"
 
@@ -581,16 +641,26 @@ def test_gemm_split_k_fp8(in_dtype, split_k, split_k_mode):
     A = (torch.randn(L, m, k, device="cuda") / 4).to(in_dtype)
     B = (torch.randn(L, n, k, device="cuda") / 4).to(in_dtype).mT  # (L, k, n), k-major
     out_ref = gemm_ref(A.float(), B.float())
-    out_pt = gemm(A, B, out_dtype=torch.bfloat16, tuned=False)  # plain fp8 baseline
+    out_pt = gemm(A, B, out_dtype=torch.bfloat16, tune_mode=TuneMode.STATIC)  # plain fp8 baseline
     out = gemm(
-        A, B, out_dtype=torch.bfloat16, tuned=False, split_k=split_k, split_k_mode=split_k_mode
+        A,
+        B,
+        out_dtype=torch.bfloat16,
+        tune_mode=TuneMode.STATIC,
+        split_k=split_k,
+        split_k_mode=split_k_mode,
     )
     _assert_close_double_baseline(out, out_ref, out_pt, mult=2)
     if split_k_mode == SplitKMode.PARALLEL:
         return  # arrival-order reduction: not deterministic run to run by design
     for _ in range(DETERMINISM_RUNS):
         out2 = gemm(
-            A, B, out_dtype=torch.bfloat16, tuned=False, split_k=split_k, split_k_mode=split_k_mode
+            A,
+            B,
+            out_dtype=torch.bfloat16,
+            tune_mode=TuneMode.STATIC,
+            split_k=split_k,
+            split_k_mode=split_k_mode,
         )
         assert torch.equal(out, out2), "split_k fp8 result is not bitwise deterministic"
 

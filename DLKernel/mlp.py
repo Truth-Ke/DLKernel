@@ -8,6 +8,7 @@ from torch import Tensor, nn
 
 from DLKernel.activation import gate_fn_map
 from DLKernel.gemm_base import GemmBase
+from DLKernel.gemm_config import TuneMode
 from DLKernel.gemm_interface import (
     act_to_pytorch_fn_map,
     gated_to_pytorch_fn_map,
@@ -15,6 +16,8 @@ from DLKernel.gemm_interface import (
     gemm_add_inplace,
 )
 from DLKernel.linear import (
+    _ops_for,
+    _prebuild_running_twins,
     _recompute_act_postact,
     _recompute_gated_postact,
     act_linear_func,
@@ -53,15 +56,17 @@ class _MLPOps:
     recompute_postact = staticmethod(_recompute_act_postact)
 
 
-class _MLPUntunedOps:
-    matmul_fwd = partial(gemm, tuned=False)
-    matmul_fwd_act = partial(GemmBase.gemm_with_activation, tuned=False)
+class _MLPStaticOps:
+    matmul_fwd = partial(gemm, tune_mode=TuneMode.STATIC)
+    matmul_fwd_act = partial(GemmBase.gemm_with_activation, tune_mode=TuneMode.STATIC)
     matmul_bwd_dact = partial(
-        GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tuned=False
+        GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tune_mode=TuneMode.STATIC
     )
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tuned=False)
-    matmul_bwd_dw_inplace = partial(gemm_add_inplace, dynamic_scheduler=True, tuned=False)
+    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC)
+    matmul_bwd_dw = partial(gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC)
+    matmul_bwd_dw_inplace = partial(
+        gemm_add_inplace, dynamic_scheduler=True, tune_mode=TuneMode.STATIC
+    )
     recompute_postact = staticmethod(_recompute_act_postact)
 
 
@@ -72,10 +77,10 @@ class _MLPGatedOps(_MLPOps):
     recompute_postact = staticmethod(_recompute_gated_postact)
 
 
-class _MLPGatedUntunedOps(_MLPUntunedOps):
-    matmul_fwd_act = partial(GemmBase.gemm_with_activation, tuned=False)
+class _MLPGatedStaticOps(_MLPStaticOps):
+    matmul_fwd_act = partial(GemmBase.gemm_with_activation, tune_mode=TuneMode.STATIC)
     matmul_bwd_dact = partial(
-        GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tuned=False
+        GemmBase.gemm_with_activation_grad, dynamic_scheduler=True, tune_mode=TuneMode.STATIC
     )
     recompute_postact = staticmethod(_recompute_gated_postact)
 
@@ -90,14 +95,28 @@ class _MLPGatedConcatOps(_MLPGatedOps):
     recompute_fwd = partial(gemm, concat_layout=("B",))
 
 
-class _MLPGatedConcatUntunedOps(_MLPGatedUntunedOps):
-    matmul_fwd_act = partial(GemmBase.gemm_with_activation, tuned=False, concat_layout=("B",))
-    matmul_bwd_dx = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("B",))
-    matmul_bwd_dw1 = partial(gemm, dynamic_scheduler=True, tuned=False, concat_layout=("out",))
-    matmul_bwd_dw1_inplace = partial(
-        gemm_add_inplace, dynamic_scheduler=True, tuned=False, concat_layout=("C", "out")
+class _MLPGatedConcatStaticOps(_MLPGatedStaticOps):
+    matmul_fwd_act = partial(
+        GemmBase.gemm_with_activation, tune_mode=TuneMode.STATIC, concat_layout=("B",)
     )
-    recompute_fwd = partial(gemm, tuned=False, concat_layout=("B",))
+    matmul_bwd_dx = partial(
+        gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC, concat_layout=("B",)
+    )
+    matmul_bwd_dw1 = partial(
+        gemm, dynamic_scheduler=True, tune_mode=TuneMode.STATIC, concat_layout=("out",)
+    )
+    matmul_bwd_dw1_inplace = partial(
+        gemm_add_inplace,
+        dynamic_scheduler=True,
+        tune_mode=TuneMode.STATIC,
+        concat_layout=("C", "out"),
+    )
+    recompute_fwd = partial(gemm, tune_mode=TuneMode.STATIC, concat_layout=("B",))
+
+
+# The RUNNING twins for the bundles _ops_for receives here, built at import
+# (same fullgraph-tracing constraint as DLKernel.linear).
+_prebuild_running_twins(_MLPOps, _MLPGatedOps, _MLPGatedConcatOps)
 
 
 class MLPRecomputeFunc(torch.autograd.Function):
@@ -221,7 +240,7 @@ def mlp_func(
     bias1=None,
     bias2=None,
     fuse_grad_accum=False,
-    tuned=True,
+    tune_mode=TuneMode.TUNED,
     recompute=False,
     concat_layout=False,
 ):
@@ -230,11 +249,11 @@ def mlp_func(
         assert gated, "concat_layout is only supported for gated MLP"
     if recompute:
         if concat_layout:
-            ops = _MLPGatedConcatOps if tuned else _MLPGatedConcatUntunedOps
+            ops = _ops_for(tune_mode, _MLPGatedConcatOps, _MLPGatedConcatStaticOps)
         elif gated:
-            ops = _MLPGatedOps if tuned else _MLPGatedUntunedOps
+            ops = _ops_for(tune_mode, _MLPGatedOps, _MLPGatedStaticOps)
         else:
-            ops = _MLPOps if tuned else _MLPUntunedOps
+            ops = _ops_for(tune_mode, _MLPOps, _MLPStaticOps)
         return MLPRecomputeFunc.apply(x, weight1, weight2, activation, fuse_grad_accum, ops)
     fc1_fn = linear_gated_func if gated else linear_act_func
     fc2_fn = gated_linear_func if gated else act_linear_func
@@ -245,7 +264,7 @@ def mlp_func(
         bias=bias1,
         store_preact=torch.is_grad_enabled(),
         fuse_grad_accum=fuse_grad_accum,
-        tuned=tuned,
+        tune_mode=tune_mode,
         **({"concat_layout": concat_layout} if concat_layout and gated else {}),
     )
     out = fc2_fn(
@@ -255,7 +274,7 @@ def mlp_func(
         activation=activation,
         bias=bias2,
         fuse_grad_accum=fuse_grad_accum,
-        tuned=tuned,
+        tune_mode=tune_mode,
     )
     return out
 
@@ -273,7 +292,7 @@ class MLP(nn.Module):
         device=None,
         dtype=None,
         fuse_grad_accum: bool = False,
-        tuned: bool = True,
+        tune_mode: TuneMode = TuneMode.TUNED,
         recompute: bool = False,
         concat_layout: bool = False,
     ):
@@ -302,7 +321,7 @@ class MLP(nn.Module):
                 )
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias2, **factory_kwargs)
         self.fuse_grad_accum = fuse_grad_accum
-        self.tuned = tuned
+        self.tune_mode = tune_mode
         self.recompute = recompute
         self.concat_layout = concat_layout
 
@@ -325,7 +344,7 @@ class MLP(nn.Module):
                 bias1=self.fc1.bias,
                 bias2=self.fc2.bias,
                 fuse_grad_accum=self.fuse_grad_accum,
-                tuned=self.tuned,
+                tune_mode=self.tune_mode,
                 recompute=self.recompute,
                 concat_layout=self.concat_layout,
             )

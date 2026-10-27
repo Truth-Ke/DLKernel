@@ -27,7 +27,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from DLKernel.gemm_config import SplitKMode
+from DLKernel.gemm_config import SplitKMode, TuneMode
 from DLKernel.gemm_sm90 import GemmSm90
 
 
@@ -109,7 +109,7 @@ class GemmMoeSm90(GemmSm90):
         token_indices: Tensor | None = None,
         gate_up_bias: Tensor | None = None,
         store_preact: bool = True,
-        tuned: bool = True,
+        tune_mode: TuneMode = TuneMode.TUNED,
     ) -> tuple[Tensor, Tensor | None]:
         """Validate and run the expert up projection (see ``moe_up_proj_act``)."""
         cls._validate_up_inputs(
@@ -131,7 +131,7 @@ class GemmMoeSm90(GemmSm90):
             A_idx=token_indices,
             store_preact=store_preact,
             dynamic_scheduler=True,
-            tuned=tuned,
+            tune_mode=tune_mode,
             concat_layout=(
                 (("B", "bias") if gate_up_bias is not None else ("B",))
                 if gated and gate_up_layout == "concat"
@@ -152,7 +152,7 @@ class GemmMoeSm90(GemmSm90):
         token_indices: Tensor | None = None,
         router_weights: Tensor | None = None,
         compute_router_weight_grad: bool = False,
-        tuned: bool = True,
+        tune_mode: TuneMode = TuneMode.TUNED,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
         """Validate and run the routed down projection (see ``moe_down_proj_dact``)."""
         cls._validate_down_inputs(
@@ -175,7 +175,7 @@ class GemmMoeSm90(GemmSm90):
             cu_seqlens_m=expert_offsets,
             A_idx=token_indices,
             dynamic_scheduler=True,
-            tuned=tuned,
+            tune_mode=tune_mode,
         )
         # gemm_with_activation_grad returns exactly (dx, postact, reduce) with
         # the reduce and exactly (dx, postact) without (the K=0 fast path
