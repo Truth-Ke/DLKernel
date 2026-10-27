@@ -52,8 +52,9 @@ from __future__ import annotations
 import inspect
 import json
 import os
+from collections.abc import Sequence
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 from torch import Tensor
 
@@ -85,7 +86,7 @@ K_GROUP_SPLIT_FEATURE = "K_over_N"
 #: ``(shape set, cluster set, swap_ab)`` rule; the rule body is padded up to
 #: ``KEEP`` by ``canonical_filler_key`` when it matches fewer candidates, which is
 #: what the offline study scored.
-K_GROUP_TREE: Tuple[Dict[str, Any], ...] = (
+K_GROUP_TREE: tuple[dict[str, Any], ...] = (
     {
         "id": "k-low",
         "upper": 79.072265625,  # midpoint of the 78.1445 -> 80.0 gap
@@ -113,7 +114,7 @@ M_GROUP_SPLIT_FEATURE = "avg_m"
 #: M-group leaves (op in {nn, nt}), evaluated top to bottom against ``avg_m``.
 #: Both bodies keep 7 candidates and are topped up to 8.  The cut sits in the
 #: widest gap of the axis (1024.0 | 1365.33).
-M_GROUP_TREE: Tuple[Dict[str, Any], ...] = (
+M_GROUP_TREE: tuple[dict[str, Any], ...] = (
     {
         "id": "m-low",
         "upper": 1194.6666666666667,  # midpoint of the 1024.0 -> 1365.3333 gap
@@ -148,7 +149,7 @@ M_GROUP_TREE: Tuple[Dict[str, Any], ...] = (
 
 #: Measured envelope (min/max over the 322 baseline cases).  Outside it the
 #: selector returns the full structurally legal set instead of guessing.
-TRAINED_ENVELOPE: Dict[str, Dict[str, Any]] = {
+TRAINED_ENVELOPE: dict[str, dict[str, Any]] = {
     "K-group": {
         "ops": ("tn",),
         "N": (512, 7168),
@@ -175,7 +176,7 @@ def _normalise_dtype(dtype: Any) -> str:
     return DTYPE_ALIASES.get(name, name)
 
 
-def _capability_major(device_capability: Any) -> Optional[int]:
+def _capability_major(device_capability: Any) -> int | None:
     """Accept either a major integer or a cached ``(major, minor)`` tuple."""
     if device_capability is None:
         return None
@@ -192,11 +193,11 @@ def _capability_major(device_capability: Any) -> Optional[int]:
         return None
 
 
-def _in_range(value: float, bounds: Tuple[float, float]) -> bool:
+def _in_range(value: float, bounds: tuple[float, float]) -> bool:
     return float(bounds[0]) <= float(value) <= float(bounds[1])
 
 
-def _coverage_reason(workload: Dict[str, Any]) -> Optional[str]:
+def _coverage_reason(workload: dict[str, Any]) -> str | None:
     """None when the workload is inside the measured envelope."""
     envelope = TRAINED_ENVELOPE.get(workload["group_type"])
     if envelope is None:
@@ -222,15 +223,15 @@ def _length_of(values: Any) -> int:
     doubles work.  Neither reads a value.
     """
     shape = getattr(values, "shape", None)
-    return int(len(values)) if shape is None else int(shape[0])
+    return len(values) if shape is None else int(shape[0])
 
 
-def _shape_of(tensor: Any) -> Tuple[int, ...]:
+def _shape_of(tensor: Any) -> tuple[int, ...]:
     shape = getattr(tensor, "shape", None)
     return tuple(int(size) for size in shape) if shape is not None else ()
 
 
-def _stride_of(tensor: Any) -> Tuple[int, ...]:
+def _stride_of(tensor: Any) -> tuple[int, ...]:
     stride = getattr(tensor, "stride", None)
     if not callable(stride):
         return ()
@@ -240,7 +241,7 @@ def _stride_of(tensor: Any) -> Tuple[int, ...]:
         return ()
 
 
-def workload_metadata(A, B, cu_seqlens_m, cu_seqlens_k, A_idx=None) -> Dict[str, Any]:
+def workload_metadata(A, B, cu_seqlens_m, cu_seqlens_k, A_idx=None) -> dict[str, Any]:
     """Derive op/group/N/K/expert-count from operand metadata alone.
 
     The ragged sizes come from the operand shapes and the segment count from
@@ -321,7 +322,7 @@ def workload_metadata(A, B, cu_seqlens_m, cu_seqlens_k, A_idx=None) -> Dict[str,
     }
 
 
-def _leaf_decision(workload: Dict[str, Any]) -> Tuple[Dict[str, Any], str, float]:
+def _leaf_decision(workload: dict[str, Any]) -> tuple[dict[str, Any], str, float]:
     """(rule, split_feature, split_value) for a valid, in-envelope workload."""
     if workload["group_type"] == "K-group":
         N = int(workload["N"])
@@ -376,28 +377,26 @@ def selector_leaf_id(
     return _leaf_decision(workload)[0]["id"]
 
 
-def candidate_fields(config: Any) -> Dict[str, Any]:
+def candidate_fields(config: Any) -> dict[str, Any]:
     """Read tile/cluster fields from an AutotuneConfig or a bare GemmConfig."""
     kwargs = getattr(config, "kwargs", None)
     if isinstance(kwargs, dict) and "config" in kwargs:
         config = kwargs["config"]
     return {
-        "tile_m": int(getattr(config, "tile_m")),
-        "tile_n": int(getattr(config, "tile_n")),
-        "tile_k": None if getattr(config, "tile_k") is None else int(getattr(config, "tile_k")),
-        "num_warps": (
-            None if getattr(config, "num_warps") is None else int(getattr(config, "num_warps"))
-        ),
-        "cluster_m": int(getattr(config, "cluster_m")),
-        "cluster_n": int(getattr(config, "cluster_n")),
-        "pingpong": bool(getattr(config, "pingpong")),
-        "swap_ab": bool(getattr(config, "swap_ab")),
+        "tile_m": int(config.tile_m),
+        "tile_n": int(config.tile_n),
+        "tile_k": None if config.tile_k is None else int(config.tile_k),
+        "num_warps": (None if config.num_warps is None else int(config.num_warps)),
+        "cluster_m": int(config.cluster_m),
+        "cluster_n": int(config.cluster_n),
+        "pingpong": bool(config.pingpong),
+        "swap_ab": bool(config.swap_ab),
         "split_k": int(getattr(config, "split_k", 1)),
         "is_dynamic_persistent": bool(getattr(config, "is_dynamic_persistent", False)),
     }
 
 
-def canonical_filler_key(fields: Dict[str, Any]) -> Tuple[Any, ...]:
+def canonical_filler_key(fields: dict[str, Any]) -> tuple[Any, ...]:
     """Fixed, label-free order used to fill a rule body up to ``KEEP``.
 
     Smallest tile area first - a grouped GEMM whose routed rows barely cover a
@@ -425,7 +424,7 @@ def canonical_filler_key(fields: Dict[str, Any]) -> Tuple[Any, ...]:
     )
 
 
-def _rule_keeps(rule: Dict[str, Any], fields: Dict[str, Any]) -> bool:
+def _rule_keeps(rule: dict[str, Any], fields: dict[str, Any]) -> bool:
     if bool(fields["is_dynamic_persistent"]):
         # A dynamic-persistent candidate only enters a leaf whose
         # ``dynamic_shapes`` explicitly admits its tile; every other leaf keeps
@@ -442,7 +441,7 @@ def _rule_keeps(rule: Dict[str, Any], fields: Dict[str, Any]) -> bool:
     return rule["swap_ab"] is None or bool(fields["swap_ab"]) is bool(rule["swap_ab"])
 
 
-def _log_decision(record: Dict[str, Any]) -> None:
+def _log_decision(record: dict[str, Any]) -> None:
     path = os.environ.get("DLKERNEL_VARLEN_SELECTOR_LOG")
     if os.environ.get("DLKERNEL_DEBUG_TUNE") == "1":
         print(
@@ -470,9 +469,9 @@ def select_varlen_gemm_candidates(
     cu_seqlens_m=None,
     cu_seqlens_k=None,
     A_idx=None,
-    device_capability: Optional[int | Tuple[int, int]] = None,
+    device_capability: int | tuple[int, int] | None = None,
     dtype=None,
-) -> List[Any]:
+) -> list[Any]:
     """Return the rule-tree candidate subset for varlen grouped GEMM.
 
     Dense GEMM, unsupported devices/dtypes and any structural variant the
@@ -481,7 +480,7 @@ def select_varlen_gemm_candidates(
     of ``configs``, never empty, and never reordered relative to the canonical
     fill order (so it does not depend on the caller's ordering).
     """
-    record: Dict[str, Any] = {
+    record: dict[str, Any] = {
         "selector_version": SELECTOR_VERSION,
         "applied": False,
         "fallback": False,
@@ -490,7 +489,7 @@ def select_varlen_gemm_candidates(
         "reason": None,
     }
 
-    def finish(result: List[Any]) -> List[Any]:
+    def finish(result: list[Any]) -> list[Any]:
         record["selected_candidate_count"] = len(result)
         _log_decision(record)
         return result
@@ -564,7 +563,7 @@ def select_varlen_gemm_candidates(
     return finish(body + fillers[: KEEP - len(body)])
 
 
-def _rule_public_view(rule: Dict[str, Any]) -> Dict[str, Any]:
+def _rule_public_view(rule: dict[str, Any]) -> dict[str, Any]:
     view = {
         "id": rule["id"],
         "upper": rule.get("upper"),
@@ -577,7 +576,7 @@ def _rule_public_view(rule: Dict[str, Any]) -> Dict[str, Any]:
     return view
 
 
-def rule_table() -> Dict[str, Any]:
+def rule_table() -> dict[str, Any]:
     """The frozen constants, for tests and for the acceptance report."""
     return {
         "selector_version": SELECTOR_VERSION,
@@ -615,15 +614,26 @@ _OPERAND_NAMES = ("A", "B", "out", "C")
 #: ``None`` *was* passed and still belongs in the key, like v1's merged dict.
 _MISSING = object()
 
+#: Parameter names that switch miss behaviour, not workload identity.  They
+#: must never enter W or F; both collection loops below exclude them.
+_NON_IDENTITY_NAMES = frozenset({"tune_mode"})
+
+#: Prefix of the fixed-contract identity F.  Distinct from ``_KEY_VERSION`` so
+#: an F tuple can never be confused with (or alias) a W tuple.
+_CONTRACT_VERSION = "gemm_contract_v1"
+
+#: Constant extent a declared ragged dimension collapses to inside F.
+_RAGGED_MARK = -1
+
 
 @lru_cache(maxsize=8)
-def _argument_index(arg_names: Tuple[str, ...]) -> Dict[str, int]:
+def _argument_index(arg_names: tuple[str, ...]) -> dict[str, int]:
     """Position of each named parameter, cached per decorated signature."""
     return {name: index for index, name in enumerate(arg_names)}
 
 
 @lru_cache(maxsize=8)
-def _key_layout(arg_names: Tuple[str, ...]) -> Tuple[Tuple[str, int], ...]:
+def _key_layout(arg_names: tuple[str, ...]) -> tuple[tuple[str, int], ...]:
     """(name, position) pairs in the key's canonical order.
 
     Alphabetical by name, which is the order v1's per-call ``sorted()`` produced;
@@ -653,9 +663,9 @@ def _ragged_dimension(rows: int, experts: int) -> int:
     return -1 if bucket < 0 else bucket * max(experts, 1)
 
 
-def _reuse_profile(stride: Tuple[int, ...]) -> Tuple[int, ...]:
+def _reuse_profile(stride: tuple[int, ...]) -> tuple[int, ...]:
     """Standardised stride: 0/1 are kept, anything else is flattened to 2."""
-    return tuple(size if size < 2 else 2 for size in stride)
+    return tuple(min(2, size) for size in stride)
 
 
 def _device_capability(tensor: Any):
@@ -676,7 +686,7 @@ def _device_capability(tensor: Any):
         return None
 
 
-def _arg_value(args, kwargs, name: str, position: Optional[int], default: Any = _MISSING) -> Any:
+def _arg_value(args, kwargs, name: str, position: int | None, default: Any = _MISSING) -> Any:
     """The value bound to ``name``: keyword beats position, then default."""
     if name in kwargs:
         return kwargs[name]
@@ -693,8 +703,8 @@ def gemm_tune_key(
     ragged_m_out_names=("out", "C", "D"),
     opaque_tensor_names=(),
     routed_m_tensor_names=(),
-) -> Optional[Tuple[Any, ...]]:
-    """Bucket-collapsed varlen tune key; ``None`` for dense calls.
+) -> tuple[Any, ...] | None:
+    """Bucket-collapsed varlen tune key (W); ``None`` for dense calls.
 
     ``ragged_m_out_names``: output-style tensors whose ``shape[-2]`` tracks the
     ragged M and is rewritten to the bucketed size ("D" is the epilogue tuner's
@@ -711,6 +721,61 @@ def gemm_tune_key(
     canonicalized with the same routed-M bucket as ``A``/the ragged outputs;
     runtime shape and buffer legality remain checked by the operator.
     """
+    return _build_identity(
+        args,
+        kwargs,
+        arg_names,
+        arg_defaults,
+        ragged_m_out_names,
+        opaque_tensor_names,
+        routed_m_tensor_names,
+        contract=False,
+    )
+
+
+def gemm_contract_key(
+    args,
+    kwargs,
+    arg_names,
+    arg_defaults=None,
+    ragged_m_out_names=("out", "C", "D"),
+    opaque_tensor_names=(),
+    routed_m_tensor_names=(),
+) -> tuple[Any, ...] | None:
+    """Fixed-contract identity F; ``None`` for dense calls.
+
+    Same single metadata pass and tensor-role declarations as
+    :func:`gemm_tune_key`, but the declared token dimensions collapse to a
+    constant mark instead of their bucket, and the measurement-side components
+    (avg-expert buckets, selector leaf, bench budget) are absent: F names the
+    operator *contract* — weights geometry, expert count, dtype, layout,
+    epilogue identity — not the measured workload point.  Calls that differ
+    only in routed totals share F; changing E/N/K/dtype/layout forms a new F.
+    Like W, F never contains ``tune_mode``, tensor addresses, or tensor values.
+    """
+    return _build_identity(
+        args,
+        kwargs,
+        arg_names,
+        arg_defaults,
+        ragged_m_out_names,
+        opaque_tensor_names,
+        routed_m_tensor_names,
+        contract=True,
+    )
+
+
+def _build_identity(
+    args,
+    kwargs,
+    arg_names,
+    arg_defaults,
+    ragged_m_out_names,
+    opaque_tensor_names,
+    routed_m_tensor_names,
+    *,
+    contract: bool,
+):
     names = tuple(arg_names)
     ragged_m_out_names = frozenset(ragged_m_out_names)
     opaque_names = frozenset(opaque_tensor_names)
@@ -746,7 +811,7 @@ def gemm_tune_key(
     # One pass over the arguments in canonical order collects scalars and
     # tensors alike.  v1 merged a dict and ran two sorted() passes per call;
     # this runs on every cache-hit, so it stays allocation-light.
-    key: list = [_KEY_VERSION]
+    key: list = [_CONTRACT_VERSION if contract else _KEY_VERSION]
     tensors: list = []
     for name, position in _key_layout(names):
         value = _arg_value(args, kwargs, name, position, defaults.get(name, _MISSING))
@@ -754,13 +819,13 @@ def gemm_tune_key(
             continue
         if isinstance(value, Tensor):
             tensors.append((name, value))
-        elif name not in _OPERAND_NAMES:
+        elif name not in _OPERAND_NAMES and name not in _NON_IDENTITY_NAMES:
             key.append((name, value))
     for name in sorted(kwargs.keys() - positions.keys()):
         value = kwargs[name]
         if isinstance(value, Tensor):
             tensors.append((name, value))
-        elif name not in _OPERAND_NAMES:
+        elif name not in _OPERAND_NAMES and name not in _NON_IDENTITY_NAMES:
             key.append((name, value))
 
     cu_seqlens_m = bound("cu_seqlens_m")
@@ -788,10 +853,16 @@ def gemm_tune_key(
         if varlen_k and isinstance(b, Tensor)
         else 0
     )
-    if varlen_m and isinstance(a, Tensor):
-        key.append(("avg_expert_m", average_rows_bucket(routed_m, m_experts)))
-    if varlen_k and isinstance(b, Tensor):
-        key.append(("avg_expert_k", average_rows_bucket(routed_k, k_experts)))
+
+    def _collapse(size: int, experts: int) -> int:
+        """Ragged extent: its monotone bucket for W, a constant mark for F."""
+        return _RAGGED_MARK if contract else _ragged_dimension(size, experts)
+
+    if not contract:
+        if varlen_m and isinstance(a, Tensor):
+            key.append(("avg_expert_m", average_rows_bucket(routed_m, m_experts)))
+        if varlen_k and isinstance(b, Tensor):
+            key.append(("avg_expert_k", average_rows_bucket(routed_k, k_experts)))
 
     if isinstance(a, Tensor):
         device = getattr(a, "device", None)
@@ -814,54 +885,55 @@ def gemm_tune_key(
         shape = list(value.shape)
         # Only declared roles may collapse M; equal extents do not imply equal roles.
         if varlen_m and name in ragged_m_out_names and len(shape) >= 2:
-            shape[-2] = _ragged_dimension(shape[-2], m_experts)
+            shape[-2] = _collapse(shape[-2], m_experts)
         elif varlen_m and name in routed_m_tensor_names and len(shape) >= 1:
             # mColVecBroadcast is a per-routed-row vector.  Use its final
             # extent for both (M,) and (L, M) spellings, while leaving the
             # actual tensor shape available to runtime legality checks.
-            shape[-1] = _ragged_dimension(shape[-1], m_experts)
+            shape[-1] = _collapse(shape[-1], m_experts)
         elif varlen_m and name == "A" and not gather_a and len(shape) >= 2:
-            shape[-2] = _ragged_dimension(shape[-2], m_experts)
+            shape[-2] = _collapse(shape[-2], m_experts)
         if varlen_m and name == "A_idx" and len(shape) >= 1:
-            shape[-1] = _ragged_dimension(shape[-1], m_experts)
+            shape[-1] = _collapse(shape[-1], m_experts)
         # Ragged-K layout: B's leading axis, and A's last axis unless gather_A
         # carries total K in the index instead.
         if varlen_k and name == "A" and not gather_a and len(shape) >= 2:
-            shape[-1] = _ragged_dimension(shape[-1], k_experts)
+            shape[-1] = _collapse(shape[-1], k_experts)
         if varlen_k and name == "B" and len(shape) >= 2:
-            shape[0] = _ragged_dimension(shape[0], k_experts)
+            shape[0] = _collapse(shape[0], k_experts)
         if varlen_k and name == "A_idx" and len(shape) >= 1:
-            shape[-1] = _ragged_dimension(shape[-1], k_experts)
+            shape[-1] = _collapse(shape[-1], k_experts)
         key.extend((name, tuple(shape), _reuse_profile(value.stride()), value.dtype))
 
-    # The rule-tree leaf the selector would prune this workload to.  Same
-    # metadata inputs as the pruning decision, so the key and the selector
-    # cannot disagree about which candidates a bucket entry was tuned on.
-    key.append(
-        (
-            "selector_leaf",
-            selector_leaf_id(
-                a,
-                b,
-                cu_seqlens_m,
-                cu_seqlens_k,
-                a_index,
-                dtype=getattr(a, "dtype", None),
-                device_capability=_device_capability(a),
-                selector_enabled=os.environ.get("DLKERNEL_VARLEN_SELECTOR", "1") != "0",
-            ),
+    if not contract:
+        # The rule-tree leaf the selector would prune this workload to.  Same
+        # metadata inputs as the pruning decision, so the key and the selector
+        # cannot disagree about which candidates a bucket entry was tuned on.
+        key.append(
+            (
+                "selector_leaf",
+                selector_leaf_id(
+                    a,
+                    b,
+                    cu_seqlens_m,
+                    cu_seqlens_k,
+                    a_index,
+                    dtype=getattr(a, "dtype", None),
+                    device_capability=_device_capability(a),
+                    selector_enabled=os.environ.get("DLKERNEL_VARLEN_SELECTOR", "1") != "0",
+                ),
+            )
         )
-    )
-    # Bench protocol settings affect the measured winner.  Key the canonical
-    # effective values so equivalent spellings/clamps cannot create aliases.
-    warmup_ms, timed_calls = _canonical_bench_budget()
-    key.append(
-        (
-            "bench_budget_env",
-            warmup_ms,
-            timed_calls,
+        # Bench protocol settings affect the measured winner.  Key the canonical
+        # effective values so equivalent spellings/clamps cannot create aliases.
+        warmup_ms, timed_calls = _canonical_bench_budget()
+        key.append(
+            (
+                "bench_budget_env",
+                warmup_ms,
+                timed_calls,
+            )
         )
-    )
     return tuple(key)
 
 
@@ -879,9 +951,7 @@ class VarlenGemmTunePolicy(GemmTunePolicy):
 
     def bind_signature(self, arg_names, arg_defaults) -> None:
         super().bind_signature(arg_names, arg_defaults)
-        self._varlen_params = bool(
-            {"cu_seqlens_m", "cu_seqlens_k"}.intersection(self.arg_names)
-        )
+        self._varlen_params = bool({"cu_seqlens_m", "cu_seqlens_k"}.intersection(self.arg_names))
 
     def prepare_candidates(self, configs, named_args, kwargs):
         merged = dict(named_args)
@@ -898,6 +968,17 @@ class VarlenGemmTunePolicy(GemmTunePolicy):
             return default_key()
         key = gemm_tune_key(args, kwargs, self.arg_names, self.arg_defaults)
         return default_key() if key is None else key
+
+    def make_contract(self, args, kwargs, default_key):
+        """Fixed operator contract F: W minus token buckets/leaf/budget.
+
+        Dense calls keep their full default-key geometry as the contract
+        (dense has no declared dynamic dimension to fold).
+        """
+        if not getattr(self, "_varlen_params", False):
+            return default_key()
+        contract = gemm_contract_key(args, kwargs, self.arg_names, self.arg_defaults)
+        return default_key() if contract is None else contract
 
     def budget_override(self, key):
         return isinstance(key, tuple) and bool(key) and key[0] == _KEY_VERSION

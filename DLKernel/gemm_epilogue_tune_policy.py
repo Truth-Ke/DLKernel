@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Iterable, Optional
 
-from DLKernel.varlen_selector import VarlenGemmTunePolicy, gemm_tune_key
+from DLKernel.varlen_selector import VarlenGemmTunePolicy, gemm_contract_key, gemm_tune_key
 from DLKernel.epilogue.legality import prune_epilogue_configs
 
 
@@ -60,6 +60,21 @@ class GemmEpilogueTunePolicy(VarlenGemmTunePolicy):
             routed_m_tensor_names=self._routed_m_tensor_names,
         )
         return default_key() if key is None else key
+
+    def make_contract(self, args, kwargs, default_key):
+        """F for the mod's epilogue tensor roles (see VarlenGemmTunePolicy)."""
+        if not getattr(self, "_varlen_params", False):
+            return default_key()
+        contract = gemm_contract_key(
+            args,
+            kwargs,
+            self.arg_names,
+            self.arg_defaults,
+            ragged_m_out_names=self._ragged_m_out_names,
+            opaque_tensor_names=self._opaque_tensor_names,
+            routed_m_tensor_names=self._routed_m_tensor_names,
+        )
+        return default_key() if contract is None else contract
 
     def prepare_candidates(self, configs, named_args, kwargs):
         configs = super().prepare_candidates(configs, named_args, kwargs)

@@ -22,7 +22,10 @@ Mechanics that make the generic path work with the Autotuner:
   (``sink_arg_shapes``), rejects undersized caller-owned buffers before the
   shared tuner key is consulted, then slices the full buffer per config. One
   buffer serves every tile size and the winning slice is returned in
-  ``TunedModGemm.sinks``.
+  ``TunedModGemm.sinks``. A -1 fallback call has no winner, but it still
+  consumes a slice: the wrapper stashes the views it ran with on the per-mod
+  fn (``_last_fallback``) and ``tuned_mod_gemm`` returns them in ``sinks``
+  while keeping ``config=None`` (the fallback-provenance contract).
 * mod.gemm validation errors (ValueError/TypeError) are rewrapped into
   RuntimeError: the bench loop only converts RuntimeError/MemoryError into an
   inf timing, and a config a prune rule missed must not abort the sweep.
@@ -46,21 +49,15 @@ candidate tiles). Not supported (yet): split_k.
 from __future__ import annotations
 
 import inspect
-
 from typing import NamedTuple
 
 import torch
 
 from DLKernel.autotuner import AutotuneConfig, Autotuner
 from DLKernel.cute_dsl_utils import get_device_capacity
-from DLKernel.gemm_config import (
-    blockscaled_config_ok,
-    config_supports,
-    cta_tile_shape_m,
-    get_all_configs,
-)
+from DLKernel.gemm_config import cta_tile_shape_m, get_all_configs
 
-__all__ = ["tuned_mod_gemm", "sink_arg_shapes", "TunedModGemm"]
+__all__ = ["TunedModGemm", "sink_arg_shapes", "tuned_mod_gemm"]
 
 
 class TunedModGemm(NamedTuple):
@@ -223,9 +220,62 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
         transform_digest=None,  # keyed; the mod itself is a closure capture
         transform_sf=None,
         config=None,
+        tune_mode=None,  # rides through the Autotuner; the fn itself ignores it
         **epi_flat,  # epi args by name + transform operands as ta__<name>
     ):
         c = config
+        # TuneMode fallback (the -1 call): no measured winner.  The miss
+        # contract is the ANALYTICAL ranker (STATIC/RUNNING), not the mod's
+        # blind default: a ranked config falls through to the explicit-tile
+        # call below, which also slices reduce sinks for the KNOWN config
+        # (worst-case buffers cannot honor a config-shaped sink contract).
+        # Mirrors the epi __call__ non-tuner chain's guard: SM90, no gather;
+        # dense stays uncovered by design.  (A is None only in signature
+        # stubs; short-circuit keeps the device query real-tensor-only.)
+        if c is None and A is not None and A_idx is None and get_device_capacity(A.device)[0] == 9:
+            from DLKernel import gemm_heuristic
+
+            _desc = gemm_heuristic.desc_from_call(A, B, D, cu_seqlens_m, None)
+            c = gemm_heuristic.rank(_desc, gemm_heuristic.sm90_candidates(_desc))
+        if c is None and (sink_allocs or ta_names):
+            # A config-shaped contract (reduce sinks, runtime-operand
+            # transform bundles) cannot ride the blind default call: the
+            # low-level gemm enforces EXACT sink shapes for its own tiling
+            # and builds no operand bundle.  Resolve the mod's own default
+            # config and take the explicit-tile path, which slices sinks and
+            # builds bundles for a KNOWN config (the same chain the epi
+            # non-tuner resolution uses).
+            c = mod._default_config(A, B, transform_a)
+        if c is None:
+            # Uncovered family with no config-shaped contract (no sinks, no
+            # runtime-operand transform): the mod's own default-config path
+            # resolves the tiling.  Delegates to the LOW-LEVEL mod.gemm
+            # (tile-parameter method, no tuner entry) — the -1 execution is
+            # loop-free by construction; it must not gain tune_mode/config
+            # kwargs (it has neither).  Stash the RAW epi_args entries for the
+            # sink names (an empty dict here) so the every-fallback-call
+            # invariant of _last_fallback holds for tuned_mod_gemm's read.
+            fn._last_fallback = (
+                None,
+                {name: epi_flat[name] for name in sink_allocs if name in epi_flat},
+            )
+            return mod.gemm(
+                A,
+                B,
+                D,
+                C,
+                epi_args={name: epi_flat[name] for name in epi_names},
+                b_kn=b_kn,
+                cu_seqlens_m=cu_seqlens_m,
+                A_idx=A_idx,
+                SFA=SFA,
+                SFB=SFB,
+                bs_format_a=bs_format_a,
+                bs_format_b=bs_format_b,
+                concat_layout=concat_layout,
+                transform_a=transform_a,
+                transform_sf=transform_sf,
+            )
         m_gemm, n_gemm = _gemm_mn(A, B, b_kn)
         if transform_a is not None and transform_a.padded_n(B) is not None:
             n_gemm = transform_a.padded_n(B)  # B is the repacked blob
@@ -251,6 +301,18 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
                     ),
                 )
             epi_args[name] = v
+        if config is None:
+            # Ranked -1 fall-through: report THIS config's sliced sink views
+            # to tuned_mod_gemm.  The stash lives on the per-mod fn (one fn
+            # per mod per tuner key) and is set on EVERY fallback call —
+            # never on sweep/winner/pinned calls, which carry an explicit
+            # config; tuned_mod_gemm reads it immediately after its own -1
+            # call returns, so the last write is the call that produced its
+            # plan.
+            fn._last_fallback = (
+                c,
+                {name: epi_args[name] for name in sink_allocs if name in epi_args},
+            )
         dyn = c.is_dynamic_persistent or dynamic_scheduler
         # SM90 dynamic-persistent scheduling consumes a semaphore; a fresh
         # zeros(1) per call is the gemm_interface pattern (under the CUDA-graph
@@ -323,6 +385,7 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
     ]
     params.append(inspect.Parameter("b_kn", kw, default=False))
     params.append(inspect.Parameter("dynamic_scheduler", kw, default=False))
+    params.append(inspect.Parameter("tune_mode", kw, default=None))
     params.append(inspect.Parameter("concat_layout", kw, default=None))
     params.append(inspect.Parameter("transform_digest", kw, default=None))
     params.append(inspect.Parameter("transform_sf", kw, default=None))
@@ -396,6 +459,7 @@ def tuned_mod_gemm(
     transform_a=None,
     transform_sf=None,
     transform_operands=None,
+    tune_mode=None,
 ):
     """Autotuned ``mod.gemm`` with a full-buffer sink contract.
 
@@ -404,7 +468,10 @@ def tuned_mod_gemm(
     Missing reduce sinks are allocated at the sweep's worst case (see
     ``sink_arg_shapes``); undersized caller-owned buffers are rejected before
     cache lookup.
-    Returns ``TunedModGemm(plan, config, sinks)`` with winning sink views.
+    Returns ``TunedModGemm(plan, config, sinks)`` with the winning config and
+    its sink views.  A -1 fallback (no measured winner) keeps ``config=None``
+    — the fallback-provenance signal — and ``sinks`` carries the views the
+    delegated call actually consumed.
     """
     # Keep caller-owned mappings immutable while allowing the tuner to fill in
     # missing reduce sinks with its full worst-case scratch allocation.
@@ -447,10 +514,23 @@ def tuned_mod_gemm(
         concat_layout=concat_layout,
         transform_digest=getattr(transform_a, "semantic_digest", None),
         transform_sf=transform_sf,
+        tune_mode=tune_mode,
         **{f"ta__{k}": v for k, v in (transform_operands or {}).items()},
         **epi_args,
     )
-    best = tuner.best_config.kwargs["config"]
+    best_obj = tuner.best_config
+    if best_obj is None:
+        # -1 fallback resolution: the delegated call already executed with the
+        # config the wrapper resolved (analytical ranker, or the mod's own
+        # default tiling when the family is uncovered).  ``config`` stays None
+        # -- callers read it as fallback provenance -- but the wrapper stashed
+        # the exact sink views this call consumed, so the caller's owned-sink
+        # hand-off sees real buffers instead of a KeyError.  The stash is
+        # per-fn and rewritten by every fallback call; this read immediately
+        # follows this call's own -1 execution.
+        _, fallback_sinks = tuner.fn._last_fallback
+        return TunedModGemm(plan, None, fallback_sinks)
+    best = best_obj.kwargs["config"]
     if A_idx is not None:
         m_gemm = A_idx.shape[0]
     return TunedModGemm(

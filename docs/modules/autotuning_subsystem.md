@@ -1,7 +1,8 @@
 # DLKernel 本地 Autotuning（tune）子系统
 
 > 阅读对象：需要改 tune 行为、加 tune 维度，或需要回答"这次调用为什么选了这个 kernel"的工程师。
-> 范围：进程内（local）autotuning——候选枚举、评测、结果缓存、运行时查表。不含任何离线调参工具。
+> 范围：进程内（local）autotuning——候选枚举、评测、结果缓存、运行时查表。miss 的模式语义
+> （TuneMode/固定契约/解析兜底）与离线工具见 [static_selection.md](static_selection.md)。
 > 约定：所有结论都能在源码里对上。`path/to/file.py:LINE` 已于 2026-10-11 对 `feature/sm90-moe-clean-arch`（`4c9e800`）全量核对；个别区间为"±数行"粒度。
 > 与既有笔记的关系见 [docs/README.md](../README.md) 索引；缓存 / 并行编译的底层机制在 `docs/modules/caching_and_parallel_compilation.md`，本文不重复。
 
@@ -122,7 +123,7 @@ tune key = "什么算同一个问题"。key 变了就重新 tune。
 dense 走 `Autotuner` 的默认 key（`gemm_tuned` 传 `policy=VarlenGemmTunePolicy()`（`gemm_interface.py:373`），其 `make_key` 对 dense 返回默认 key，见 3.1.3）：
 
 ```python
-# DLKernel/autotuner.py:697 _default_key（每次调用都跑，是热路径）
+# DLKernel/autotuner.py:815 _default_key（每次调用都跑，是热路径）
 key = [kwargs[k] for k in self.keys if k in kwargs]
 for arg in args:                       # 位置参数里的 Tensor
     if isinstance(arg, Tensor):
@@ -141,13 +142,13 @@ key = tuple(key)
 2. 每个 Tensor 的 `(shape, 归一化 stride, dtype)`。
 3. stride 归一化：`s if s < 2 else 2`。该式保留 0/1（广播、行/列主序、连续）语义，抹掉绝对 stride 数值（`DLKernel/varlen_selector.py:656` 的 `_reuse_profile` 是同一规则）。
 
-为什么这些必须进 key：key 必须覆盖剪枝（`policy.prepare_candidates` / `shortlist`）读到的一切，因为命中时不会再剪枝（`DLKernel/autotuner.py:520` 的 `if key not in self.cache:` 才走剪枝管线）。剪枝读：device capacity、`A_idx` 是否存在、`cu_seqlens_m/k` 是否存在、`SFA`/`SFD`/`SFDCol` 是否存在、`split_k is None`、A/B 的 shape（`_expand_split_k_configs` 算 tile 数）与 dtype。上面的 tensor 维度 + 命名标量全部覆盖它们。stride 决定 major，major 决定哪些 kernel 变体可编译，所以 stride 必须进 key。
+为什么这些必须进 key：key 必须覆盖剪枝（`policy.prepare_candidates` / `shortlist`）读到的一切，因为命中时不会再剪枝（`DLKernel/autotuner.py:576` 的 `if key not in self.cache:` 才走剪枝管线）。剪枝读：device capacity、`A_idx` 是否存在、`cu_seqlens_m/k` 是否存在、`SFA`/`SFD`/`SFDCol` 是否存在、`split_k is None`、A/B 的 shape（`_expand_split_k_configs` 算 tile 数）与 dtype。上面的 tensor 维度 + 命名标量全部覆盖它们。stride 决定 major，major 决定哪些 kernel 变体可编译，所以 stride 必须进 key。
 
 刻意不进 key 的：`alpha` / `beta`（float 形式）、`bias` 的"有无"（作为 Tensor 传入时其 shape 仍在 key 里）、`add_to_output`、`rounding_mode`、`sr_seed`。理由：它们不改变候选合法性，只影响"选得好不好"；tune 只保证"在等价形状上选最快的合法候选"。**代价**见 9.1 第 2 条。
 
 ### 3.1.1 磁盘缓存还要额外吃下候选集本身
 
-磁盘 key 是 `sha256(VERSION + str(tuning_key) + 每个候选的 str())`（`DLKernel/autotuner.py:419-421`，`VERSION` 即 `__version__`，`:29/:33`）。因此**增删改任何一个候选配置，会让所有 shape 的 tune JSON 全部失效**。这与 `AGENTS.md`「缓存稳定性不是设计约束」一致，但要有预期。
+磁盘 key 是 `sha256(VERSION + str(tuning_key) + 每个候选的 str())`（`DLKernel/autotuner.py:433-437` 的磁盘 key，`VERSION` 即 `__version__`）。因此**增删改任何一个候选配置，会让所有 shape 的 tune JSON 全部失效**。这与 `AGENTS.md`「缓存稳定性不是设计约束」一致，但要有预期。
 
 ### 3.1.2 key 只在 kwargs 里找命名标量
 
@@ -155,7 +156,7 @@ key = tuple(key)
 
 ### 3.1.3 varlen 分支的 hook
 
-`Autotuner.__call__` 每次先走 `self._policy_make_key(args, kwargs, default_key)`（`autotuner.py:507`）。policy 的 `make_key` 返回 `None`（dense）→ 用默认 key；返回 key（varlen bucket key）→ 用该 key，且 `policy.budget_override(key)`（`autotuner.py:291`；实现 `varlen_selector.py:902`）同时打开 bench 预算覆写开关。只有 routed/varlen 调用能读 `DLKERNEL_TUNE_WARMUP_MS` / `DLKERNEL_TUNE_TIMED_CALLS`（解析与夹取在 `autotuner.py:40-69`；非法取值直接 `ValueError`，不静默夹取）。这个耦合是有意的：dense 永远拿历史协议（200 ms / 200 次），varlen 才允许缩短冷启动。
+`Autotuner.__call__` 每次先走 `self._policy_make_key(args, kwargs, default_key)`（`autotuner.py:563`）。policy 的 `make_key` 返回 `None`（dense）→ 用默认 key；返回 key（varlen bucket key）→ 用该 key，且 `policy.budget_override(key)`（`autotuner.py:217`；实现见 varlen_selector）同时打开 bench 预算覆写开关。只有 routed/varlen 调用能读 `DLKERNEL_TUNE_WARMUP_MS` / `DLKERNEL_TUNE_TIMED_CALLS`（解析与夹取在 `autotuner.py:45-70`；非法取值直接 `ValueError`，不静默夹取）。这个耦合是有意的：dense 永远拿历史协议（200 ms / 200 次），varlen 才允许缩短冷启动。
 
 ### 3.2 候选配置空间
 
@@ -190,7 +191,7 @@ key = tuple(key)
 
 失败处理：L2-cold 路径只吞 `(RuntimeError, MemoryError)`（smem 溢出 / 启动失败 / OOM）并给 `[inf, inf, inf]`（`:318` 起 `_bench`、except `:372`）。编程错误继续抛。回落 do_bench 路径吞一切异常。`inf` 永远不会赢，但会往 stderr 打一行 `n_failed/len` 汇总（`:650-653`）。**这行汇总是防止 smem 溢出被静默掩盖的唯一防线**。全部候选都失败时抛 `RuntimeError`，不缓存空冠军（`:668-673`）。
 
-预算覆写（只对 routed 生效）：`DLKERNEL_TUNE_WARMUP_MS` 夹到 `[10, 2000]`、`DLKERNEL_TUNE_TIMED_CALLS` 夹到 `[16, 2000]`（`autotuner.py:40-69`）。
+预算覆写（只对 routed 生效）：`DLKERNEL_TUNE_WARMUP_MS` 夹到 `[10, 2000]`、`DLKERNEL_TUNE_TIMED_CALLS` 夹到 `[16, 2000]`（`autotuner.py:45-70`）。
 
 ### 3.4 缓存与持久化
 
@@ -203,12 +204,14 @@ cache_dir = $DLKERNEL_CACHE_DIR 或 ($DLKERNEL_HOME 或 ~)/.dlkernel/cache
 FileCacheManager.key = base32(sha256(VERSION + str(tuning_key) + 各候选 str()))
 file_name = f"{fn.__name__[:150]}.autotune.json"
 内容 = {"key": str(tuning_key), "configs_timings": [[候选 str, [t50,t20,t80]], ...]}
+contract_winners/<合同摘要>.json（同一 cache_dir；内容 {"config": str}，末写者胜）
 ```
 
 - 是否启用：`Autotuner.cache_results`，构造参数或环境变量 `DLKERNEL_CACHE_AUTOTUNING == "1"`（`:253-254`）。`gemm_tuned` 与 epi tuner 都显式 `cache_results=True`。
 - 失效：key 变；候选集变（字符串进 key）；`DLKernel.__version__` 变（`:29/:33`，进磁盘 key）；`DLKERNEL_FORCE_CACHE_UPDATE` 被设置（`:437`，`_env_flag` 解析）。
 - 淘汰：无。目录只增不减（`benchmarks/benchmark_gemm_autotuned.py:47` 的 `clear_caches()` 是唯一清理入口）。
 - 冷启动拒绝：`DLKERNEL_REQUIRE_TUNE_CACHE=1` 把冷 key 变成 `RuntimeError` 而不是 bench（`:446-452`）。它用于断言"这一步的 shape 已在跑之前预热过"。
+- 并发安全（2026-10-27 事故后收口）：缓存根只有一个解析点 `default_cache_dir()`——`DLKERNEL_CACHE_DIR` 设置即整体接管（含 `contract_winners/`），否则落在 `$DLKERNEL_HOME/.dlkernel/cache`。写 = mkstemp 私有临时名 + `os.replace` 原子换入；所有读点把损坏/撕裂 JSON 按未命中处理，record 侧随后重写自愈。多 rank 共享同一缓存目录安全。
 - 多进程：`{file_name}.lock`（`fcntl.flock LOCK_EX`，`:463`）串行化昂贵测量。锁内二次检查 `path = cache.get_file(file_name)` 后才 bench（`:458-468`），所以 N 个 rank 只有一个真的测。注意：剪枝在锁外执行，每个 rank 都会跑一遍（便宜）。
 - 命中时：`load_cached` 用候选字符串反查 `AutotuneConfig`（`:427-434`），`bench_time = 0`。
 
@@ -317,7 +320,7 @@ flowchart TD
 
 ### 4.5 与 `linear.py` / `gemm_runtime/*` 的调用关系
 
-- `DLKernel/linear.py` 完全不支持 varlen：全文没有任何 `cu_seqlens` / `varlen` / `A_idx` 引用（已 grep 确认）。它通过 ops bundle 选择 tune 与否：`_LinearOps.matmul_fwd_fn = gemm`（tuned 默认）vs `_LinearUntunedOps.matmul_fwd_fn = partial(gemm, tuned=False)`（`DLKernel/linear.py:87`、`:99`）；反向同理（`:89-91`、`:108-110`）；gated/concat 变体再加 `concat_layout=`（`:115-125`）。
+- `DLKernel/linear.py` 完全不支持 varlen：全文没有任何 `cu_seqlens` / `varlen` / `A_idx` 引用（已 grep 确认）。它通过 ops bundle 选择 tune 与否：`_LinearOps.matmul_fwd_fn = gemm`（tuned 默认）vs `_LinearStaticOps.matmul_fwd_fn = partial(gemm, tuned=False)`（`DLKernel/linear.py:87`、`:99`）；反向同理（`:89-91`、`:108-110`）；gated/concat 变体再加 `concat_layout=`（`:115-125`）。
 - varlen 的入口是 `gemm` / `gemm_with_activation` / `gemm_with_activation_grad` 等直接调用（`tests/test_linear_varlen_m.py` 名字里虽有 "linear"，实际调的是 `gemm(..., cu_seqlens_m=...)`）。
 - `gemm_runtime/*` 与 varlen 的关系：`tuned_mod_gemm` 明确支持 varlen（`DLKernel/gemm_runtime/autotune.py:33`：`cu_seqlens_m`/`A_idx` 是顶层张量 kwarg，因此正常进 key、正常参与 L2 轮转克隆）。其 varlen key 同样走 bucket 塌缩。`_get_tuner` 传 `policy=GemmEpilogueTunePolicy`（`:365-368`），`make_key` 经 `gemm_tune_key` 塌缩（详见 9.2）。
 
@@ -582,7 +585,7 @@ epilogue 特有的机制（都在 `DLKernel/gemm_runtime/autotune.py` 的模块 
 4. 标量 epi 参数不进 key（docstring `:26-29`），理由：tile 选择对标量值不敏感，且 `mod.gemm` 在真实调用时会按元数据重新 plan。
 5. `dynamic_scheduler=True` 会强制每个候选都用 dynamic-persistent 调度（`:253`）；`swap_ab` 只在 element-mode 且无 sink 的 mod 上通过 swap-at-trace 生效（docstring `:33-34` 与 sweep `:258-259`）；`split_k` 尚未支持（`:43`）。
 
-eager 入口（`DLKernel/epilogue/frontend.py`）：`use_tuner` 的守卫是 `tuned and config is None and rounding_mode == RN and epi_key_overrides is None and not add_to_output`（`:1588-1595`）。SR / 显式 key 覆盖 / reduce-add D 走非 tune 路径。sink 形状按 `(lead[-1], n, l, device, num_seqs)` 缓存在 `self._sink_shape_cache`（`:1602-1612`），因为 `sink_arg_shapes` 会遍历整个候选空间、且在热路径上。
+eager 入口（`DLKernel/epilogue/frontend.py`）：`use_tuner` 的守卫是 `config is None and rounding_mode == RN and epi_key_overrides is None and not add_to_output`（`:1588-1595`；2026-10-21 起任意 TuneMode 都走 tuner 消费冠军,STATIC miss 的 `-1` 由 rank 解析 config 并按其切片 reduce sink）。SR / 显式 key 覆盖 / reduce-add D 走非 tune 路径。sink 形状按 `(lead[-1], n, l, device, num_seqs)` 缓存在 `self._sink_shape_cache`（`:1602-1612`），因为 `sink_arg_shapes` 会遍历整个候选空间、且在热路径上。
 
 torch.compile 路线不 tune：`__call__` 在 `torch.compiler.is_compiling()` 时直接走 `compile_call`（`:1466-1478`）；且对带 sink 的 mod 强制 `cfg = default_config(A.device); tuned = False`（`DLKernel/gemm_runtime/torch_op.py:247-253`，"partials 由 graph 分配，tiling 必须在这里定死"）。不带 sink 时 op body 在执行期用 `tuned=m["tuned"]` 调回 `__call__`（`torch_op.py:124` 起），等价于在第一次真实执行时补一次 tune。
 
@@ -597,14 +600,15 @@ torch.compile 路线不 tune：`__call__` 在 `torch.compiler.is_compiling()` �
 | `DLKERNEL_FORCE_CACHE_UPDATE` | unset | 真值（如 `=1`）忽略磁盘结果重测；`=0` 不触发 | `autotuner.py:437` |
 | `DLKERNEL_REQUIRE_TUNE_CACHE` | unset | `=1` 时冷 key 直接 `RuntimeError`，不 bench | `autotuner.py:446-452` |
 | `DLKERNEL_DEBUG_TUNE` | unset | `=1` 输出 `DLKERNEL_TUNE_START/DISK_HIT/DISK_MISS/END/L2_CLONE_UNAVAILABLE`；同时打开选择器日志 | `autotuner.py:81`（`_tune_trace`）；`varlen_selector.py:445-456` |
-| `DLKERNEL_TUNE_WARMUP_MS` | 200 | 仅 routed（policy 返回 bucket key）生效；夹到 `[10, 2000]`，非法值报错 | `autotuner.py:40-69` |
-| `DLKERNEL_TUNE_TIMED_CALLS` | 200 | 同上；夹到 `[16, 2000]`，非法值报错 | `autotuner.py:40-69` |
+| `DLKERNEL_TUNE_WARMUP_MS` | 200 | 仅 routed（policy 返回 bucket key）生效；夹到 `[10, 2000]`，非法值报错 | `autotuner.py:45-70` |
+| `DLKERNEL_TUNE_TIMED_CALLS` | 200 | 同上；夹到 `[16, 2000]`，非法值报错 | `autotuner.py:45-70` |
 | `DLKERNEL_VARLEN_SELECTOR` | `1` | `=0` 关闭规则树剪枝（回全集）；**同时改变 tune key** | `varlen_selector.py:851、:916` |
 | `DLKERNEL_VARLEN_SELECTOR_LOG` | unset | 追加 JSONL 记录（`selector_version/applied/fallback/rule/...`） | `varlen_selector.py:445-463` |
-| `DLKERNEL_CACHE_DIR` | `.o`：`/tmp/$USER/dlkernel_cache`；winner：`~/.dlkernel/cache` | 同时覆盖 `.o` 根（`cache.get_cache_path()`）与 winner 根（`FileCacheManager`）；没有独立的 artifact 旋钮 | `cache/__init__.py:38-39`；`autotuner.py:102-110` |
+| `DLKERNEL_CACHE_DIR` | unset（回退 `~/.dlkernel/cache`） | 整体覆盖调优缓存根：per-key winner 与 `contract_winners/` 全走 `default_cache_dir()` 单一解析点；不引导 `.o` artifact | `autotuner.py:101-110` |
+| `DLKERNEL_ARTIFACT_CACHE_DIR` | unset（回退 per-user 临时目录） | `.o` artifact 根，独立于调优缓存 | `cache/__init__.py:55-69` |
 | `DLKERNEL_CACHE_ENABLED` | `1` | `=0` 关闭 `.o` 磁盘缓存（内存缓存仍在）；**不影响 tune JSON** | `cache/__init__.py:38`；`cache/jit.py:273-287` |
-| `DLKERNEL_HOME` | `~` | 决定 tune JSON 的默认根 | `autotuner.py:99-104` |
-| `DLKERNEL_ARCH` | 物理 GPU | 覆盖**分派**架构（CPU-only 编译）；进 `.o` 指纹 | `cute_dsl_utils.py:97-139`；`cache/jit.py:176` |
+| `DLKERNEL_HOME` | `~` | 仅当 `CACHE_DIR` 未设时，作默认根的宿主：`$DLKERNEL_HOME/.dlkernel/cache` | `autotuner.py:97-110` |
+| `DLKERNEL_ARCH` | 物理 GPU | 覆盖**分派**架构（CPU-only 编译）；进 `.o` 指纹 | `cute_dsl_utils.py:146-216`；`cache/jit.py:176` |
 | `DLKERNEL_COMPILE_WORKERS` | 8 | 共享编译池大小 | `cache/async_compile.py:342` |
 | `DLKERNEL_ASYNC_COMPILE_START` | `forkserver` | 改 `spawn` 关掉 sidecar | `cache/async_compile.py:312` |
 
@@ -655,7 +659,7 @@ torch.compile 路线不 tune：`__call__` 在 `torch.compiler.is_compiling()` �
 
 - **cut 落在 2 的幂 bucket 区间内部，是"刻意耦合"而非错配**：K 组 cut 79.07 与 M 组 cut 1194.67 都不在 bucket 边界上；bucket 只按 2 的幂切（`average_rows_bucket`，`varlen_selector.py:636-647`）。因此同一个 bucket 里必然可能同时存在两片叶子的 workload，`selector_leaf` 进 key 正是为此（`selector_leaf_id` docstring，`varlen_selector.py:349-356`；测试 `test_gemm_token_bucket_separates_same_bucket_across_selector_leaves`）。
 - **两个函数用了不同的除法**：bucket 用 `ceil(rows/experts)`（`:640`），叶子用精确浮点 `routed_rows / expert_count`（`:329`）。当 `rows` 是 `experts` 的整数倍时二者相等；否则 ceil 大一点点，只会影响是否跨过 bucket 的 2 的幂边界，不会让 bucket 与叶子的判定互相污染（叶子完全不用 bucket）。这是可接受的不一致；但要改 bucket 语义，必须同时确认叶子不受影响。
-- **epilogue 入口同样拿到 bucket 塌缩**：`tuned_mod_gemm`（epilogue 路径）与普通 GEMM 共用同一机制。`_get_tuner` 传入 `policy=GemmEpilogueTunePolicy(mod, transform_a)`（`gemm_runtime/autotune.py:365-368`）。`Autotuner.__call__` 每次先走 `policy.make_key`（`autotuner.py:507`）。`GemmEpilogueTunePolicy` 继承 `VarlenGemmTunePolicy`，`bind_signature` 检测到签名含 `cu_seqlens_m/k` 时置 `_varlen_params`（`varlen_selector.py:880-883`），`make_key` 据此调用 `gemm_tune_key`，并把 epilogue 输出/scratch 按 `ragged_m_out_names`（默认含 `out/C/D` 与声明输出）和 `ta__*` 等 opaque 名单处理（`gemm_epilogue_tune_policy.py:50-62`）。静态 `key=` 只在无 varlen 参数时才直接成为最终 key。带 epilogue 的 routed MoE GEMM（`cu_seqlens_m` 经 `tuned_mod_gemm` 进入）同样命中 bucket key，不会因 routed 行数变化而冷启动。
+- **epilogue 入口同样拿到 bucket 塌缩**：`tuned_mod_gemm`（epilogue 路径）与普通 GEMM 共用同一机制。`_get_tuner` 传入 `policy=GemmEpilogueTunePolicy(mod, transform_a)`（`gemm_runtime/autotune.py:365-368`）。`Autotuner.__call__` 每次先走 `policy.make_key`（`autotuner.py:563`）。`GemmEpilogueTunePolicy` 继承 `VarlenGemmTunePolicy`，`bind_signature` 检测到签名含 `cu_seqlens_m/k` 时置 `_varlen_params`（`varlen_selector.py:880-883`），`make_key` 据此调用 `gemm_tune_key`，并把 epilogue 输出/scratch 按 `ragged_m_out_names`（默认含 `out/C/D` 与声明输出）和 `ta__*` 等 opaque 名单处理（`gemm_epilogue_tune_policy.py:50-62`）。静态 `key=` 只在无 varlen 参数时才直接成为最终 key。带 epilogue 的 routed MoE GEMM（`cu_seqlens_m` 经 `tuned_mod_gemm` 进入）同样命中 bucket key，不会因 routed 行数变化而冷启动。
 - **`MIN_RULE_KEEP`/`KEEP` 与候选网格强绑定**：规则表是照着 SM90 的 tile 网格冻结的（`varlen_selector.py:539-554` 的区间检查）。**任何对 `_get_sm90_configs` 的增删都可能让某片叶子的规则体超出 `[4, 8]` → 该 workload 整体回退全集**（不会出错，只是变慢）。`test_four_leaves_return_the_frozen_candidate_sets` 会把这种改动直接测挂，这是有意的护栏。
 
 ### 9.3 缓存 / 生命周期
@@ -688,7 +692,7 @@ torch.compile 路线不 tune：`__call__` 在 `torch.compiler.is_compiling()` �
 1. 改 `DLKernel/gemm_config.py` 的 `_get_sm80/_sm90/_sm100/_sm120_configs`（`:194`、`:115`、`:227`、`:265`）。`GemmConfig` 字段见 `:37-55`（`tile_m, tile_n, tile_k, num_warps, pingpong, is_dynamic_persistent, cluster_m/n/k, split_k, swap_ab, max_swizzle_size, device_capacity, use_tma_gather`）。
 2. 如果它可能在 varlen 场景存活：跑 `tests/test_varlen_selector.py`。规则体的 `[MIN_RULE_KEEP, KEEP]` 预算可能被打破。这是安全失败（回退全集），但你会丢掉剪枝收益；此时要么调整规则表，要么接受。
 3. 如果它需要新的合法性约束（例如"某 epilogue 不支持它"），把规则加到 `config_supports`（`:98`）或 `blockscaled_config_ok`（`:71`）。**这两处是"单一声明"，两条剪枝路径都调它们**。不要只在 `prune_structural_gemm_configs`（`gemm_tune_policy.py:87`）里加特例。
-4. 预期副作用：候选字符串进入磁盘 key（`autotuner.py:419-421`），**所有 tune JSON 立即失效**；每个 shape 会重新 tune 一次。
+4. 预期副作用：候选字符串进入磁盘 key（`autotuner.py:433-437`），**所有 tune JSON 立即失效**；每个 shape 会重新 tune 一次。
 5. epilogue 侧候选来自 `_config_space`（`gemm_runtime/autotune.py:76-93`）+ `prune_epilogue_configs`，前者复用 `get_all_configs(epilogue=hint)`。
 
 ### 10.2 加一个 tune 维度（key 维度）
@@ -704,7 +708,7 @@ torch.compile 路线不 tune：`__call__` 在 `torch.compiler.is_compiling()` �
 
 当前范式：写一个 `fn(configs, named_args, **kwargs) -> list[AutotuneConfig]` 放进 `TunePolicy.prepare_candidates`。两个现成样例：`prune_structural_gemm_configs`（`gemm_tune_policy.py:87`，合并 `named_args | kwargs`）与 `GemmEpilogueTunePolicy.prepare_candidates` → `prune_epilogue_configs`（`gemm_epilogue_tune_policy.py:64-66`、`epilogue/legality.py:54`）。
 
-**铁律**：剪枝只在冷 key 时执行（`autotuner.py:520-526`）。任何只被剪枝读取、却没进 key 的输入，都会把一个"为 A 剪出来的候选集"复用到"B"上。加规则前先确认它的输入已在 key 里。
+**铁律**：剪枝只在冷 key 时执行（`autotuner.py:576-582`）。任何只被剪枝读取、却没进 key 的输入，都会把一个"为 A 剪出来的候选集"复用到"B"上。加规则前先确认它的输入已在 key 里。
 
 ### 10.4 加一片选择器叶子（新规则 / 新特征）
 

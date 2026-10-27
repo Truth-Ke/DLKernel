@@ -2,32 +2,32 @@
 # Copyright (C) 2025, Tri Dao.
 from __future__ import annotations
 
+import base64
 import builtins
+import hashlib
+import inspect
+import json
 import math
 import os
 import sys
+import tempfile
 import time
-import inspect
-import base64
-import hashlib
-import json
-import fcntl
-from pathlib import Path
+import warnings
 from functools import cached_property, partial
-from typing import Dict, Tuple, List, Optional, Any
+from pathlib import Path
+
+import torch
+import triton
+from torch import Tensor
+
 from DLKernel.bench.bench_utils import (
     _bench_cuda_graph_l2_rotate,
     _clone_l2_rotate_inputs,
     _pick_l2_rotate_count,
 )
-
-import torch
-from torch import Tensor
-
-import triton
+from DLKernel.gemm_config import TuneMode
 
 from . import __version__
-
 
 PACKAGE_NAME = "dlkernel"
 VERSION = __version__
@@ -39,7 +39,7 @@ _DEFAULT_BENCH_WARMUP_MS = float(_BENCH_SIGNATURE["warmup_target_ms"].default)
 _DEFAULT_BENCH_TIMED_CALLS = int(_BENCH_SIGNATURE["n_timed_calls"].default)
 
 
-def _canonical_bench_budget() -> Tuple[float, int]:
+def _canonical_bench_budget() -> tuple[float, int]:
     """Parse and clamp the optional routed benchmark budget once per miss.
 
     Invalid values fail closed with an actionable error instead of surfacing as
@@ -100,15 +100,21 @@ def get_home_dir():
 
 
 def default_cache_dir():
+    """The tuning caches' single resolution point: ``DLKERNEL_CACHE_DIR``
+    overrides the whole root (winner files and contract_winners alike),
+    else ``$DLKERNEL_HOME`` (or the real home) hosts ``.dlkernel/cache``.
+    No tuning-cache path may bypass this — a split resolution is how the
+    2026-10-27 incident's per-arm isolation silently missed one family."""
+    override = os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip()
+    if override:
+        return override
     return os.path.join(get_home_dir(), f".{PACKAGE_NAME}", "cache")
 
 
 class FileCacheManager(triton.runtime.cache.FileCacheManager):
     def __init__(self, key):
         super().__init__(key)
-        self.cache_dir = (
-            os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_DIR", "").strip() or default_cache_dir()
-        )
+        self.cache_dir = default_cache_dir()
         if self.cache_dir:
             self.cache_dir = os.path.join(self.cache_dir, self.key)
             self.lock_path = os.path.join(self.cache_dir, "lock")
@@ -192,6 +198,15 @@ class TunePolicy:
     def make_key(self, args, kwargs, default_key):
         return default_key()
 
+    def make_contract(self, args, kwargs, default_key):
+        """Fixed operator contract F for RUNNING's once-per measurement.
+
+        Return the contract tuple, or ``None`` to fall back to the winner key
+        W (operators without a declared dynamic dimension keep F == W).  Runs
+        on cache misses only and, like ``make_key``, must never synchronize.
+        """
+        return
+
     def bind_signature(self, arg_names, arg_defaults):
         """Receive the decorated function signature when the tuner is built.
 
@@ -243,12 +258,10 @@ class Autotuner:
             self.configs = configs
         signature = inspect.signature(fn)
         self.keys = key
-        self.cache: Dict[Tuple, AutotuneConfig] = {}
+        self.cache: dict[tuple, AutotuneConfig] = {}
         self.arg_names = list(signature.parameters.keys())
         self._arg_positions = {name: index for index, name in enumerate(self.arg_names)}
-        self.arg_defaults = tuple(
-            parameter.default for parameter in signature.parameters.values()
-        )
+        self.arg_defaults = tuple(parameter.default for parameter in signature.parameters.values())
         self._arg_name_set = frozenset(self.arg_names)
         self.cache_results = (
             cache_results or os.getenv(f"{PACKAGE_NAME.upper()}_CACHE_AUTOTUNING", None) == "1"
@@ -288,14 +301,35 @@ class Autotuner:
         # indirection; custom policies pay one call per hook they use.
         self._base_policy = type(self.policy) is TunePolicy
         self._policy_make_key = self.policy.make_key
+        self._policy_make_contract = self.policy.make_contract
         self._policy_budget_override = self.policy.budget_override
+        #: Contracts (F) with a successful in-process sweep: RUNNING's
+        #: once-per-contract measurement quota, shared with TUNED sweeps.
+        self._measured_contracts: set = set()
+        #: Winner-key digests already warned about on the fallback path.
+        self._fallback_warned: set = set()
         #: Set per call from ``policy.budget_override(key)``: True only when the
         #: policy tuned this call under its own routed/varlen key.  The
         #: environment bench-budget overrides are documented varlen-only and
         #: hang off exactly this signal.
         self._budget_override = False
+        #: Last call's winner (None = resolved inside the op by the fallback
+        #: or default chain) and its provenance: True when the -1 fallback
+        #: resolved this call.  Plan caching keys off the latter — a fallback
+        #: config must not be pinned (gemm_interface).
+        self.best_config = None
+        self.used_fallback = False
+        #: Contract F -> its measured winner, transferred across that
+        #: contract's token buckets on RUNNING/STATIC misses (2026-10-22
+        #: design; see _contract_winner).  Never adopted into ``self.cache``
+        #: — a peer's per-key winner must still upgrade the next call.
+        self._contract_winners: dict = {}
+        #: key -> (contract-winner config, its disk-winner file path): the
+        #: steady-miss fast path.  Written by the reuse branch, invalidated
+        #: the moment the winner file appears (peer publication wins).
+        self._reuse_resolved: dict = {}
 
-    def _bench_budget(self) -> Tuple[float, int]:
+    def _bench_budget(self) -> tuple[float, int]:
         """``(warmup_ms, timed_calls)`` for the L2-cold protocol.
 
         Dense calls always get the historical protocol.  Only a call whose
@@ -410,10 +444,11 @@ class Autotuner:
             return [float("inf"), float("inf"), float("inf")]
 
     @torch.compiler.disable
-    def check_disk_cache(self, tuning_key, configs, bench_fn):
+    def check_disk_cache(self, tuning_key, configs, bench_fn) -> bool:
+        """True iff ``bench_fn`` ran (a disk load is not a measurement)."""
         if not tuning_key:
             bench_fn()
-            return
+            return True
 
         fn = self.fn
         config_str_list = [str(c) for c in configs]
@@ -422,26 +457,10 @@ class Autotuner:
         cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
         cache = FileCacheManager(_base32(cache_key))
         file_name = f"{fn.__name__[:150]}.autotune.json"
-        path = cache.get_file(file_name)
-
-        def load_cached(path):
-            str2config = {s: c for s, c in zip(config_str_list, configs)}
-            with open(path, "r") as cached_configs:
-                timings = json.load(cached_configs)["configs_timings"]
-                timings = {str2config[config]: timing for config, timing in timings}
-                self.cache[tuning_key] = builtins.min(timings, key=timings.get)
-                self.configs_timings = timings
-                self.bench_time = 0
 
         # There's an environment variable to force cache update
-        force_update = _env_flag(f"{PACKAGE_NAME.upper()}_FORCE_CACHE_UPDATE")
-        if path and not force_update:
-            _tune_trace(
-                f"DLKERNEL_TUNE_DISK_HIT fn={fn.__name__} "
-                f"key={_key_digest(tuning_key)} path={path}"
-            )
-            load_cached(path)
-            return
+        if self._load_disk_winner(tuning_key, configs):
+            return False
 
         # ``DLKERNEL_REQUIRE_TUNE_CACHE=1`` turns a cold key into an error
         # instead of a bench: it is how a caller asserts "this shape was warmed
@@ -462,30 +481,164 @@ class Autotuner:
         # legitimate bench, not cache I/O. Tunable for tests.
         from DLKernel.cache.jit import FileLock as _FileLock
 
-        lock_timeout = float(
-            os.environ.get(f"{PACKAGE_NAME.upper()}_TUNE_LOCK_TIMEOUT_S", "600")
-        )
-        _tune_trace(
-            f"DLKERNEL_TUNE_DISK_MISS fn={fn.__name__} key={_key_digest(tuning_key)}"
-        )
+        lock_timeout = float(os.environ.get(f"{PACKAGE_NAME.upper()}_TUNE_LOCK_TIMEOUT_S", "600"))
+        _tune_trace(f"DLKERNEL_TUNE_DISK_MISS fn={fn.__name__} key={_key_digest(tuning_key)}")
         with _FileLock(Path(lock_path), exclusive=True, timeout=lock_timeout):
-            path = cache.get_file(file_name)
-            if path and not force_update:
-                load_cached(path)
-                return
+            if self._load_disk_winner(tuning_key, configs):
+                return False
             bench_fn()
             cache.put(
                 json.dumps(
                     {
                         "key": str(tuning_key),
                         "configs_timings": [
-                            (str(config), timings) for config, timings in self.configs_timings.items()
+                            (str(config), timings)
+                            for config, timings in self.configs_timings.items()
                         ],
                     }
                 ),
                 file_name,
                 binary=False,
-                )
+            )
+        return True
+
+    def _bound_tune_mode(self, args, kwargs):
+        """The call's TuneMode: keyword beats position; absent -> legacy."""
+        if "tune_mode" in kwargs:
+            return kwargs["tune_mode"]
+        position = self._arg_positions.get("tune_mode")
+        if position is not None and position < len(args):
+            return args[position]
+        return None
+
+    def _load_disk_winner(self, tuning_key, configs) -> bool:
+        """Read-only winner lookup; on hit, load it into ``self.cache``.
+
+        Shared by the tuning path (unlocked first read and the in-lock
+        re-check of ``check_disk_cache``) and by STATIC / spent-RUNNING
+        misses, which must see winners other processes publish without ever
+        measuring.  ``DLKERNEL_FORCE_CACHE_UPDATE`` makes every entry a miss.
+        """
+        if not tuning_key:
+            return False
+        fn = self.fn
+        config_str_list = [str(c) for c in configs]
+        cache_key = [VERSION, str(tuning_key)] + config_str_list
+        cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
+        cache = FileCacheManager(_base32(cache_key))
+        file_name = f"{fn.__name__[:150]}.autotune.json"
+        path = cache.get_file(file_name)
+        if not path or _env_flag(f"{PACKAGE_NAME.upper()}_FORCE_CACHE_UPDATE"):
+            return False
+        _tune_trace(
+            f"DLKERNEL_TUNE_DISK_HIT fn={fn.__name__} key={_key_digest(tuning_key)} path={path}"
+        )
+        str2config = {s: c for s, c in zip(config_str_list, configs)}
+        with open(path, "r") as cached_configs:
+            timings = json.load(cached_configs)["configs_timings"]
+            timings = {str2config[config]: timing for config, timing in timings}
+        self.cache[tuning_key] = builtins.min(timings, key=timings.get)
+        self.configs_timings = timings
+        self.bench_time = 0
+        return True
+
+    def _winner_file_path(self, tuning_key, configs):
+        """The disk-winner file this (key, candidate list) reads — keep the
+        construction byte-identical to ``_load_disk_winner``'s lookup."""
+        config_str_list = [str(c) for c in configs]
+        cache_key = [VERSION, str(tuning_key)] + config_str_list
+        cache_key = hashlib.sha256("-".join(cache_key).encode("utf-8")).hexdigest()
+        cache = FileCacheManager(_base32(cache_key))
+        return Path(cache.cache_dir) / f"{self.fn.__name__[:150]}.autotune.json"
+
+    def _contract_winner_path(self, contract):
+        return Path(default_cache_dir()) / "contract_winners" / f"{_key_digest(contract)}.json"
+
+    def _contract_winner(self, contract, configs):
+        """The contract F's measured winner, valid for THIS call's candidate
+        space: memory first, then (disk-enabled tuners only) the per-contract
+        file a peer or an earlier process wrote.  ``None`` when the contract
+        has never been measured anywhere, or the recorded config is not in
+        the current space (space drifted — resolve afresh, never run a
+        foreign config)."""
+        if contract is None:
+            return None
+        winner = self._contract_winners.get(contract)
+        if winner is None:
+            if not self.cache_results:
+                return None
+            path = self._contract_winner_path(contract)
+            try:
+                if not path.is_file():
+                    return None
+                with open(path) as fh:
+                    recorded = json.load(fh)["config"]
+            except (OSError, ValueError, KeyError):
+                return None
+            by_str = {str(c): c for c in configs}
+            winner = self._contract_winners[contract] = by_str.get(recorded)
+            return winner
+        return winner if str(winner) in {str(c) for c in configs} else None
+
+    def _record_contract_winner(self, contract, config):
+        """Remember the contract's winner (memory always; one small file for
+        cold processes, disk-enabled tuners only) whenever a winner lands for
+        any of its keys."""
+        self._contract_winners[contract] = config
+        if not self.cache_results:
+            return
+        path = self._contract_winner_path(contract)
+        try:
+            if path.is_file():
+                with open(path) as fh:
+                    try:
+                        if json.load(fh).get("config") == str(config):
+                            return
+                    except ValueError:
+                        pass  # torn file from a racing peer: rewrite it whole
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Never truncate the live file in place: ranks record the same
+            # contract concurrently (2026-10-27 incident), and open("w")
+            # interleaves into torn JSON whose readers then crash. Land a
+            # complete file under a mkstemp-private name and rename it into
+            # place — cache.jit's publish protocol, last-writer-wins edition.
+            fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.tmp.", dir=path.parent)
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"config": str(config)}, fh)
+            os.replace(tmp_name, path)
+        except OSError:
+            pass  # read-only cache dirs: reuse stays in-process
+
+    def _run_no_winner_fallback(self, key, args, kwargs):
+        """The -1 path: no winner for this key AND the contract was never
+        measured anywhere — the operator's own analytical fallback resolves
+        the config inside the op.  No winner is manufactured or persisted,
+        and a later published winner stays visible because misses are never
+        memoized negatively."""
+        if os.environ.get(f"{PACKAGE_NAME.upper()}_REQUIRE_TUNE_CACHE") == "1":
+            raise RuntimeError(
+                f"Missing autotune cache for {self.fn.__name__}; prewarm this shape "
+                f"before the run starts (key={_key_digest(key)})"
+            )
+        digest = _key_digest(key)
+        if digest not in self._fallback_warned:
+            self._fallback_warned.add(digest)
+            warnings.warn(
+                f"{PACKAGE_NAME}: no measured winner for {self.fn.__name__} "
+                f"(key={digest}); running the operator's analytical fallback. "
+                f"Measure this shape (TuneMode.TUNED or the production tuner) "
+                f"to upgrade it.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        _tune_trace(f"AUTOTUNE_FALLBACK_HEURISTIC fn={self.fn.__name__} key={digest}")
+        self.used_fallback = True
+        # The config was resolved INSIDE the op (heuristic/default chain);
+        # at tuner level there is no winner to report.
+        self.best_config = None
+        ret = self.fn(*args, **kwargs)
+        self.nargs = None
+        return ret
 
     @staticmethod
     def _validate_candidate_pipeline(prepared, shortlisted):
@@ -506,8 +659,25 @@ class Autotuner:
         return prepared, shortlisted
 
     def __call__(self, *args, **kwargs):
+        # Provenance of THIS call's config resolution: True when the -1
+        # fallback resolved it (no measured winner anywhere).  Execution-plan
+        # caches read this to avoid pinning a fallback plan over a winner a
+        # peer process may publish later (plan v4: misses are never memoized
+        # negatively).  Reset first so every entry path starts False.
+        self.used_fallback = False
+        # A pinned config legitimately bypasses auto-selection (v4 §1):
+        # no sweep, no winner-cache consult — straight to the op.  Binding
+        # mirrors _bound_tune_mode (keyword first, then position).
+        pinned = kwargs.get("config")
+        if pinned is None:
+            position = self._arg_positions.get("config")
+            if position is not None and position < len(args):
+                pinned = args[position]
+        if pinned is not None:
+            return self.fn(*args, **kwargs)
         used_cached_result = True
         if len(self.configs) > 1:
+            config = None
             if self._base_policy:
                 key = None
                 self._budget_override = False
@@ -528,6 +698,26 @@ class Autotuner:
             if key not in self.cache:
                 self.nargs = named_args
                 used_cached_result = False
+                memo = self._reuse_resolved.get(key)
+                if memo is not None and self._bound_tune_mode(args, kwargs) in (
+                    TuneMode.STATIC,
+                    TuneMode.RUNNING,
+                ):
+                    # Steady-miss fast path (2026-10-22): this key already
+                    # resolved to the contract winner; skip the candidate
+                    # prep / contract scan below.  One stat per call keeps
+                    # peer-published winners visible — the memo dies the
+                    # moment the winner file appears, and the full miss path
+                    # below loads it (memory hit from then on).  TUNED/legacy
+                    # never take this branch: they must sweep on a miss.
+                    reused_cfg, winner_file = memo
+                    if Path(winner_file).is_file():
+                        del self._reuse_resolved[key]
+                    else:
+                        self.best_config = reused_cfg
+                        ret = self.fn(*args, **kwargs, **reused_cfg.all_kwargs())
+                        self.nargs = None
+                        return ret
                 prepared_configs = self.policy.prepare_candidates(self.configs, self.nargs, kwargs)
                 prepared_input = list(prepared_configs)
                 prepared_snapshot = list(prepared_input)
@@ -540,7 +730,7 @@ class Autotuner:
                 )
 
                 @torch.compiler.disable  # Don't want any tracing here
-                def benchmark():
+                def benchmark() -> bool:
                     # Compile/bench overlap via the async compile pool
                     # (DLKernel.cache.async_compile): the bench loop runs inside
                     # pool_scope(). A config whose kernel isn't compiled yet
@@ -679,14 +869,74 @@ class Autotuner:
                             f"all {len(timings)} candidates failed for {self.fn.__name__}{key}"
                         )
                     self.cache[key] = builtins.min(finite_timings, key=finite_timings.get)
+                    return True
+                    # (an all-failed sweep raises above; a raise must not
+                    # consume the RUNNING quota)
 
-                if self.cache_results:
-                    self.check_disk_cache(key, pruned_configs, benchmark)
+                # TuneMode dispatch (v4 plan §2.2).  ``None`` = the operator
+                # does not take a tune_mode parameter: legacy behaviour,
+                # untouched.  Measured winners are shared across all modes; only
+                # a successful in-process sweep consumes RUNNING's quota.
+                mode = self._bound_tune_mode(args, kwargs)
+                if mode in (TuneMode.TUNED, TuneMode.STATIC, TuneMode.RUNNING):
+                    # STATIC needs the contract too: its miss path reuses the
+                    # contract's already-measured winner (2026-10-22 design).
+                    contract = self._policy_make_contract(args, kwargs, lambda: key) or key
                 else:
-                    benchmark()
-
-            config = self.cache[key]
+                    contract = None
+                tune_now = (
+                    mode is None
+                    or mode == TuneMode.TUNED
+                    or (mode == TuneMode.RUNNING and contract not in self._measured_contracts)
+                )
+                if tune_now:
+                    swept = (
+                        self.check_disk_cache(key, pruned_configs, benchmark)
+                        if self.cache_results
+                        else benchmark()
+                    )
+                    # v4 §2.2: only a sweep THIS process executed consumes the
+                    # RUNNING quota — a disk load (including one read under the
+                    # lock) leaves the contract's first measurement available.
+                    if swept and contract is not None:
+                        self._measured_contracts.add(contract)
+                elif not (self.cache_results and self._load_disk_winner(key, pruned_configs)):
+                    # No measured winner for THIS key.  Design (2026-10-22):
+                    # reuse the contract F's already-measured winner — the
+                    # first online tune under this operator contract transfers
+                    # across token buckets.  Executed with the config explicit
+                    # (winner semantics: plan/recipe caching allowed); NOT
+                    # adopted into ``self.cache`` so a peer publishing THIS
+                    # key's own winner is still picked up on the next call.
+                    reused = self._contract_winner(contract, pruned_configs)
+                    if reused is not None:
+                        _tune_trace(
+                            f"AUTOTUNE_CONTRACT_REUSE fn={self.fn.__name__} "
+                            f"contract={_key_digest(contract)} key={_key_digest(key)}"
+                        )
+                        config = reused
+                        self._reuse_resolved[key] = (
+                            reused,
+                            str(self._winner_file_path(key, pruned_configs)),
+                        )
+                    else:
+                        return self._run_no_winner_fallback(key, args, kwargs)
+                if contract is not None and config is None:
+                    # A winner landed for this key (sweep or disk load): it is
+                    # the contract's winner now.  (Reuse already set `config`.)
+                    self._record_contract_winner(contract, self.cache[key])
+            if config is None:
+                # Memory hit, or a miss resolved through the sweep/disk path.
+                config = self.cache[key]
         else:
+            # Single-candidate operators (plan §2: mode/REQUIRE semantics
+            # apply here too): REQUIRE still asserts -- auto-selection without
+            # a measured winner is what the flag forbids.
+            if os.environ.get(f"{PACKAGE_NAME.upper()}_REQUIRE_TUNE_CACHE") == "1":
+                raise RuntimeError(
+                    f"Missing autotune cache for {self.fn.__name__}; prewarm this shape "
+                    f"before the run starts (single-candidate operator, keyless path)"
+                )
             config = self.configs[0]
         self.best_config = config
         # Cheap flag first: the getenv (plus its f-string) is measurable on the
@@ -713,18 +963,20 @@ class Autotuner:
             if position is not None and position < len(args):
                 key.append(args[position])
                 continue
-            default = self.arg_defaults[position] if position is not None else inspect.Parameter.empty
+            default = (
+                self.arg_defaults[position] if position is not None else inspect.Parameter.empty
+            )
             if default is not inspect.Parameter.empty:
                 key.append(default)
         for arg in args:
             if isinstance(arg, Tensor):
                 key.append(tuple(arg.shape))
-                key.append(tuple([s if s < 2 else 2 for s in arg.stride()]))
+                key.append(tuple([min(2, s) for s in arg.stride()]))
                 key.append(arg.dtype)
         for name, arg in kwargs.items():
             if isinstance(arg, Tensor) and name in self._arg_name_set:
                 key.append(tuple(arg.shape))
-                key.append(tuple([s if s < 2 else 2 for s in arg.stride()]))
+                key.append(tuple([min(2, s) for s in arg.stride()]))
                 key.append(arg.dtype)
         return tuple(key)
 
@@ -762,14 +1014,19 @@ class AutotuneConfig:
 
 
 def autotune(
-    configs, key=None, restore_value=None, do_bench=None, cache_results=True, policy=None,
+    configs,
+    key=None,
+    restore_value=None,
+    do_bench=None,
+    cache_results=True,
+    policy=None,
 ):
-    f"""
-    Decorator for auto-tuning a function function.
+    """
+    Decorator for auto-tuning a function.
 
     .. highlight:: python
 
-    If the environment variable :code:`{PACKAGE_NAME.upper()}_PRINT_AUTOTUNING` is set to
+    If the environment variable :code:`DLKERNEL_PRINT_AUTOTUNING` is set to
     :code:`"1"`, we will print a message to stdout after autotuning each
     kernel, including the time spent autotuning and the best configuration.
 

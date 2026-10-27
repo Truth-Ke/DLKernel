@@ -1,9 +1,8 @@
 # Copyright (C) 2025, Tri Dao.
 import itertools
-from enum import IntEnum
-from typing import Optional, List
-from functools import lru_cache, partial
 from dataclasses import dataclass
+from enum import IntEnum
+from functools import cache, partial
 
 
 class SplitKMode(IntEnum):
@@ -31,6 +30,22 @@ class SplitKMode(IntEnum):
     # kernel (DLKernel/split_k_reduce.py) sums them in a deterministic order and applies
     # the epilogue.
     SEPARATE = 2
+
+
+class TuneMode(IntEnum):
+    """How a tune-cache miss resolves for an operator with auto-selection.
+
+    ``TUNED`` measures every uncovered winner key W.  ``STATIC`` never
+    measures: a miss runs the operator's own analytical fallback.  ``RUNNING``
+    measures once per fixed operator contract F per process, then behaves like
+    ``STATIC`` for new winner keys of an already-measured contract.  Measured
+    winners are shared across all three modes.  IntEnum so the value crosses
+    the torch.library custom-op schema as a plain int, like ``SplitKMode``.
+    """
+
+    TUNED = 0
+    STATIC = 1
+    RUNNING = 2
 
 
 @dataclass(frozen=True)
@@ -113,9 +128,9 @@ def config_supports(config: GemmConfig, *, gather_A: bool = False, varlen_m: boo
 
 
 def _get_sm90_configs(
-    epilogue: Optional[str] = None,
+    epilogue: str | None = None,
     tune_coop: bool = True,
-) -> List[GemmConfig]:
+) -> list[GemmConfig]:
     tile_n_vals = [128, 160, 192, 208]
     tile_mn_vals_coop = [(256, tile_n) for tile_n in tile_n_vals] + [
         (128, 224),
@@ -160,7 +175,7 @@ def _get_sm90_configs(
     ]
 
 
-def get_sm90_dynamic_varlen_configs() -> List[GemmConfig]:
+def get_sm90_dynamic_varlen_configs() -> list[GemmConfig]:
     """Dynamic-persistent twins for the varlen K-group rule tree (SM90).
 
     The SM90 dynamic tile scheduler claims one output tile at a time from a GMEM
@@ -191,7 +206,7 @@ def get_sm90_dynamic_varlen_configs() -> List[GemmConfig]:
     ]
 
 
-def _get_sm80_configs() -> List[GemmConfig]:
+def _get_sm80_configs() -> list[GemmConfig]:
     tile_mn_warps_vals = [
         (128, 128, 4),
         (128, 128, 8),
@@ -225,8 +240,8 @@ def _get_sm80_configs() -> List[GemmConfig]:
 
 
 def _get_sm100_configs(
-    epilogue: Optional[str] = None,
-) -> List[GemmConfig]:
+    epilogue: str | None = None,
+) -> list[GemmConfig]:
     tile_n_vals = [16, 32, 64, 128, 160, 192, 224, 256]
     tile_mn_cluster_vals = (
         [(128, tile_n, (1, 1)) for tile_n in tile_n_vals]
@@ -263,9 +278,9 @@ def _get_sm100_configs(
 
 
 def _get_sm120_configs(
-    epilogue: Optional[str] = None,
+    epilogue: str | None = None,
     tune_coop: bool = True,
-) -> List[GemmConfig]:
+) -> list[GemmConfig]:
     tile_mn_vals_coop = [(128, 128), (128, 64), (64, 128), (128, 160), (128, 192)]
     tile_mn_vals_pingpong = [(128, 128), (128, 64), (64, 128), (128, 160)]
     tile_mn_vals = []
@@ -292,9 +307,9 @@ def _get_sm120_configs(
 
 
 def get_all_configs(
-    epilogue: Optional[str] = None,
+    epilogue: str | None = None,
     tune_coop: bool = True,
-) -> List[GemmConfig]:
+) -> list[GemmConfig]:
     """Return autotuning configs for all supported device capabilities.
 
     Each GemmConfig is tagged with its target device_capacity, so the caller can
@@ -345,7 +360,7 @@ def blockscaled_default_config(m: int, n: int, device_capacity: int = 10) -> Gem
     return _blockscaled_config(tile_m, tile_n, cluster)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _blockscaled_config(tile_m, tile_n, cluster, device_capacity=10, pingpong=False):
     return GemmConfig(
         tile_m=tile_m,
@@ -358,7 +373,7 @@ def _blockscaled_config(tile_m, tile_n, cluster, device_capacity=10, pingpong=Fa
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _default_config_for_cap(cap):
     if cap == 8:
         return GemmConfig(

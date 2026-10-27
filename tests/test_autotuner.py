@@ -32,6 +32,114 @@ def _bucket_key(args, kwargs=None):
     return gemm_tune_key(args, kwargs or {}, gemm_tuned.arg_names)
 
 
+def _contract_key(args, kwargs=None):
+    """Fixed-contract identity (F), mirroring ``_bucket_key``'s W harness."""
+    from DLKernel.gemm_interface import gemm_tuned
+    from DLKernel.varlen_selector import gemm_contract_key
+
+    return gemm_contract_key(args, kwargs or {}, gemm_tuned.arg_names)
+
+
+def _varlen_m_args(rows, *, experts=32, k=2048, n=1024, dtype=None, b=None, cu=None):
+    """Positional ``gemm_tuned`` args for a varlen-M call with packed expert-major B."""
+    import torch
+
+    dtype = dtype or torch.bfloat16
+    b = torch.empty((experts, k, n), dtype=dtype) if b is None else b
+    cu = torch.zeros((experts + 1,), dtype=torch.int32) if cu is None else cu
+    return (
+        torch.empty((rows, k), dtype=dtype),
+        b,
+        torch.empty((rows, n), dtype=dtype),
+        None,
+        None,
+        1.0,
+        1.0,
+        cu,
+        None,
+        None,
+    )
+
+
+def test_gemm_contract_key_strips_declared_token_dims_only():
+    # C3: only the declared token totals differ (same E/K/N weights geometry).
+    assert _contract_key(_varlen_m_args(32768)) == _contract_key(_varlen_m_args(60000))
+    # W still splits the same pair across buckets.
+    assert _bucket_key(_varlen_m_args(32768)) != _bucket_key(_varlen_m_args(60000))
+
+
+def test_gemm_contract_key_separates_fixed_geometry():
+    import torch
+
+    base = _contract_key(_varlen_m_args(4096))
+    # C1: different expert geometry (Qwen vs DeepSeek style E) is a new contract.
+    other_e = _contract_key(
+        _varlen_m_args(
+            4096,
+            experts=16,
+            b=torch.empty((16, 2048, 1024), dtype=torch.bfloat16),
+            cu=torch.zeros((17,), dtype=torch.int32),
+        )
+    )
+    assert base != other_e
+    # C2: projection width, dtype, and weight layout each form a new contract.
+    assert base != _contract_key(_varlen_m_args(4096, n=2048))
+    assert base != _contract_key(_varlen_m_args(4096, dtype=torch.float16))
+    b_n_major = torch.empty((32, 1024, 2048), dtype=torch.bfloat16)  # (E, N, K)
+    assert base != _contract_key(_varlen_m_args(4096, b=b_n_major.mT))
+    # Same contract, only data address/values differ -> same F.
+    assert base == _contract_key(_varlen_m_args(4096))
+
+
+def test_gemm_contract_key_varlen_k_folds_only_contraction_total():
+    import torch
+
+    def k_args(total_k, experts=32, m=128, n=1024):
+        return (
+            torch.empty((m, total_k)),
+            torch.empty((total_k, n)),
+            torch.empty((experts, m, n)),
+            None,
+            None,
+            1.0,
+            1.0,
+            None,
+            torch.zeros((experts + 1,), dtype=torch.int32),
+            None,
+        )
+
+    assert _contract_key(k_args(65536)) == _contract_key(k_args(131072))
+    assert _bucket_key(k_args(65536)) != _bucket_key(k_args(131072))
+
+
+def test_gemm_tune_and_contract_keys_exclude_tune_mode():
+    args = _varlen_m_args(4096)
+    base_w = _bucket_key(args)
+    base_f = _contract_key(args)
+    # Extra-kwargs collection path.
+    assert _bucket_key(args, {"tune_mode": 1}) == base_w
+    assert _contract_key(args, {"tune_mode": 1}) == base_f
+    # Signature-scalar collection path: same synthetic signature with and
+    # without the tune_mode parameter is the only allowed difference.
+    from DLKernel.varlen_selector import gemm_contract_key, gemm_tune_key
+
+    plain_names = ("A", "B", "out", "C", "bias", "alpha", "beta", "cu_seqlens_m")
+    mode_names = (*plain_names, "tune_mode")
+    a, b, out, cu = args[0], args[1], args[2], args[7]
+    base8 = (a, b, out, None, None, 1.0, 1.0, cu)
+    assert gemm_tune_key((*base8, 1), {}, mode_names) == gemm_tune_key(base8, {}, plain_names)
+    assert gemm_contract_key((*base8, 1), {}, mode_names) == gemm_contract_key(
+        base8, {}, plain_names
+    )
+
+
+def test_gemm_contract_key_dense_returns_none():
+    import torch
+
+    dense = (torch.empty((128, 64)), torch.empty((64, 128)), torch.empty((128, 128)))
+    assert _contract_key(dense) is None
+
+
 def test_autotune_config_supports_multi_kwarg_hash_and_equality():
     config_a = AutotuneConfig(block_m=128, num_warps=4)
     config_b = AutotuneConfig(block_m=128, num_warps=4)
@@ -344,6 +452,7 @@ def test_large_sm90_varlen_m_prunes_to_the_candidate_budget(monkeypatch):
     """End to end through the pruning hook: an in-envelope varlen call is
     reduced to the shipped budget, as a subset of the structural pool."""
     import torch
+
     import DLKernel.gemm_interface as gi
     from DLKernel.gemm_config import _get_sm90_configs
     from DLKernel.varlen_selector import KEEP
@@ -368,6 +477,7 @@ def test_large_sm90_varlen_m_prunes_to_the_candidate_budget(monkeypatch):
 
 def test_large_sm90_varlen_k_prunes_to_the_candidate_budget(monkeypatch):
     import torch
+
     import DLKernel.gemm_interface as gi
     from DLKernel.gemm_config import _get_sm90_configs
     from DLKernel.varlen_selector import KEEP
@@ -393,6 +503,7 @@ def test_large_sm90_varlen_out_of_coverage_keeps_the_structural_pool(monkeypatch
     and hand the structural pool (22 M-group / 44 K-group + 2 dynamic twins)
     to the autotuner."""
     import torch
+
     import DLKernel.gemm_interface as gi
     from DLKernel.gemm_config import _get_sm90_configs
 
@@ -422,6 +533,7 @@ def test_large_sm90_varlen_k_high_keeps_the_dynamic_twins(monkeypatch):
     """The k-high prune keeps the 6 static matches plus the measured
     dynamic-persistent twins; every other leaf rejects dynamic configs."""
     import torch
+
     import DLKernel.gemm_interface as gi
     from DLKernel.gemm_config import _get_sm90_configs, get_sm90_dynamic_varlen_configs
     from DLKernel.varlen_selector import KEEP
@@ -449,6 +561,7 @@ def test_large_sm90_varlen_k_high_keeps_the_dynamic_twins(monkeypatch):
 def test_large_sm90_varlen_selector_kill_switch(monkeypatch):
     """DLKERNEL_VARLEN_SELECTOR=0 restores the full structural pool."""
     import torch
+
     import DLKernel.gemm_interface as gi
     from DLKernel.gemm_config import _get_sm90_configs
     from DLKernel.varlen_selector import KEEP
@@ -472,8 +585,10 @@ def test_large_sm90_gather_prune_keeps_structural_filters(monkeypatch):
     """gather_A is outside the selector's coverage, so the structural rules are
     the only thing pruning: cluster_n == 1, no swap_ab, and use_tma_gather is
     rejected below SM100."""
-    import torch
     from dataclasses import replace
+
+    import torch
+
     import DLKernel.gemm_interface as gi
     from DLKernel.gemm_config import _get_sm90_configs
 
@@ -508,7 +623,7 @@ def test_autotune_bench_loop_defers_and_retries(monkeypatch):
     precompiles via fake tensors — the bench loop discovers cold keys with
     the real tensors in-process and overlaps compilation via the pool.
     """
-    from DLKernel.autotuner import Autotuner, AutotuneConfig
+    from DLKernel.autotuner import AutotuneConfig, Autotuner
     from DLKernel.cache import async_compile
     from DLKernel.cache.async_compile import CompilePending
 
@@ -567,7 +682,7 @@ def test_autotune_wedged_pool_falls_back_in_process(monkeypatch):
     so autotuning always terminates.
     """
     import DLKernel.autotuner as at
-    from DLKernel.autotuner import Autotuner, AutotuneConfig
+    from DLKernel.autotuner import AutotuneConfig, Autotuner
     from DLKernel.cache import async_compile
     from DLKernel.cache.async_compile import CompilePending, get_active_pool
 
@@ -731,11 +846,148 @@ def test_bench_budget_rejects_invalid_environment_values(monkeypatch):
         tuner._bench_budget()
 
 
+# ---------------------------------------------------------------------------
+# TuneMode chain semantics (v4 plan §2.2): measured winners are shared across
+# modes; STATIC never benches; RUNNING tunes once per fixed contract F.  The
+# harness drives W and F off different tensor axes so the two identities vary
+# independently: x = torch.empty(n) gives W = n // 10 and F = n % 10.
+# ---------------------------------------------------------------------------
+
+
+def _mode_harness():
+
+    from DLKernel.autotuner import AutotuneConfig, Autotuner, TunePolicy
+
+    class Recorder:
+        fn_configs = None
+        bench_calls = 0
+
+    rec = Recorder()
+    rec.fn_configs = []
+
+    def fn(x, config=None, **kw):
+        rec.fn_configs.append(config)
+
+    def do_bench(kernel_call, quantiles=None, **kw):
+        kernel_call()
+        rec.bench_calls += 1
+        return [1.0, 1.0, 1.0]
+
+    class WF_Policy(TunePolicy):
+        def make_key(self, args, kwargs, default_key):
+            return ("W", args[0].shape[0] // 10)
+
+        def make_contract(self, args, kwargs, default_key):
+            return ("F", args[0].shape[0] % 10)
+
+    tuner = Autotuner(
+        fn,
+        [],
+        [AutotuneConfig(config=1), AutotuneConfig(config=2)],
+        do_bench=do_bench,
+        policy=WF_Policy(),
+    )
+    return tuner, rec
+
+
+@pytest.fixture(autouse=True)
+def _no_gpu_warmup(monkeypatch):
+    """Mode tests exercise dispatch, not the bench protocol itself."""
+    import DLKernel.autotuner as at
+
+    monkeypatch.setattr(at, "_gpu_warmup", lambda duration_ms=200: None)
+
+
+def test_static_miss_never_benches_and_falls_back(monkeypatch):
+    import torch
+
+    from DLKernel.gemm_config import TuneMode
+
+    tuner, rec = _mode_harness()
+    with pytest.warns(RuntimeWarning, match="analytical fallback"):
+        tuner(torch.empty(17), tune_mode=TuneMode.STATIC)
+    assert rec.bench_calls == 0
+    assert rec.fn_configs == [None]  # no config injected: the -1 call
+    assert not tuner.cache  # no winner manufactured, nothing persisted
+
+    # Same key again: still correct, but the warning is one-shot.
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        tuner(torch.empty(17), tune_mode=TuneMode.STATIC)
+    assert rec.fn_configs == [None, None]
+
+
+def test_measured_winners_are_shared_across_modes():
+    import torch
+
+    from DLKernel.gemm_config import TuneMode
+
+    tuner, rec = _mode_harness()
+    tuner(torch.empty(17), tune_mode=TuneMode.TUNED)  # benches, winner cached
+    assert rec.bench_calls == 2  # one sweep = 2 candidates
+    assert tuner.cache[("W", 1)].kwargs["config"] == 1
+
+    tuner(torch.empty(17), tune_mode=TuneMode.STATIC)  # memory hit: winner reused
+    assert rec.bench_calls == 2
+    assert rec.fn_configs[-1] == 1
+
+
+def test_running_tunes_once_per_contract():
+    import torch
+
+    from DLKernel.gemm_config import TuneMode
+
+    tuner, rec = _mode_harness()
+    tuner(torch.empty(17), tune_mode=TuneMode.RUNNING)  # W1, F7: first tune
+    assert rec.bench_calls == 2  # one sweep = 2 candidates
+    tuner(torch.empty(27), tune_mode=TuneMode.RUNNING)  # W2, F7: spent -> reuse F7 winner
+    assert rec.bench_calls == 2
+    # 2026-10-22 design: the contract's first online tune transfers across
+    # token buckets -- the fn runs with the F7 winner, explicit.
+    assert rec.fn_configs[-1] == 1
+    # New bucket AND new contract (38 -> W3, F8): the memo is keyed by W, and
+    # production policies derive F from the same scan as W (same W => same F),
+    # so a fresh contract always arrives under a fresh W.  It tunes.
+    tuner(torch.empty(38), tune_mode=TuneMode.RUNNING)
+    assert rec.bench_calls == 4
+    tuner(torch.empty(17), tune_mode=TuneMode.RUNNING)  # W1: memory winner
+    assert rec.bench_calls == 4
+    assert rec.fn_configs[-1] == 1
+
+
+def test_tuned_still_benches_new_w_and_shares_the_record():
+    import torch
+
+    from DLKernel.gemm_config import TuneMode
+
+    tuner, rec = _mode_harness()
+    tuner(torch.empty(17), tune_mode=TuneMode.RUNNING)
+    tuner(torch.empty(27), tune_mode=TuneMode.TUNED)  # F7 measured, new W: TUNED re-benches
+    assert rec.bench_calls == 4
+    # The TUNED sweep shares its record: RUNNING on a third W of F7 reuses
+    # the contract winner (2026-10-22) instead of the analytical fallback.
+    tuner(torch.empty(37), tune_mode=TuneMode.RUNNING)
+    assert rec.bench_calls == 4
+    assert rec.fn_configs[-1] == 1
+
+
+def test_missing_tune_mode_keeps_legacy_bench():
+    import torch
+
+    tuner, rec = _mode_harness()
+    tuner(torch.empty(17))
+    tuner(torch.empty(27))
+    assert rec.bench_calls == 4  # every new W sweeps (2 candidates each): today's behaviour
+    assert rec.fn_configs[-1] == 1
+
+
 def test_varlen_selector_accepts_canonical_sm_arch_override(monkeypatch):
     import torch
 
-    from DLKernel.autotuner import AutotuneConfig
     import DLKernel.varlen_selector as selector_mod
+    from DLKernel.autotuner import AutotuneConfig
     from DLKernel.varlen_selector import VarlenGemmTunePolicy
 
     seen = []
@@ -806,6 +1058,7 @@ def test_autotuner_required_cache_rejects_varlen_miss(
     _cpu_tuning, monkeypatch, direction, positional
 ):
     import torch
+
     import DLKernel.autotuner as at
 
     monkeypatch.setenv("DLKERNEL_REQUIRE_TUNE_CACHE", "1")
@@ -840,6 +1093,7 @@ def test_autotuner_required_cache_rejects_varlen_miss(
 
 def test_autotuner_cache_miss_tunes_when_required_cache_is_unset(_cpu_tuning, monkeypatch):
     import torch
+
     import DLKernel.autotuner as at
 
     monkeypatch.delenv("DLKERNEL_REQUIRE_TUNE_CACHE", raising=False)
@@ -860,6 +1114,7 @@ def test_autotuner_cache_miss_tunes_when_required_cache_is_unset(_cpu_tuning, mo
 
 def test_autotuner_does_not_cache_an_all_failed_sweep(_cpu_tuning):
     import torch
+
     import DLKernel.autotuner as at
 
     def failed_bench(fn, **kwargs):
@@ -902,6 +1157,7 @@ class _RecordingPolicy(TunePolicy):
 
 def test_autotuner_policy_hooks_run_in_order():
     import torch
+
     from DLKernel.autotuner import AutotuneConfig, Autotuner
 
     events = []
@@ -923,6 +1179,7 @@ def test_autotuner_policy_hooks_run_in_order():
 
 def test_autotuner_policy_rejects_empty_or_duplicate_candidates():
     import torch
+
     from DLKernel.autotuner import AutotuneConfig, Autotuner, TunePolicy
 
     configs = [AutotuneConfig(x=1), AutotuneConfig(x=2)]
@@ -995,8 +1252,8 @@ def test_tune_cache_lock_times_out_and_recovers(tmp_path, monkeypatch):
     import sys
     import time
 
-    import DLKernel.cache.jit as jit
     from DLKernel.autotuner import AutotuneConfig, TunePolicy, autotune
+    from DLKernel.cache import jit
 
     monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
     monkeypatch.setenv("DLKERNEL_TUNE_LOCK_TIMEOUT_S", "2")
@@ -1005,11 +1262,20 @@ def test_tune_cache_lock_times_out_and_recovers(tmp_path, monkeypatch):
         def make_key(self, args, kwargs, default_key):
             return ("lock-timeout",)
 
+    bench_order = []  # one entry per do_bench call, i.e. per candidate swept
+
+    def fixed_bench(fn, **kwargs):
+        # Equal-cost candidates: a real bench picks the winner by noise (a
+        # tie makes min() take the first), so pin config 2 to win instead.
+        bench_order.append(None)
+        return [float(3 - len(bench_order))]
+
     @autotune(
         configs=[AutotuneConfig(config=1), AutotuneConfig(config=2)],
         key=[],
         policy=P(),
         cache_results=True,
+        do_bench=fixed_bench,
     )
     def victim_fn(x, config=None):
         return x * config
@@ -1054,3 +1320,533 @@ def test_tune_cache_lock_times_out_and_recovers(tmp_path, monkeypatch):
         holder.wait()
 
     assert victim_fn(3) == 6  # 持锁者死亡 → flock 释放 → 正常完成
+
+
+def test_running_disk_hit_does_not_consume_quota(tmp_path, monkeypatch):
+    """C5 (plan v4 §6): a winner read from disk — including this process's
+    own earlier sweep republished — is not a measurement; the contract keeps
+    its first in-process sweep available for a NEW winner key."""
+    import torch
+
+    from DLKernel.autotuner import AutotuneConfig, Autotuner, TunePolicy
+    from DLKernel.gemm_config import TuneMode
+
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
+    benched = [0]
+
+    def fn(x, config=None, **kw):
+        return x
+
+    def do_bench(kernel_call, quantiles=None, **kw):
+        kernel_call()
+        benched[0] += 1
+        return [1.0, 1.0, 1.0]
+
+    class WF_Policy(TunePolicy):
+        def make_key(self, args, kwargs, default_key):
+            return ("W", args[0].shape[0] // 10)
+
+        def make_contract(self, args, kwargs, default_key):
+            return ("F", args[0].shape[0] % 10)
+
+    def make_tuner():
+        return Autotuner(
+            fn,
+            [],
+            [AutotuneConfig(config=1), AutotuneConfig(config=2)],
+            do_bench=do_bench,
+            policy=WF_Policy(),
+            cache_results=True,
+        )
+
+    writer = make_tuner()
+    writer(torch.empty(17), tune_mode=TuneMode.RUNNING)  # sweep + publish
+    assert benched[0] == 2
+
+    reader = make_tuner()  # fresh memory, same disk cache dir
+    reader(torch.empty(17), tune_mode=TuneMode.RUNNING)  # disk hit, no sweep
+    assert benched[0] == 2
+    assert ("W", 1) in reader.cache
+
+    # Same contract F7, new winner key W2: the quota is still there.
+    reader(torch.empty(27), tune_mode=TuneMode.RUNNING)
+    assert benched[0] == 4
+
+
+def test_pinned_config_bypasses_tuning_entirely(tmp_path, monkeypatch):
+    """v4 §1 (review F2, 2026-10-21): a pinned config never sweeps, never
+    consults the winner cache, and reaches the op verbatim — regardless of
+    TuneMode and regardless of any previously measured winners."""
+    import torch
+
+    from DLKernel.gemm_config import TuneMode
+
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
+    tuner, rec = _mode_harness()
+
+    # Warm the winner cache first: a TUNED sweep stores W1.
+    tuner(torch.empty(17), tune_mode=TuneMode.TUNED)
+    assert rec.bench_calls > 0
+    benches_before = rec.bench_calls
+
+    # Pinned call on the SAME key: the pin must bypass everything — no bench,
+    # and the op receives the pinned config object itself.
+    rec.fn_configs.clear()
+    tuner(torch.empty(17), tune_mode=TuneMode.TUNED, config=99)
+    assert rec.bench_calls == benches_before
+    assert rec.fn_configs == [99]
+
+    # And on a cold key: still no sweep, still the pin.
+    tuner(torch.empty(29), tune_mode=TuneMode.RUNNING, config=98)
+    assert rec.bench_calls == benches_before
+    assert rec.fn_configs == [99, 98]
+
+
+def test_epi_minus_one_delegation_matches_low_level_signature():
+    """The epi ``-1`` delegation targets the LOW-LEVEL ``mod.gemm`` (tile
+    parameters only — no tune_mode/config, no tuner entry).  The stub below
+    mirrors that exact signature with NO **kw, so any stray kwarg the
+    delegation tries to pass (a 2026-10-21 fix once forwarded tune_mode and
+    would have TypeError'd every real epi fallback) fails this test."""
+    from DLKernel.gemm_runtime.autotune import _make_tuned_fn
+
+    calls = []
+
+    class StubMod:
+        sinks = {}
+        _ident = "stub_mod"
+
+        def gemm(
+            self,
+            A,
+            B,
+            D,
+            C=None,
+            *,
+            epi_args,
+            b_kn,
+            cu_seqlens_m,
+            A_idx,
+            SFA,
+            SFB,
+            bs_format_a,
+            bs_format_b,
+            concat_layout,
+            transform_a,
+            transform_sf,
+        ):
+            calls.append(1)
+            return "resolved"
+
+    fn = _make_tuned_fn(StubMod(), epi_names=[])
+    assert fn(None, None, None, None, config=None, tune_mode=2) == "resolved"
+    assert calls == [1]
+
+
+def test_failed_sweep_does_not_consume_running_quota(tmp_path, monkeypatch):
+    """C5: only a sweep THIS process completed consumes the quota -- a failed
+    sweep (all candidates error) raises and leaves the contract unmeasured."""
+    import torch
+
+    from DLKernel.autotuner import AutotuneConfig, Autotuner
+    from DLKernel.gemm_config import TuneMode
+
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
+
+    def fn(x, config=None, **kw):
+        return "ran"
+
+    def bad_bench(kernel_call, quantiles=None, **kw):
+        raise RuntimeError("candidate exploded")
+
+    class P(TunePolicy):
+        def make_key(self, args, kwargs, default_key):
+            return ("W", args[0].shape[0] // 10)
+
+        def make_contract(self, args, kwargs, default_key):
+            return ("F", args[0].shape[0] % 10)
+
+    tuner = Autotuner(
+        fn,
+        [],
+        [AutotuneConfig(config=1), AutotuneConfig(config=2)],
+        do_bench=bad_bench,
+        policy=P(),
+        cache_results=False,
+    )
+    with pytest.raises(RuntimeError):
+        tuner(torch.empty(27), tune_mode=TuneMode.RUNNING)
+    assert tuner._measured_contracts == set()
+
+
+def test_force_cache_update_forces_resweep_on_hit(tmp_path, monkeypatch):
+    """C7: DLKERNEL_FORCE_CACHE_UPDATE makes a disk winner a miss again -- the
+    reader re-sweeps instead of adopting the entry (but the mode still
+    governs: STATIC never sweeps, it falls back)."""
+    import torch
+
+    from DLKernel.autotuner import AutotuneConfig, Autotuner
+    from DLKernel.gemm_config import TuneMode
+
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
+
+    def make_tuner():
+        bench = {"n": 0}
+
+        def fn(x, config=None, **kw):
+            return "ran"
+
+        def do_bench(kernel_call, quantiles=None, **kw):
+            kernel_call()
+            bench["n"] += 1
+            return [1.0, 1.0, 1.0]
+
+        class P(TunePolicy):
+            def make_key(self, args, kwargs, default_key):
+                return ("W", args[0].shape[0] // 10)
+
+            def make_contract(self, args, kwargs, default_key):
+                return ("F", args[0].shape[0] % 10)
+
+        return Autotuner(
+            fn,
+            [],
+            [AutotuneConfig(config=1), AutotuneConfig(config=2)],
+            do_bench=do_bench,
+            policy=P(),
+            cache_results=True,
+        ), bench
+
+    writer, wb = make_tuner()
+    writer(torch.empty(17), tune_mode=TuneMode.TUNED)
+    assert wb["n"] > 0
+
+    reader, rb = make_tuner()  # fresh memory, same disk dir
+    reader(torch.empty(17), tune_mode=TuneMode.TUNED)
+    assert rb["n"] == 0  # disk hit adopted
+
+    monkeypatch.setenv("DLKERNEL_FORCE_CACHE_UPDATE", "1")
+    forced, fb = make_tuner()
+    forced(torch.empty(17), tune_mode=TuneMode.TUNED)
+    assert fb["n"] > 0  # entry not adopted; swept again
+
+
+def test_fallback_provenance_flag_drives_plan_cache_decision(tmp_path, monkeypatch):
+    """P7 (2026-10-21): ``used_fallback`` is True only when the -1 fallback
+    resolved the call -- winner hits and sweeps leave it False, so plan caches
+    can distinguish 'safe to pin' from 'a peer may still publish a winner'."""
+    import torch
+
+    from DLKernel.gemm_config import TuneMode
+
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))
+    tuner, rec = _mode_harness()
+
+    tuner(torch.empty(17), tune_mode=TuneMode.TUNED)  # sweep -> winner
+    assert tuner.used_fallback is False
+    tuner(torch.empty(17), tune_mode=TuneMode.TUNED)  # memory hit
+    assert tuner.used_fallback is False
+    tuner(torch.empty(29), tune_mode=TuneMode.STATIC)  # cold key -> -1
+    assert tuner.used_fallback is True
+    tuner(torch.empty(17), tune_mode=TuneMode.TUNED)  # winner again
+    assert tuner.used_fallback is False
+
+
+# ---------------------------------------------------------------------------
+# -1 fallback sink hand-off (2026-10-21 fix): the wrapper's fallback resolves
+# a config through the analytical ranker and slices the worst-case sink
+# buffers to it, but ``tuned_mod_gemm`` used to return an empty ``sinks`` dict
+# -- the eager frontend indexes ``TunedModGemm.sinks`` by its owned sinks and
+# KeyError'd.  The wrapper now stashes what it ran with on the per-mod fn.
+# CPU-only: the SM90 ranker is GPU-blind under DLKERNEL_ARCH and STATIC never
+# benches.
+# ---------------------------------------------------------------------------
+
+
+def _stub_sink_mod(ident):
+    """A signature-faithful mod double: one config-shaped (dim==0) sink, the
+    low-level ``gemm`` entry (tile parameters only, no tuner kwargs), and the
+    default-config resolution the -1 chain falls back to."""
+
+    class _SinkOp:
+        dim = 0
+
+        @staticmethod
+        def sink_alloc_shape(lead, n, tile_m, tile_n, num_seqs=None):
+            del tile_m, num_seqs
+            return (lead[-1], -(-n // tile_n))
+
+    class _StubSinkMod:
+        mode = "element"
+        outputs = ()
+        _ident = ident
+
+        def __init__(self):
+            self.gemm_calls = []
+            self.sinks = {"stat": _SinkOp()}
+
+        @property
+        def semantic_digest(self):
+            return f"{ident}-digest"
+
+        @staticmethod
+        def _default_config(A, B, transform_a):
+            del A, B, transform_a
+            from DLKernel.gemm_config import GemmConfig
+
+            return GemmConfig(tile_m=128, tile_n=128, cluster_m=1, cluster_n=1, device_capacity=9)
+
+        def gemm(self, A, B, D, C=None, *, epi_args, **kwargs):
+            self.gemm_calls.append((kwargs, dict(epi_args)))
+            return "plan-sentinel"
+
+    return _StubSinkMod()
+
+
+def test_fallback_returns_ranked_sliced_sinks(_cpu_tuning, monkeypatch):
+    """The ranked -1 call hands its SLICED sink views back: TunedModGemm.sinks
+    carries the per-config views of the worst-case buffers, and ``config``
+    stays None (the caller's winner-vs-fallback provenance signal)."""
+    import torch
+
+    import DLKernel.gemm_runtime.autotune as epi_autotune
+    from DLKernel import gemm_heuristic
+    from DLKernel.gemm_config import TuneMode
+
+    monkeypatch.setattr(epi_autotune, "_MOD_TUNERS", {})
+    m, k, n, experts = 4096, 512, 2048, 8
+    A = torch.empty((m, k), dtype=torch.bfloat16)
+    B = torch.empty((k, n), dtype=torch.bfloat16)  # b_kn: (K, N)
+    D = torch.empty((m, n), dtype=torch.bfloat16)
+    cu = torch.zeros((experts + 1,), dtype=torch.int32)
+    mod = _stub_sink_mod("ranked_sink_mod")
+    worst = epi_autotune.sink_arg_shapes(mod, m, n, device="cpu")
+    buf = torch.empty(worst["stat"], dtype=torch.float32)
+
+    # Self-check: this varlen_m desc is ranker-covered, and the ranked config
+    # decides the expected sink shape below.
+    desc = gemm_heuristic.desc_from_call(A, B, D, cu, None)
+    ranked = gemm_heuristic.rank(desc, gemm_heuristic.sm90_candidates(desc))
+    assert ranked is not None
+
+    with pytest.warns(RuntimeWarning, match="analytical fallback"):
+        res = epi_autotune.tuned_mod_gemm(
+            mod,
+            A,
+            B,
+            D,
+            epi_args={"stat": buf},
+            b_kn=True,
+            cu_seqlens_m=cu,
+            tune_mode=TuneMode.STATIC,
+        )
+
+    assert res.config is None  # fallback provenance, unchanged
+    assert res.plan == "plan-sentinel"
+    assert set(res.sinks) == {"stat"}  # was {} -> KeyError in the eager frontend
+    expected = (m, -(-n // ranked.tile_n))
+    assert tuple(res.sinks["stat"].shape) == expected
+    assert res.sinks["stat"].data_ptr() == buf.data_ptr()  # live view of the buffer
+    # The delegated call ran the ranked tiles and consumed the same slice.
+    ((delegated_kwargs, delegated_epi),) = mod.gemm_calls
+    assert delegated_kwargs["tile_N"] == ranked.tile_n
+    assert delegated_kwargs["tile_M"] == ranked.tile_m
+    assert tuple(delegated_epi["stat"].shape) == expected
+    # The stash the hand-off read: the ranked config itself, views identical.
+    tuner = next(iter(epi_autotune._MOD_TUNERS.values()))
+    stash_cfg, stash_sinks = tuner.fn._last_fallback
+    assert stash_cfg == ranked
+    assert stash_sinks["stat"] is res.sinks["stat"]
+
+
+def test_fallback_default_config_path_stashes_sliced_sinks():
+    """Uncovered family WITH sinks (dense): the -1 chain resolves the mod's
+    own default config and takes the explicit-tile path -- the stash reports
+    that config's sliced views, and the delegation carries tile parameters."""
+    import torch
+
+    import DLKernel.gemm_runtime.autotune as epi_autotune
+
+    mod = _stub_sink_mod("default_cfg_sink_mod")
+    fn = epi_autotune._make_tuned_fn(mod, ("stat",))
+    buf = torch.full((64, 2), 3.0)
+    out = fn(
+        A=torch.empty((64, 16), dtype=torch.bfloat16),
+        B=torch.empty((128, 16), dtype=torch.bfloat16),
+        D=torch.empty((64, 128), dtype=torch.bfloat16),
+        stat=buf,
+    )
+
+    assert out == "plan-sentinel"
+    cfg, sinks = fn._last_fallback
+    assert cfg == mod._default_config(None, None, None)
+    assert tuple(sinks["stat"].shape) == (64, 1)  # ceil(n=128 / tile_n=128)
+    ((delegated_kwargs, delegated_epi),) = mod.gemm_calls
+    assert delegated_kwargs["tile_N"] == 128  # explicit tiles, not the blind call
+    assert delegated_epi["stat"] is sinks["stat"]
+
+
+def test_fallback_bare_path_stash_covers_sinkless_mods():
+    """A sink-less uncovered mod still rides the blind low-level delegation;
+    the stash is still written (empty), so tuned_mod_gemm's hand-off read
+    never faces a missing attribute."""
+    import torch
+
+    import DLKernel.gemm_runtime.autotune as epi_autotune
+
+    record = []
+
+    class _BareMod:
+        _ident = "bare_mod"
+
+        def __init__(self):
+            self.sinks = {}
+
+        def gemm(self, A, B, D, C=None, *, epi_args, **kwargs):
+            record.append(kwargs)
+            return "resolved"
+
+    fn = epi_autotune._make_tuned_fn(_BareMod(), ())
+    out = fn(
+        A=torch.empty((64, 16), dtype=torch.bfloat16),
+        B=torch.empty((128, 16), dtype=torch.bfloat16),
+        D=torch.empty((64, 128), dtype=torch.bfloat16),
+    )
+
+    assert out == "resolved"
+    assert fn._last_fallback == (None, {})
+    assert "tile_M" not in record[0]  # loop-free low-level delegation
+
+
+@pytest.mark.skipif(
+    not __import__("torch").cuda.is_available(), reason="fallback lifecycle needs a GPU"
+)
+def test_varlen_sink_running_fallback_returns_sliced_sinks(tmp_path, monkeypatch):
+    """Full eager lifecycle of the fixed KeyError: RUNNING, same contract F,
+    two cold winner buckets W.  Bucket 1 sweeps and consumes its winner;
+    bucket 2 spends F's quota and REUSES the contract winner (2026-10-22) --
+    an explicit config whose sliced sink views must still come back.  Both
+    buckets are checked against a torch reference."""
+    from itertools import pairwise
+
+    import torch
+
+    import DLKernel.gemm_runtime.autotune as epi_autotune
+    from DLKernel.epilogue.frontend import gemm_epilogue
+    from DLKernel.epilogue.ops import ColVecReduce
+    from DLKernel.gemm_config import TuneMode
+
+    monkeypatch.setenv("DLKERNEL_CACHE_DIR", str(tmp_path))  # hermetic winner cache
+    monkeypatch.setattr(epi_autotune, "_MOD_TUNERS", {})
+
+    @gemm_epilogue(reduces={"stat": ColVecReduce("stat")})
+    def _stat_rowsum_epi(acc):
+        return {"D": acc, "stat": acc}
+
+    device = "cuda"
+    if torch.cuda.get_device_capability(device)[0] != 9:
+        pytest.skip("the analytical -1 fallback ranks SM90 only")
+    torch.random.manual_seed(7)
+    experts, k, n = 8, 256, 512
+    B = torch.randn((experts, k, n), device=device, dtype=torch.bfloat16) / 8
+
+    def run(rows):
+        # avg rows/expert 128 vs 256: two W buckets, one contract F (the
+        # ragged extent collapses to a mark; E/K/N/dtype are what is left).
+        A = torch.randn((rows, k), device=device, dtype=torch.bfloat16) / 8
+        cu = torch.arange(0, rows + 1, rows // experts, device=device, dtype=torch.int32)
+        res = _stat_rowsum_epi(A, B, tune_mode=TuneMode.RUNNING, cu_seqlens_m=cu)
+        # B rides the torch convention (E, K, N): each expert's segment is a
+        # plain A_seg @ B[e].
+        ref = torch.cat([A[s:e].float() @ B[i].float() for i, (s, e) in enumerate(pairwise(cu))])
+        return res, ref
+
+    res1, ref1 = run(1024)
+    tuners = list(epi_autotune._MOD_TUNERS.values())
+    assert len(tuners) == 1 and tuners[0].used_fallback is False  # bucket 1 swept
+    assert res1["stat"].shape == (1024,)
+    assert (res1["D"].float() - ref1).abs().max() < 2e-2 * ref1.abs().max()
+    assert (res1["stat"] - ref1.sum(-1)).abs().max() < 2e-2 * ref1.abs().max()
+
+    res2, ref2 = run(2048)
+    # 2026-10-22: quota spent reuses the contract's measured winner (an
+    # explicit config) -- NOT the -1 fallback.  Sinks come back sliced for
+    # that config, which is what closed the original KeyError.
+    assert tuners[0].used_fallback is False
+    assert tuners[0].best_config is not None
+    assert res2["stat"].shape == (2048,)  # sinks actually returned (the KeyError path)
+    assert (res2["D"].float() - ref2).abs().max() < 2e-2 * ref2.abs().max()
+    assert (res2["stat"] - ref2.sum(-1)).abs().max() < 2e-2 * ref2.abs().max()
+
+
+def test_concurrent_contract_winner_recording_is_atomic(_cpu_tuning, tmp_path):
+    """The 2026-10-27 incident, CPU edition.
+
+    torchrun ranks share one contract_winners file. Concurrent recorders of
+    the same contract must neither crash on a peer's in-flight write
+    (JSONDecodeError escaped _record_contract_winner and killed every later
+    run of the affected contracts) nor leave torn JSON behind. Also pins the
+    single-resolution-point rule: the winner file must land inside this
+    test's DLKERNEL_CACHE_DIR, never in a shared home directory.
+    """
+    import json
+    import multiprocessing as mp
+
+    import DLKernel.autotuner as at
+
+    contract = ("contract-race",)
+    n_proc, n_iter = 4, 800
+    cfgs = (at.AutotuneConfig(block=1), at.AutotuneConfig(block=123456))
+
+    def make_tuner():
+        return at.Autotuner(
+            lambda x, block=1: None,
+            configs=list(cfgs),
+            key=[],
+            do_bench=lambda fn, **k: [1.0],
+            cache_results=True,
+        )
+
+    def hammer(rank, q):
+        tuner = make_tuner()
+        cfg = cfgs[rank % 2]  # drifted candidate spaces: str() lengths differ
+        n_err, first = 0, None
+        for _ in range(n_iter):
+            try:
+                tuner._record_contract_winner(contract, cfg)
+            except ValueError as e:  # JSONDecodeError subclasses ValueError
+                n_err, first = n_err + 1, first or str(e)
+        q.put((n_err, first))
+
+    def read_through(path, stop, q):
+        n_bad, first = 0, None
+        while not stop.is_set():
+            try:
+                json.loads(path.read_text())
+            except FileNotFoundError:
+                continue
+            except ValueError as e:
+                n_bad, first = n_bad + 1, first or str(e)
+        q.put((n_bad, first))
+
+    path = make_tuner()._contract_winner_path(contract)
+    assert path.is_relative_to(tmp_path), "contract winners bypassed the cache root"
+
+    ctx = mp.get_context("fork")
+    q = ctx.Queue()
+    stop = ctx.Event()
+    reader = ctx.Process(target=read_through, args=(path, stop, q))
+    procs = [ctx.Process(target=hammer, args=(r, q)) for r in range(n_proc)]
+    reader.start()
+    for p in procs:
+        p.start()
+    results = [q.get(timeout=60) for _ in procs]
+    for p in procs:
+        p.join(60)
+    stop.set()
+    results.append(q.get(timeout=60))
+    reader.join(60)
+
+    for n_err, first in results:
+        assert n_err == 0, f"recorder crashed / reader saw torn JSON: {first}"
+    json.loads(path.read_text())  # a torn terminal state fails here
