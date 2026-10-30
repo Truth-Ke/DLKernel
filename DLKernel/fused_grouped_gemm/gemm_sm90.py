@@ -48,6 +48,13 @@ class GemmMoeSm90(GemmSm90):
     # compiled graph survives refactors of this module.
     variant_id = "moe_sm90"
     _ACTIVATION_DTYPES = (torch.float16, torch.bfloat16)
+    _ROUTER_DTYPES = (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
     _GATED_ACTIVATIONS = ("swiglu", "geglu", "reglu")
     _ACTIVATIONS = _GATED_ACTIVATIONS + ("silu", "relu", "relu_sq", "gelu_tanh_approx")
     _GATE_UP_LAYOUTS = ("concat", "interleaved")
@@ -330,8 +337,8 @@ class GemmMoeSm90(GemmSm90):
                     f"router_weights must be [R] with R={gate_up_preact.shape[0]}, "
                     f"got {tuple(router_weights.shape)}"
                 )
-            if router_weights.dtype not in (*cls._ACTIVATION_DTYPES, torch.float32):
-                raise TypeError("router_weights must use float32 or the activation dtype")
+            if router_weights.dtype not in cls._ROUTER_DTYPES:
+                raise TypeError(f"router_weights must use one of {cls._ROUTER_DTYPES}")
         if compute_router_weight_grad and router_weights is None:
             raise ValueError("router_weights is required when compute_router_weight_grad=True")
 

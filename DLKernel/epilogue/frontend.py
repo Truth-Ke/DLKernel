@@ -212,6 +212,12 @@ _KIND_TO_OP = {
 }
 
 
+def _flip_vec_op(op):
+    """Swap-at-trace relabel: the caller's colvec is the swapped kernel's
+    rowvec (and vice versa), so a pinned VecLoad flips its class for the call."""
+    return (RowVecLoad if type(op) is ColVecLoad else ColVecLoad)(op.name)
+
+
 def _infer_kind(name, value, m, n, varlen_m=False):
     if not hasattr(value, "stride"):  # python number
         return "scalar"
@@ -651,6 +657,38 @@ class EpiMod:
         self._minted[key] = cls
         return cls
 
+    @staticmethod
+    def _colvec_rows(A, A_idx, n_gemm, flipped):
+        """Kernel-M row count for colvec host checks. Swap-at-trace and
+        layout-owning transforms make caller N the kernel M; gathered calls
+        count indexed rows; otherwise A's rows are the colvec length (total_m
+        under varlen)."""
+        if flipped:
+            return n_gemm
+        if A_idx is not None:
+            return A_idx.shape[0]
+        return A.shape[-2]
+
+    def _preflight_colvecs(self, epi_args, *, rows, varlen_m, flipped=False):
+        """Check new lowbit columns before compile/tuning. rows is kernel M
+        (see _colvec_rows); flipped relabels caller row/col pins, as in the
+        kernel's operand schema. Fake inputs check metadata; launch converters
+        check real pointers.
+        """
+        import torch
+
+        for name in self.operand_names:
+            value = epi_args.get(name)
+            if not isinstance(value, torch.Tensor) or value.ndim != 1:
+                continue
+            op = self.ops.get(name)
+            if flipped and type(op) in (ColVecLoad, RowVecLoad):
+                op = _flip_vec_op(op)
+            if isinstance(op, ColVecLoad):
+                op.host_preflight(value, rows)
+            elif op is None and varlen_m and value.numel() != 1:
+                ColVecLoad(name).host_preflight(value, rows)
+
     def gemm_tuned(self, A, B, D, C=None, *, epi_args: dict, b_kn: bool = False, tune_mode=None):
         """Autotuned gemm(): config-space sweep via DLKernel.gemm_runtime.autotune (lazy
         import — this module sits below gemm_config in the import graph).
@@ -940,7 +978,14 @@ class EpiMod:
             m = A.shape[-2]
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
         # stays caller-oriented (swap-at-trace transposes those at trace).
-        m_i, n_i = (n_gemm, m) if (swap_ab or owned_fmt is not None) else (m, n_gemm)
+        flipped = swap_ab or owned_fmt is not None
+        m_i, n_i = (n_gemm, m) if flipped else (m, n_gemm)
+        self._preflight_colvecs(
+            epi_args,
+            rows=self._colvec_rows(A, A_idx, n_gemm, flipped),
+            varlen_m=varlen_m,
+            flipped=flipped,
+        )
         batch = B.shape[0] if B.ndim == 3 else None
         base_shape = _tile_shape(batch, m, n_gemm, varlen_m)
         if packed_c:
@@ -995,11 +1040,10 @@ class EpiMod:
         # caller colvec is the swapped kernel's rowvec (and vice versa), so the
         # pin's class flips for this call. Other orientation-sensitive vec pins
         # (varlen subclasses, reduces) have no swapped form and fail loudly.
-        flipped = swap_ab or owned_fmt is not None
         pins = {}
         for name, op in self.ops.items():
             if flipped and type(op) in (ColVecLoad, RowVecLoad):
-                pins[name] = (RowVecLoad if type(op) is ColVecLoad else ColVecLoad)(name)
+                pins[name] = _flip_vec_op(op)
             elif flipped and isinstance(op, (VecLoad, VecReduce)):
                 raise ValueError(
                     f"swap_ab/transform_a: pinned vec op {name!r} of type {type(op).__name__} "

@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from DLKernel import moe_down_proj_dact, moe_up_proj_act, TuneMode
+from DLKernel import TuneMode, moe_down_proj_dact, moe_up_proj_act
 from DLKernel.fused_grouped_gemm.gemm_sm90 import GemmMoeSm90
 from DLKernel.gemm_base import GemmBase
 
@@ -183,7 +183,7 @@ def _down_reference(grad_output, down_weight, preact, offsets, token_indices, sc
         accumulator = grad_output[rows].float() @ down_weight[expert].float()
         postact, jac = _postact_and_grad(activation, preact[begin:end])
         score = (
-            scores[begin:end]
+            scores[begin:end].float()
             if scores is not None
             else torch.ones(end - begin, device=preact.device)
         )
@@ -511,6 +511,148 @@ def test_moe_role_fullgraph_reference(activation, gather, reduce):
     )
     if reduce:
         assert d_score.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    ("score_dtype", "gather", "reduce"),
+    [
+        (torch.bfloat16, False, False),
+        (torch.bfloat16, True, True),
+        (torch.float16, True, True),
+        (torch.float8_e4m3fn, False, True),
+        (torch.float8_e4m3fn, True, False),
+        (torch.float8_e5m2, True, True),
+    ],
+)
+def test_moe_down_lowbit_router_weights(score_dtype, gather, reduce):
+    device = _require_sm90()
+    torch.manual_seed(91)
+    r, h, i = 259, 256, 128
+    dtype = torch.float16 if score_dtype == torch.float16 else torch.bfloat16
+    grad_output = torch.randn(113 if gather else r, h, device=device, dtype=dtype)
+    down_weight = torch.randn(3, h, i, device=device, dtype=dtype) / 16
+    preact = torch.randn(r, 2 * i, device=device, dtype=dtype)
+    offsets = torch.tensor([0, 65, 65, r], device=device, dtype=torch.int32)
+    scores = torch.randn(r, device=device).to(score_dtype)
+    indices = torch.randint(113, (r,), device=device, dtype=torch.int32) if gather else None
+    got = moe_down_proj_dact(
+        grad_output,
+        down_weight,
+        preact,
+        offsets,
+        router_weights=scores,
+        token_indices=indices,
+        compute_router_weight_grad=reduce,
+        tune_mode=TuneMode.STATIC,
+    )
+    rows = indices if gather else torch.arange(r, device=device)
+    ref = _down_reference(grad_output, down_weight, preact, offsets, rows, scores, "swiglu")
+    for name, actual, expected in zip(("dH", "postact", "dS"), got, ref):
+        if name == "dS" and not reduce:
+            assert actual is None
+        else:
+            _assert_close_scaled(actual, expected, name, torch.float32 if name == "dS" else dtype)
+
+
+@pytest.mark.parametrize("score_dtype", [torch.float64, torch.int32])
+def test_moe_down_rejects_unsupported_router_dtype(score_dtype):
+    """Router dtypes outside _ROUTER_DTYPES fail validation before any GPU work."""
+    device = _require_sm90()
+    r, h, i = 16, 32, 16
+    grad_output = torch.randn(r, h, device=device, dtype=torch.bfloat16)
+    down_weight = torch.randn(3, h, i, device=device, dtype=torch.bfloat16)
+    preact = torch.randn(r, 2 * i, device=device, dtype=torch.bfloat16)
+    offsets = torch.tensor([0, r, r, r], device=device, dtype=torch.int32)
+    scores = torch.ones(r, device=device, dtype=score_dtype)
+    with pytest.raises(TypeError, match="router_weights must use one of"):
+        moe_down_proj_dact(grad_output, down_weight, preact, offsets, router_weights=scores)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_moe_fp32_router_weights_with_odd_offsets(dtype):
+    """The supported FP32 scale path keeps numerical parity on ragged segments."""
+    _require_sm90()
+    _run_moe_up_down(
+        "swiglu",
+        "concat",
+        dtype,
+        tokens=129,
+        hidden=256,
+        intermediate=128,
+        experts=3,
+        offsets=[0, 65, 65, 129],
+        token_indices=None,
+    )
+
+
+@pytest.mark.parametrize("score_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_moe_down_lowbit_fullgraph(score_dtype):
+    device = _require_sm90()
+    torch.manual_seed(92)
+    r, h, i = 129, 256, 128
+    go = torch.randn(r, h, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(3, h, i, device=device, dtype=go.dtype) / 16
+    preact = torch.randn(r, 2 * i, device=device, dtype=go.dtype)
+    offsets = torch.tensor([0, 65, 65, r], device=device, dtype=torch.int32)
+    scores = torch.randn(r, device=device).to(score_dtype)
+
+    def call(scores):
+        return moe_down_proj_dact(
+            go,
+            weight,
+            preact,
+            offsets,
+            router_weights=scores,
+            compute_router_weight_grad=True,
+            tune_mode=TuneMode.STATIC,
+        )
+
+    actual = torch.compile(call, fullgraph=True)(scores)
+    reference = _down_reference(
+        go, weight, preact, offsets, torch.arange(r, device=device), scores, "swiglu"
+    )
+    for name, got, want in zip(("dH", "postact", "dS"), actual, reference):
+        _assert_close_scaled(got, want, name, torch.float32 if name == "dS" else go.dtype)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        (256, 128, 1, 2, False),
+        (128, 224, 1, 2, False),
+        (128, 160, 2, 1, True),
+        (192, 128, 1, 2, True),
+    ],
+)
+def test_moe_down_lowbit_reported_configs(spec):
+    """Pin every reported failing tile so tuning cannot route around the bug."""
+    from DLKernel.gemm_config import GemmConfig
+
+    device = _require_sm90()
+    torch.manual_seed(93)
+    r, h, i = 129, 256, 256
+    go = torch.randn(r, h, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(3, h, i, device=device, dtype=go.dtype) / 16
+    preact = torch.randn(r, 2 * i, device=device, dtype=go.dtype)
+    offsets = torch.tensor([0, 65, 65, r], device=device, dtype=torch.int32)
+    scores = torch.randn(r, device=device, dtype=go.dtype)
+    m, n, cm, cn, pp = spec
+    actual = GemmMoeSm90.gemm_with_activation_grad(
+        go,
+        weight,
+        preact,
+        activation="swiglu",
+        colvec_scale=scores,
+        colvec_reduce=True,
+        cu_seqlens_m=offsets,
+        dynamic_scheduler=True,
+        config=GemmConfig(tile_m=m, tile_n=n, cluster_m=cm, cluster_n=cn, pingpong=pp),
+    )
+    reference = _down_reference(
+        go, weight, preact, offsets, torch.arange(r, device=device), scores, "swiglu"
+    )
+    for name, got, want in zip(("dH", "postact", "dS"), actual, reference):
+        _assert_close_scaled(got, want, name, torch.float32 if name == "dS" else go.dtype)
 
 
 def test_moe_down_unpack_contract(monkeypatch):

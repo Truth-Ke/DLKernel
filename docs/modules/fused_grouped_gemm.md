@@ -88,7 +88,7 @@ size 为 `I`:
 | `down_weight` | `[E, D, I]` |
 | `expert_offsets` | CUDA int32 `[E+1]`,expert-major 路由分段,首值为 0、末值为 `R` |
 | `token_indices` | CUDA int32 `[R]`,分组行 `r` 指向原始 token 行 `t` |
-| `router_weights` | `[R]` 浮点 score,与分组行对齐 |
+| `router_weights` | FP32/FP16/BF16/FP8 E4M3FN/E5M2 `[R]` score,与分组行对齐 |
 | `gate_up_preact`(gated) | `[R, 2I]`,interleaved `[gate0, up0, ...]`,与输入布局无关 |
 | `gate_up_preact`(非 gated) | `[R, I]`,自然序 |
 | `postact` | gated `[R, I]`,非 gated `[R, I]` |
@@ -97,6 +97,14 @@ size 为 `I`:
 `token_indices=None` 表示输入已经是 `[R, D]` 的连续路由行。它只是 primitive 的可选
 operand。offsets 的首值==0、单调性、末值与 indices 值域属于调用方 producer
 contract。生产热路径不通过 `.item()` 做设备回读。
+
+低精度 `router_weights` 必须连续(stride=1),基址按 16 字节对齐。不符合时在
+调参前或实际 launch 前抛出 `ValueError`,包括命中缓存后换入未对齐指针。
+FP32 保留原加载路径。低精度列向量使用 16 字节对齐窗口的 cp.async,在 shared
+中跳过前缀,按当前 expert 的有效行数对尾部补零。读取后在寄存器中转 FP32;
+不另发 cast/clone kernel。该契约同样适用于 gather 模式,score 始终按分组行排列。
+FP8 score 表示其原生数值,不隐含额外量化 scale。激活/专家权重仍仅支持 FP16/BF16,
+`grad_router_weights` 仍为 FP32。
 
 校验自身也不产生回读。校验逻辑位于 `GemmMoeSm90` 的私有方法,在类方法内、任何
 backend 调用之前执行:

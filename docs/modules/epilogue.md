@@ -33,6 +33,11 @@ EpiOp(ops.py:298)是协议基类:一个 op 声明一类张量资源怎么用,组
 - flush 两段式:`end_loop_stage` 各 op 先把条带 stage 进互不相交的 smem,驱动器每 subtile 只发一次共享 barrier,再 `end_loop_finish` 合并写 gmem(协议注释 ops.py:483-490;实现 mixin.py:331-356)。多 sink 的 epilogue 每次 flush 只付一次 `arrive_and_wait`。
 - `config_key`(:340)fail-closed:实例带静态配置却不实现该方法直接抛 `NotImplementedError`,防止两个语义不同的 epilogue 在持久 jit cache 里共用一键。`cache_key`(:354)= 模块 + 类名 + name + config_key。
 - `host_arg_key` 返回 None 表示该 op 从编译产物中滤除(:374-375);`arg_spec_type(const=True)` 产 Constexpr 注解,FFI 转换器不发出运行时参数(:391-396)。
+- `host_call_converter(key)` 在计划构建时选择逐次调用的转换函数。identity 参数选择
+  None,热路径不调用 Python converter。rank-1 的 8/16-bit `ColVecLoad` 选择契约检查:
+  stride=1、基址 16 字节对齐。真实冷调用在编译/调参前检查,每次 launch 再检查实际
+  指针;FakeTensor 阶段只检查元数据。该列向量使用 16-byte cp.async 对齐窗口,
+  shared 多留 16 字节、偏移消费视图,并按当前分段有效行补零。rank-2 与 FP32 保留原路径。
 - `EpiContext`(ops.py:121)把 epi_tile、tiled copy、tile 坐标、varlen、barrier、tidx 打包传给设备钩子;`EpiSmemBytes`(ops.py:273)三分量(unstaged / D-stage / C-stage)逐 op 相加成 smem 预算。
 
 ### op 词表

@@ -79,6 +79,12 @@ def moe_down_proj_dact(
     activations ``gate_up_preact`` is the interleaved ``[R, 2I]`` preactivation
     produced by :func:`moe_up_proj_act`; for ungated activations it is the
     natural-order ``[R, I]`` preactivation.
+
+    ``router_weights`` supports float32, float16, bfloat16, float8_e4m3fn and
+    float8_e5m2. Low-precision scores require stride=1 and a 16-byte-aligned
+    base pointer; invalid layouts raise ValueError before tuning or launch.
+    Scores retain their storage dtype and convert to float32 inside the
+    epilogue. The optional score gradient is float32.
     """
 
     return GemmMoeSm90.down_proj_dact(

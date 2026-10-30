@@ -483,6 +483,13 @@ def tuned_mod_gemm(
     m_gemm, n_gemm = _gemm_mn(A, B, b_kn)
     if transform_a is not None and transform_a.padded_n(B) is not None:
         n_gemm = transform_a.padded_n(B)
+    flipped = transform_a is not None and transform_a.owned_fmt is not None
+    mod._preflight_colvecs(
+        epi_args,
+        rows=mod._colvec_rows(A, A_idx, n_gemm, flipped),
+        varlen_m=cu_seqlens_m is not None,
+        flipped=flipped,
+    )
     _validate_full_sink_buffers(
         mod,
         epi_args,

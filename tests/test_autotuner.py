@@ -1568,6 +1568,8 @@ def _stub_sink_mod(ident):
     low-level ``gemm`` entry (tile parameters only, no tuner kwargs), and the
     default-config resolution the -1 chain falls back to."""
 
+    from DLKernel.epilogue.frontend import EpiMod
+
     class _SinkOp:
         dim = 0
 
@@ -1579,6 +1581,11 @@ def _stub_sink_mod(ident):
     class _StubSinkMod:
         mode = "element"
         outputs = ()
+        # Follow the current host preflight protocol. This double declares
+        # one sink and no column-vector inputs.
+        operand_names = ()
+        _colvec_rows = staticmethod(EpiMod._colvec_rows)
+        _preflight_colvecs = EpiMod._preflight_colvecs
         _ident = ident
 
         def __init__(self):

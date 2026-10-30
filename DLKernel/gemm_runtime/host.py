@@ -29,7 +29,6 @@ from DLKernel.cache import jit_cache
 from DLKernel.compile_utils import make_fake_tensor
 from DLKernel.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
 from DLKernel.gemm_config import SplitKMode, cta_tile_shape_m
-from DLKernel.epilogue.ops import EpiOp
 from DLKernel.gemm_runtime.identity import (
     resolve_gemm_class,
     resolve_transform_a,
@@ -473,9 +472,7 @@ def build_gemm_epi_plan(
     call_ops = tuple(
         (
             name,
-            None
-            if type(plan_ops[name]).host_call_arg is EpiOp.host_call_arg
-            else plan_ops[name].host_call_arg,
+            plan_ops[name].host_call_converter(key),
             key,
         )
         for name, key in epi_keys

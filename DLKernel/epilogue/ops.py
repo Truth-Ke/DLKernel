@@ -13,27 +13,31 @@ below therefore assume their `param` / `arg_tensor` is non-None — the
 framework guarantees inactive ops are never iterated.
 """
 
-import math
-import operator
 import hashlib
 import inspect
+import math
+import operator
 from functools import partial
 from typing import NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as blackwell_helpers
+import torch
 from cutlass import Boolean, Float32, Int32, Uint32, const_expr
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import warp
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm
 from cutlass.experimental import primitives as prims
+from torch._subclasses.fake_tensor import FakeTensor
 
-import torch
-
+import DLKernel.copy_utils as copy_utils
+import DLKernel.layout_utils as layout_utils
+import DLKernel.sm90_utils as sm90_utils
+import DLKernel.utils as utils
 from DLKernel.compile_utils import div_for_dtype, fake_batched, make_fake_tensor
 from DLKernel.cute_dsl_utils import torch2cute_dtype_map
-import DLKernel.sm90_utils as sm90_utils
+from DLKernel.reduce import swap_shuffle_reduce
 from DLKernel.rounding import (
     SR_STORE_DTYPES,
     RoundingMode,
@@ -41,11 +45,7 @@ from DLKernel.rounding import (
     epilogue_aux_out_sr_seed,
     epilogue_sr_seed,
 )
-from DLKernel.reduce import swap_shuffle_reduce
 from DLKernel.sm90_utils import partition_for_epilogue
-import DLKernel.utils as utils
-import DLKernel.copy_utils as copy_utils
-import DLKernel.layout_utils as layout_utils
 
 
 def assume_stride_divisibility(tensor):
@@ -388,6 +388,10 @@ class EpiOp:
         """Per-call runtime argument matching the compiled signature."""
         return value
 
+    def host_call_converter(self, key):
+        """Select by host_arg_key once; None preserves the identity launch fast path."""
+        return None if type(self).host_call_arg is EpiOp.host_call_arg else self.host_call_arg
+
     def arg_spec_type(self, const=False):
         """Type annotation for this op's EpilogueArguments field. ``const``
         reflects host_arg_form: a Constexpr[...] annotation makes the TVM-FFI
@@ -625,6 +629,9 @@ class VecLoad(EpiOp):
     def _tile_size(self, cta_tile_shape_mnk):
         return cta_tile_shape_mnk[self.dim]
 
+    def _smem_size(self, tensor, cta_tile_shape_mnk):
+        return self._tile_size(cta_tile_shape_mnk)
+
     def _broadcast_stride(self):
         # Row: stride (0,1) — broadcast along M. Col: stride (1,0) — broadcast along N.
         return (0, 1) if self.dim == 1 else (1, 0)
@@ -637,20 +644,22 @@ class VecLoad(EpiOp):
 
     def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
         return EpiSmemBytes(
-            unstaged=self._tile_size(cta_tile_shape_mnk) * (arg_tensor.element_type.width // 8)
+            unstaged=self._smem_size(arg_tensor, cta_tile_shape_mnk)
+            * (arg_tensor.element_type.width // 8)
         )
 
     def smem_struct_field(self, gemm, params):
         tensor = getattr(params, self.name)
-        size = self._tile_size(gemm.cta_tile_shape_mnk)
+        size = self._smem_size(tensor, gemm.cta_tile_shape_mnk)
         return (
             f"s_{self.name}",
             cute.struct.Align[cute.struct.MemRange[tensor.element_type, size], 16],
         )
 
     def get_smem_tensor(self, gemm, params, storage_epi):
+        tensor = getattr(params, self.name)
         return getattr(storage_epi, f"s_{self.name}").get_tensor(
-            cute.make_layout(self._tile_size(gemm.cta_tile_shape_mnk))
+            cute.make_layout(self._smem_size(tensor, gemm.cta_tile_shape_mnk))
         )
 
     def needs_async_fence(self):
@@ -735,6 +744,55 @@ class ColVecLoad(VecLoad):
     dim = 0
     fn_port = "col"
 
+    @staticmethod
+    def _lowbit_key(key):
+        dtype, ndim = key
+        return ndim == 1 and dtype.width in (8, 16)
+
+    def _checked_lowbit_arg(self, value, key=None):
+        # Dual role: preflight validator and per-launch converter (call_ops).
+        # stride=1 plus a 16-byte base pointer is the whole lowbit contract.
+        if value.stride(0) != 1:
+            raise ValueError(f"column vector {self.name!r} requires stride=1; got {value.stride()}")
+        # With tile_ptr >= B, B%16 == 0 keeps the aligned prefix inside the vector.
+        # Fake/meta calls have no address; every real launch checks it again.
+        if not isinstance(value, FakeTensor) and value.numel() and value.data_ptr() % 16:
+            raise ValueError(
+                f"column vector {self.name!r} requires a 16-byte-aligned base pointer; "
+                f"got dtype={value.dtype}, shape={tuple(value.shape)}, "
+                f"ptr%16={value.data_ptr() % 16}"
+            )
+        return value
+
+    def host_preflight(self, value, rows):
+        if value is not None and self._lowbit_key(self.host_arg_key(value)):
+            if value.numel() != rows:
+                raise ValueError(
+                    f"column vector {self.name!r} must have {rows} elements; got {value.numel()}"
+                )
+            self._checked_lowbit_arg(value)
+
+    def host_call_converter(self, key):
+        return (
+            self._checked_lowbit_arg if self._lowbit_key(key) else super().host_call_converter(key)
+        )
+
+    def host_fake_arg(self, key, fctx):
+        if self._lowbit_key(key):
+            dtype, _ = key
+            return make_fake_tensor(
+                dtype, (fctx.m,), leading_dim=0, divisibility=div_for_dtype(dtype)
+            )
+        return super().host_fake_arg(key, fctx)
+
+    def _smem_size(self, tensor, cta_tile_shape_mnk):
+        size = super()._smem_size(tensor, cta_tile_shape_mnk)
+        if cute.rank(tensor) == 1 and tensor.element_type.width in (8, 16):
+            # One extra 16-byte cp.async word: the <=15 B alignment prefix
+            # plus the word-granular tail copy never need more.
+            size += 128 // tensor.element_type.width
+        return size
+
     @cute.jit
     def _get_gmem_vec(self, param, ctx):
         if const_expr(ctx.varlen_manager.varlen_m):
@@ -750,6 +808,57 @@ class ColVecLoad(VecLoad):
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(cute.rank(param) == 1 and param.element_type.width in (8, 16)):
+            return self._begin_lowbit(gemm, param, smem_tensor, ctx)
+        else:
+            return self._begin_vector(gemm, param, smem_tensor, ctx)
+
+    @cute.jit
+    def _begin_lowbit(self, gemm, param, smem_tensor, ctx):
+        dtype = param.element_type
+        elem_bytes = const_expr(dtype.width // 8)
+        copy_elems = const_expr(16 // elem_bytes)
+        tile_dim = ctx.tile_M
+        coord = ctx.tile_coord_mnkl[0]
+        gVec = cute.local_tile(self._get_gmem_vec(param, ctx), (tile_dim,), (coord,))
+        addr = gVec.iterator.toint()
+        # Bit operations avoid signed floor-division code for pointer alignment.
+        prefix = Int32(addr & 15) >> const_expr(1 if elem_bytes == 2 else 0)
+        aligned_addr = addr & cutlass.Int64(-16)
+        valid_rows = min(ctx.varlen_manager.len_m(ctx.batch_idx) - coord * tile_dim, tile_dim)
+        end_addr = min(
+            param.iterator.toint() + cute.size(param) * elem_bytes,
+            addr + cutlass.Int64(valid_rows) * elem_bytes,
+        )
+        src_base = cute.make_ptr(dtype, aligned_addr, cute.AddressSpace.gmem, assumed_align=16)
+        # Cover the entire logical tile: invalid rows must be zero for M-fold sinks.
+        for group in cutlass.range_constexpr(
+            cute.ceil_div(tile_dim + copy_elems, ctx.num_epi_threads * copy_elems)
+        ):
+            word = ctx.tidx + group * ctx.num_epi_threads
+            if word * copy_elems < tile_dim + prefix:
+                valid = Int32(max(min(end_addr - (aligned_addr + word * 16), 16), 0))
+                cute.arch.cp_async_shared_global(
+                    smem_tensor.iterator + word * copy_elems,
+                    src_base + word * copy_elems,
+                    16,
+                    "ca",
+                    cp_size=valid,
+                )
+        # The shifted view guarantees only element alignment. Do not assume 16B.
+        tDsV = ctx.partition_for_epilogue_fn(
+            cute.make_tensor(
+                smem_tensor.iterator + prefix,
+                cute.make_layout((ctx.tile_M, ctx.tile_N), stride=self._broadcast_stride()),
+            )
+        )
+        if const_expr(ctx.tiled_copy_t2r is not None):
+            tDsV = ctx.tiled_copy_r2s.retile(tDsV)
+        sub = cute.group_modes(tDsV, 3, cute.rank(tDsV))[None, None, None, 0]
+        return [tDsV, cute.make_rmem_tensor(sub.layout, gemm.acc_dtype)]
+
+    @cute.jit
+    def _begin_vector(self, gemm, param, smem_tensor, ctx):
         dtype = param.element_type
         num_copy_elems = const_expr(max(32, dtype.width)) // dtype.width
         thr_copy = copy_utils.tiled_copy_1d(
