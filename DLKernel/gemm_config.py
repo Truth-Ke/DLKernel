@@ -37,9 +37,11 @@ class TuneMode(IntEnum):
 
     ``TUNED`` measures every uncovered winner key W.  ``STATIC`` never
     measures: a miss runs the operator's own analytical fallback.  ``RUNNING``
-    measures once per fixed operator contract F per process, then behaves like
-    ``STATIC`` for new winner keys of an already-measured contract.  Measured
-    winners are shared across all three modes.  IntEnum so the value crosses
+    prepares all token buckets at the first call of a supported SM90 varlen
+    contract: only the current bucket may be measured; other buckets use the
+    shared analytical ranker. All selected kernels are compiled before return.
+    Later calls use the prepared cache. Other families retain once-per-F
+    measurement. Measured winners are shared across all modes. IntEnum so the value crosses
     the torch.library custom-op schema as a plain int, like ``SplitKMode``.
     """
 

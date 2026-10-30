@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import warnings
+from dataclasses import dataclass
 from functools import cached_property, partial
 from pathlib import Path
 
@@ -167,6 +168,20 @@ def _gpu_warmup(duration_ms=200):
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RunningConfig:
+    """One bucket's explicit configuration and metadata-only compile call.
+
+    ``candidates`` is the measured shortlist, used only to read an existing
+    winner. The analytical config can come from the full legal prepared pool.
+    """
+
+    key: tuple
+    kwargs: dict
+    config: AutotuneConfig
+    candidates: list[AutotuneConfig]
+
+
 class TunePolicy:
     """Variation points for autotune semantics.
 
@@ -231,6 +246,19 @@ class TunePolicy:
 
     def shortlist(self, configs, named_args, kwargs):
         return configs
+
+    def running_configs(self, args, kwargs, configs):
+        """Return all bucket preparations, or None for an unbucketed family.
+
+        Calls must contain metadata tensors only and an explicit config. The
+        tuner owns materialization and publishes the choices only after every
+        compile succeeds. Policies own enumeration, legality and ranking.
+        """
+        return
+
+    def prepares_running(self, key):
+        """Whether this workload has a finite, operator-owned preparation."""
+        return False
 
 
 class Autotuner:
@@ -328,6 +356,40 @@ class Autotuner:
         #: steady-miss fast path.  Written by the reuse branch, invalidated
         #: the moment the winner file appears (peer publication wins).
         self._reuse_resolved: dict = {}
+        # Separate from measured winners: TUNED must still measure a bucket
+        # that RUNNING prepared analytically. No GPU tensors or plans live here.
+        self._running_cache: dict[tuple, AutotuneConfig] = {}
+        self._running_ready: set = set()
+
+    def _prewarm_running(self, contract, key, config, cases):
+        """Publish a complete contract only after all its artifacts are ready."""
+        from DLKernel.cache.precompile import precompile
+
+        choices = {}
+        calls = []
+        for case in cases:
+            selected = self.cache.get(case.key)
+            if (
+                selected is None
+                and self.cache_results
+                and self._load_disk_winner(case.key, case.candidates)
+            ):
+                selected = self.cache[case.key]
+            if case.key == key:
+                selected = config
+            selected = selected or case.config
+            choices[case.key] = selected
+            call_kwargs = case.kwargs | selected.all_kwargs()
+            calls.append(partial(self.fn, **call_kwargs))
+        if key not in choices:
+            raise RuntimeError("RUNNING preparation did not cover the current bucket")
+        precompile(calls)
+        self._running_cache.update(choices)
+        self._running_ready.add(contract)
+        _tune_trace(
+            f"DLKERNEL_RUNNING_READY fn={self.fn.__name__} "
+            f"contract={_key_digest(contract)} buckets={len(choices)}"
+        )
 
     def _bench_budget(self) -> tuple[float, int]:
         """``(warmup_ms, timed_calls)`` for the L2-cold protocol.
@@ -675,6 +737,8 @@ class Autotuner:
                 pinned = args[position]
         if pinned is not None:
             return self.fn(*args, **kwargs)
+        running_cases = None
+        running_contract = None
         used_cached_result = True
         if len(self.configs) > 1:
             config = None
@@ -695,13 +759,27 @@ class Autotuner:
                 # on a miss, for pruning.
                 key = self._default_key(args, kwargs)
             named_args = dict(zip(self.arg_names, args))
+            if self._bound_tune_mode(
+                args, kwargs
+            ) == TuneMode.RUNNING and self.policy.prepares_running(key):
+                if key in self._running_cache:
+                    config = self.cache.get(key) or self._running_cache[key]
+                    self.best_config = config
+                    return self.fn(*args, **kwargs, **config.all_kwargs())
+                running_contract = self._policy_make_contract(args, kwargs, lambda: key) or key
+                running_cases = self.policy.running_configs(args, kwargs, self.configs)
             if key not in self.cache:
                 self.nargs = named_args
                 used_cached_result = False
                 memo = self._reuse_resolved.get(key)
-                if memo is not None and self._bound_tune_mode(args, kwargs) in (
-                    TuneMode.STATIC,
-                    TuneMode.RUNNING,
+                if (
+                    running_cases is None
+                    and memo is not None
+                    and self._bound_tune_mode(args, kwargs)
+                    in (
+                        TuneMode.STATIC,
+                        TuneMode.RUNNING,
+                    )
                 ):
                     # Steady-miss fast path (2026-10-22): this key already
                     # resolved to the contract winner; skip the candidate
@@ -887,7 +965,11 @@ class Autotuner:
                 tune_now = (
                     mode is None
                     or mode == TuneMode.TUNED
-                    or (mode == TuneMode.RUNNING and contract not in self._measured_contracts)
+                    or (
+                        mode == TuneMode.RUNNING
+                        and contract not in self._measured_contracts
+                        and contract not in self._running_ready
+                    )
                 )
                 if tune_now:
                     swept = (
@@ -901,26 +983,30 @@ class Autotuner:
                     if swept and contract is not None:
                         self._measured_contracts.add(contract)
                 elif not (self.cache_results and self._load_disk_winner(key, pruned_configs)):
-                    # No measured winner for THIS key.  Design (2026-10-22):
-                    # reuse the contract F's already-measured winner — the
-                    # first online tune under this operator contract transfers
-                    # across token buckets.  Executed with the config explicit
-                    # (winner semantics: plan/recipe caching allowed); NOT
-                    # adopted into ``self.cache`` so a peer publishing THIS
-                    # key's own winner is still picked up on the next call.
-                    reused = self._contract_winner(contract, pruned_configs)
-                    if reused is not None:
-                        _tune_trace(
-                            f"AUTOTUNE_CONTRACT_REUSE fn={self.fn.__name__} "
-                            f"contract={_key_digest(contract)} key={_key_digest(key)}"
+                    if running_cases is not None:
+                        config = next(
+                            (case.config for case in running_cases if case.key == key), None
                         )
-                        config = reused
-                        self._reuse_resolved[key] = (
-                            reused,
-                            str(self._winner_file_path(key, pruned_configs)),
-                        )
+                        if config is None:
+                            raise RuntimeError(
+                                "RUNNING preparation did not cover the current bucket"
+                            )
                     else:
-                        return self._run_no_winner_fallback(key, args, kwargs)
+                        # Families without bulk preparation retain the
+                        # existing contract-winner transfer semantics.
+                        reused = self._contract_winner(contract, pruned_configs)
+                        if reused is not None:
+                            _tune_trace(
+                                f"AUTOTUNE_CONTRACT_REUSE fn={self.fn.__name__} "
+                                f"contract={_key_digest(contract)} key={_key_digest(key)}"
+                            )
+                            config = reused
+                            self._reuse_resolved[key] = (
+                                reused,
+                                str(self._winner_file_path(key, pruned_configs)),
+                            )
+                        else:
+                            return self._run_no_winner_fallback(key, args, kwargs)
                 if contract is not None and config is None:
                     # A winner landed for this key (sweep or disk load): it is
                     # the contract's winner now.  (Reuse already set `config`.)
@@ -938,6 +1024,8 @@ class Autotuner:
                     f"before the run starts (single-candidate operator, keyless path)"
                 )
             config = self.configs[0]
+        if running_cases is not None:
+            self._prewarm_running(running_contract, key, config, running_cases)
         self.best_config = config
         # Cheap flag first: the getenv (plus its f-string) is measurable on the
         # per-call cache-hit path.

@@ -1,5 +1,9 @@
 # DLKernel 本地 Autotuning（tune）子系统
 
+SM90 varlen 与 fused GEMM 的 `RUNNING` 首调会完成全桶准备,只允许当前桶在线实测。
+后续桶直接使用已准备配置和编译产物。它们共用同一个 `Autotuner`,fused policy
+只补充合法性与张量角色。详细契约见 [static_selection.md](static_selection.md#21-sm90-平均-token-桶与首调准备)。
+
 > 阅读对象：需要改 tune 行为、加 tune 维度，或需要回答"这次调用为什么选了这个 kernel"的工程师。
 > 范围：进程内（local）autotuning——候选枚举、评测、结果缓存、运行时查表。miss 的模式语义
 > （TuneMode/固定契约/解析兜底）与离线工具见 [static_selection.md](static_selection.md)。
@@ -442,6 +446,7 @@ return (tile_m * tile_n, tile_m, tile_n, cluster_m, cluster_n,
 avg = ceil(rows / experts)            # 注意是 ceil，不是浮点除；experts <= 0 返回 -1
 bucket = 32          if avg <= 32     # _MIN_AVERAGE_ROWS
        = 最小 >= avg 的 2 的幂
+SM90: bucket = min(bucket, 2048)      # 2048 是 >1024 的开放尾桶标签
 ragged 维的 key 值 = bucket * max(experts, 1)   # _ragged_dimension（:650）
 ```
 
@@ -449,7 +454,7 @@ ragged 维的 key 值 = bucket * max(experts, 1)   # _ragged_dimension（:650）
 
 key 的完整内容（顺序即代码顺序）：
 
-1. `_KEY_VERSION = "gemm_token_bucket_v5"`（`varlen_selector.py:608`）——版本号一升就刻意作废旧缓存；
+1. SM90 使用 `gemm_token_bucket_v6`,其他架构保留 `gemm_token_bucket_v5`；
 2. 所有非操作数标量/枚举，按参数名的字典序（`_key_layout`，`:626`，注释说明这是为了保持 v1 `sorted()` 的字节级一致）；
 3. `("avg_expert_m", bucket)` / `("avg_expert_k", bucket)`（`:792-794`）；
 4. `("device_capability", (major, minor))`；取不到时退化为 `("device_type", device.type)`。这里刻意排除 device ordinal，理由写在 `:803-805`：`CUDA_VISIBLE_DEVICES` 重映射不该让等价硬件分裂出不同的冠军；

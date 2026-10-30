@@ -4,12 +4,13 @@ import pytest
 import torch
 
 from DLKernel.autotuner import AutotuneConfig
-from DLKernel.gemm_tune_policy import GemmTunePolicy
 from DLKernel.gemm_epilogue_tune_policy import GemmEpilogueTunePolicy
+from DLKernel.gemm_tune_policy import GemmTunePolicy
 from DLKernel.varlen_selector import VarlenGemmTunePolicy
 
 
 def test_gemm_policy_binds_signature_and_stages_selection(monkeypatch):
+    monkeypatch.setenv("DLKERNEL_ARCH", "90")
     events = []
 
     def structural(configs, named_args, **kwargs):
@@ -42,7 +43,7 @@ def test_gemm_policy_binds_signature_and_stages_selection(monkeypatch):
     configs = [AutotuneConfig(config="a"), AutotuneConfig(config="b")]
 
     key = policy.make_key((A, B, out, cu), {}, lambda: ("default",))
-    assert key[0] == "gemm_token_bucket_v5"
+    assert key[0] == "gemm_token_bucket_v6"
     prepared = policy.prepare_candidates(configs, {"A": A}, {"cu_seqlens_m": cu})
     selected = policy.shortlist(prepared, {"A": A}, {"cu_seqlens_m": cu})
 
@@ -83,6 +84,7 @@ def test_gemm_policy_budget_override_tracks_the_bucket_key():
 # --------------------------------------------------------------------------- #
 # Varlen bucket key semantics (CPU, DLKERNEL_ARCH=90 proxy)
 # --------------------------------------------------------------------------- #
+
 
 def _m_group_workload(total_m, experts=32, n=512, k=512):
     A = torch.empty((total_m, k), dtype=torch.bfloat16)
@@ -133,8 +135,9 @@ def test_epilogue_policy_buckets_routed_mcolvec_broadcast(monkeypatch):
 
     # Both workloads are in the same avg-M bucket and the same m-high selector leaf.
     assert key_for(32 * 1200) == key_for(32 * 1250)
-    # Crossing the next power-of-two average-M bucket must still split the winner.
-    assert key_for(32 * 2500) != key_for(32 * 1250)
+    # The open tail shares one average bucket; the 1024 boundary still splits.
+    assert key_for(32 * 2500) == key_for(32 * 1250)
+    assert key_for(32 * 1024) != key_for(32 * 1024 + 1)
 
     dense = torch.empty((32 * 1250,), dtype=torch.bfloat16)
     dense_key = policy.make_key(
@@ -159,14 +162,28 @@ def test_epilogue_policy_buckets_scratch_and_d_output(monkeypatch):
         outputs=("premult",),
         sinks={"sqsum": SimpleNamespace(sink_alloc_shape=lambda *a, **k: None)},
     )
-    policy = GemmEpilogueTunePolicy(
-        mod
-    )
+    policy = GemmEpilogueTunePolicy(mod)
     arg_names = (
-        "A", "B", "D", "C", "mod_digest", "b_kn", "cu_seqlens_m", "A_idx",
-        "dynamic_scheduler", "SFA", "SFB", "bs_format_a", "bs_format_b",
-        "concat_layout", "transform_digest", "transform_sf", "config",
-        "ta__scale", "sqsum", "premult",
+        "A",
+        "B",
+        "D",
+        "C",
+        "mod_digest",
+        "b_kn",
+        "cu_seqlens_m",
+        "A_idx",
+        "dynamic_scheduler",
+        "SFA",
+        "SFB",
+        "bs_format_a",
+        "bs_format_b",
+        "concat_layout",
+        "transform_digest",
+        "transform_sf",
+        "config",
+        "ta__scale",
+        "sqsum",
+        "premult",
     )
     policy.bind_signature(arg_names, (None,) * len(arg_names))
 
@@ -183,9 +200,18 @@ def test_epilogue_policy_buckets_scratch_and_d_output(monkeypatch):
         ta_scale = torch.empty((total_m,), dtype=torch.float32)
         premult = torch.empty((total_m, 512), dtype=torch.bfloat16)
         kwargs = dict(
-            A=A, B=B, D=D, mod_digest="m1", b_kn=False, cu_seqlens_m=cu,
-            dynamic_scheduler=False, concat_layout=None, transform_digest=None,
-            sqsum=sqsum, premult=premult, **{"ta__scale": ta_scale},
+            A=A,
+            B=B,
+            D=D,
+            mod_digest="m1",
+            b_kn=False,
+            cu_seqlens_m=cu,
+            dynamic_scheduler=False,
+            concat_layout=None,
+            transform_digest=None,
+            sqsum=sqsum,
+            premult=premult,
+            ta__scale=ta_scale,
         )
         return policy.make_key((), kwargs, lambda: ("dense-default",)), kwargs
 
@@ -215,9 +241,7 @@ def test_epilogue_and_plain_policies_share_varlen_key_facts(monkeypatch):
     plain = VarlenGemmTunePolicy()
     plain.bind_signature(("A", "B", "out", "cu_seqlens_m"), (None,) * 4)
     mod = SimpleNamespace(outputs=(), sinks={})
-    epi = GemmEpilogueTunePolicy(
-        mod
-    )
+    epi = GemmEpilogueTunePolicy(mod)
     epi.bind_signature(("A", "B", "D", "cu_seqlens_m"), (None,) * 4)
 
     total_m, experts, n, k = 32 * 1200, 32, 512, 512
@@ -283,9 +307,7 @@ def test_epilogue_policy_uses_explicit_ragged_roles(monkeypatch):
 
     monkeypatch.setenv("DLKERNEL_ARCH", "90")
     mod = SimpleNamespace(outputs=("premult",), sinks={})
-    policy = GemmEpilogueTunePolicy(
-        mod
-    )
+    policy = GemmEpilogueTunePolicy(mod)
     policy.bind_signature(("A", "B", "D", "cu_seqlens_m", "accidental"), (None,) * 5)
 
     def key_for(total_m):
@@ -340,6 +362,4 @@ def test_varlen_row_reduce_combine_rule_is_shared_with_prune():
         "B": torch.empty((16, 128), dtype=torch.bfloat16),
         "cu_seqlens_m": torch.empty((2,), dtype=torch.int32),
     }
-    assert prune_epilogue_configs(
-        mod, None, [config], named, device_capacity=(9, 0)
-    ) == []
+    assert prune_epilogue_configs(mod, None, [config], named, device_capacity=(9, 0)) == []

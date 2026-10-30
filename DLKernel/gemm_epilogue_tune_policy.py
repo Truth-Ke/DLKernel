@@ -7,10 +7,10 @@ this module contributes only explicit epilogue tensor roles and host legality.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
-from DLKernel.varlen_selector import VarlenGemmTunePolicy, gemm_contract_key, gemm_tune_key
 from DLKernel.epilogue.legality import prune_epilogue_configs
+from DLKernel.varlen_selector import VarlenGemmTunePolicy
 
 
 class GemmEpilogueTunePolicy(VarlenGemmTunePolicy):
@@ -21,7 +21,7 @@ class GemmEpilogueTunePolicy(VarlenGemmTunePolicy):
         mod,
         transform_a=None,
         *,
-        ragged_m_out_names: Optional[Iterable[str]] = None,
+        ragged_m_out_names: Iterable[str] | None = None,
         opaque_tensor_names: Iterable[str] = (),
         routed_m_tensor_names: Iterable[str] = ("mColVecBroadcast",),
     ) -> None:
@@ -47,38 +47,23 @@ class GemmEpilogueTunePolicy(VarlenGemmTunePolicy):
             )
         )
 
-    def make_key(self, args, kwargs, default_key):
-        if not getattr(self, "_varlen_params", False):
-            return default_key()
-        key = gemm_tune_key(
-            args,
-            kwargs,
-            self.arg_names,
-            self.arg_defaults,
-            ragged_m_out_names=self._ragged_m_out_names,
-            opaque_tensor_names=self._opaque_tensor_names,
-            routed_m_tensor_names=self._routed_m_tensor_names,
-        )
-        return default_key() if key is None else key
-
-    def make_contract(self, args, kwargs, default_key):
-        """F for the mod's epilogue tensor roles (see VarlenGemmTunePolicy)."""
-        if not getattr(self, "_varlen_params", False):
-            return default_key()
-        contract = gemm_contract_key(
-            args,
-            kwargs,
-            self.arg_names,
-            self.arg_defaults,
-            ragged_m_out_names=self._ragged_m_out_names,
-            opaque_tensor_names=self._opaque_tensor_names,
-            routed_m_tensor_names=self._routed_m_tensor_names,
-        )
-        return default_key() if contract is None else contract
-
     def prepare_candidates(self, configs, named_args, kwargs):
         configs = super().prepare_candidates(configs, named_args, kwargs)
         return prune_epilogue_configs(self.mod, self.transform_a, configs, named_args, **kwargs)
+
+    def running_configs(self, args, kwargs, configs):
+        from DLKernel.gemm_running import running_configs
+
+        if self.transform_a is not None:
+            return None
+        return running_configs(
+            self,
+            args,
+            kwargs,
+            configs,
+            mod=self.mod,
+            b_kn_default=False,
+        )
 
 
 __all__ = ["GemmEpilogueTunePolicy"]

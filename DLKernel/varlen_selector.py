@@ -597,14 +597,18 @@ def rule_table() -> dict[str, Any]:
 
 #: Smallest average-rows bucket.  MoE shards in the measured envelope start at
 #: 32 routed rows per expert; a finer floor would only split the key space.
-_MIN_AVERAGE_ROWS = 32
+_AVERAGE_ROWS_BUCKETS = (32, 64, 128, 256, 512, 1024, 2048)
+# The last label is the open-ended >1024 bucket, not an upper bound of 2048.
+_MIN_AVERAGE_ROWS = _AVERAGE_ROWS_BUCKETS[0]
 
 #: Prefix of the key.  v3 includes the selector leaf, canonical defaults and the
 #: operand device identity.  v4 adds the dynamic-persistent k-high candidates;
 #: v5 additionally canonicalizes routed epilogue vectors such as
-#: ``mColVecBroadcast`` with the routed-M bucket.  Each bump deliberately
+#: ``mColVecBroadcast`` with the routed-M bucket. v6 caps average rows at
+#: the open >1024 tail. Each bump deliberately
 #: orphans older winners whose identity did not carry the new distinction.
-_KEY_VERSION = "gemm_token_bucket_v5"
+_KEY_VERSION = "gemm_token_bucket_v6"
+_LEGACY_KEY_VERSION = "gemm_token_bucket_v5"
 
 #: Named operands.  They are covered by the shape rewrite below, so they are
 #: never added to the key as plain values (their identity does not matter).
@@ -643,8 +647,8 @@ def _key_layout(arg_names: tuple[str, ...]) -> tuple[tuple[str, int], ...]:
     return tuple(sorted((name, index) for index, name in enumerate(arg_names)))
 
 
-def average_rows_bucket(rows: int, experts: int) -> int:
-    """Average routed rows per expert, rounded up to a power of two.
+def average_rows_bucket(rows: int, experts: int, *, device_capability=None) -> int:
+    """Power-of-two average rows; SM90 has six bounded bins and one >1024 bin.
 
     ``-1`` marks an unusable expert count so the caller can still key on it.
     """
@@ -654,12 +658,17 @@ def average_rows_bucket(rows: int, experts: int) -> int:
     if average <= _MIN_AVERAGE_ROWS:
         return _MIN_AVERAGE_ROWS
     # Smallest power of two >= average, without a doubling loop.
-    return 1 << (average - 1).bit_length()
+    bucket = 1 << (average - 1).bit_length()
+    return (
+        min(bucket, _AVERAGE_ROWS_BUCKETS[-1])
+        if device_capability and device_capability[0] == 9
+        else bucket
+    )
 
 
-def _ragged_dimension(rows: int, experts: int) -> int:
+def _ragged_dimension(rows: int, experts: int, device_capability=None) -> int:
     """Collapsed size of a ragged dimension, still monotone in its real size."""
-    bucket = average_rows_bucket(rows, experts)
+    bucket = average_rows_bucket(rows, experts, device_capability=device_capability)
     return -1 if bucket < 0 else bucket * max(experts, 1)
 
 
@@ -703,6 +712,7 @@ def gemm_tune_key(
     ragged_m_out_names=("out", "C", "D"),
     opaque_tensor_names=(),
     routed_m_tensor_names=(),
+    device_capability=None,
 ) -> tuple[Any, ...] | None:
     """Bucket-collapsed varlen tune key (W); ``None`` for dense calls.
 
@@ -730,6 +740,7 @@ def gemm_tune_key(
         opaque_tensor_names,
         routed_m_tensor_names,
         contract=False,
+        device_capability=device_capability,
     )
 
 
@@ -741,6 +752,7 @@ def gemm_contract_key(
     ragged_m_out_names=("out", "C", "D"),
     opaque_tensor_names=(),
     routed_m_tensor_names=(),
+    device_capability=None,
 ) -> tuple[Any, ...] | None:
     """Fixed-contract identity F; ``None`` for dense calls.
 
@@ -762,6 +774,7 @@ def gemm_contract_key(
         opaque_tensor_names,
         routed_m_tensor_names,
         contract=True,
+        device_capability=device_capability,
     )
 
 
@@ -775,6 +788,7 @@ def _build_identity(
     routed_m_tensor_names,
     *,
     contract: bool,
+    device_capability=None,
 ):
     names = tuple(arg_names)
     ragged_m_out_names = frozenset(ragged_m_out_names)
@@ -811,7 +825,16 @@ def _build_identity(
     # One pass over the arguments in canonical order collects scalars and
     # tensors alike.  v1 merged a dict and ran two sorted() passes per call;
     # this runs on every cache-hit, so it stays allocation-light.
-    key: list = [_CONTRACT_VERSION if contract else _KEY_VERSION]
+    a = bound("A")
+    capability = (
+        device_capability
+        if device_capability is not None
+        else _device_capability(a)
+        if isinstance(a, Tensor)
+        else None
+    )
+    key_version = _KEY_VERSION if capability and capability[0] == 9 else _LEGACY_KEY_VERSION
+    key: list = [_CONTRACT_VERSION if contract else key_version]
     tensors: list = []
     for name, position in _key_layout(names):
         value = _arg_value(args, kwargs, name, position, defaults.get(name, _MISSING))
@@ -856,18 +879,27 @@ def _build_identity(
 
     def _collapse(size: int, experts: int) -> int:
         """Ragged extent: its monotone bucket for W, a constant mark for F."""
-        return _RAGGED_MARK if contract else _ragged_dimension(size, experts)
+        return _RAGGED_MARK if contract else _ragged_dimension(size, experts, capability)
 
     if not contract:
         if varlen_m and isinstance(a, Tensor):
-            key.append(("avg_expert_m", average_rows_bucket(routed_m, m_experts)))
+            key.append(
+                (
+                    "avg_expert_m",
+                    average_rows_bucket(routed_m, m_experts, device_capability=capability),
+                )
+            )
         if varlen_k and isinstance(b, Tensor):
-            key.append(("avg_expert_k", average_rows_bucket(routed_k, k_experts)))
+            key.append(
+                (
+                    "avg_expert_k",
+                    average_rows_bucket(routed_k, k_experts, device_capability=capability),
+                )
+            )
 
     if isinstance(a, Tensor):
         device = getattr(a, "device", None)
         if device is not None:
-            capability = _device_capability(a)
             if capability is not None:
                 key.append(("device_capability", tuple(capability)))
             else:
@@ -919,7 +951,7 @@ def _build_identity(
                     cu_seqlens_k,
                     a_index,
                     dtype=getattr(a, "dtype", None),
-                    device_capability=_device_capability(a),
+                    device_capability=capability,
                     selector_enabled=os.environ.get("DLKERNEL_VARLEN_SELECTOR", "1") != "0",
                 ),
             )
@@ -948,6 +980,30 @@ class VarlenGemmTunePolicy(GemmTunePolicy):
 
     def __init__(self) -> None:
         super().__init__()
+        self._ragged_m_out_names = ("out", "C", "D")
+        self._opaque_tensor_names = ()
+        self._routed_m_tensor_names = ()
+
+    def _gemm_key(self, args, kwargs, *, contract=False, device_capability=None):
+        builder = gemm_contract_key if contract else gemm_tune_key
+        return builder(
+            args,
+            kwargs,
+            self.arg_names,
+            self.arg_defaults,
+            ragged_m_out_names=self._ragged_m_out_names,
+            opaque_tensor_names=self._opaque_tensor_names,
+            routed_m_tensor_names=self._routed_m_tensor_names,
+            device_capability=device_capability,
+        )
+
+    def running_configs(self, args, kwargs, configs):
+        from DLKernel.gemm_running import running_configs
+
+        return running_configs(self, args, kwargs, configs)
+
+    def prepares_running(self, key):
+        return isinstance(key, tuple) and bool(key) and key[0] == _KEY_VERSION
 
     def bind_signature(self, arg_names, arg_defaults) -> None:
         super().bind_signature(arg_names, arg_defaults)
@@ -966,7 +1022,7 @@ class VarlenGemmTunePolicy(GemmTunePolicy):
     def make_key(self, args, kwargs, default_key):
         if not getattr(self, "_varlen_params", False):
             return default_key()
-        key = gemm_tune_key(args, kwargs, self.arg_names, self.arg_defaults)
+        key = self._gemm_key(args, kwargs)
         return default_key() if key is None else key
 
     def make_contract(self, args, kwargs, default_key):
@@ -977,11 +1033,13 @@ class VarlenGemmTunePolicy(GemmTunePolicy):
         """
         if not getattr(self, "_varlen_params", False):
             return default_key()
-        contract = gemm_contract_key(args, kwargs, self.arg_names, self.arg_defaults)
+        contract = self._gemm_key(args, kwargs, contract=True)
         return default_key() if contract is None else contract
 
     def budget_override(self, key):
-        return isinstance(key, tuple) and bool(key) and key[0] == _KEY_VERSION
+        return (
+            isinstance(key, tuple) and bool(key) and key[0] in (_KEY_VERSION, _LEGACY_KEY_VERSION)
+        )
 
     def shortlist(self, configs, named_args, kwargs):
         # The parent owns dense structural/performance staging.  Calling it

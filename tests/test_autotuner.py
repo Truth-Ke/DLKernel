@@ -109,7 +109,8 @@ def test_gemm_contract_key_varlen_k_folds_only_contraction_total():
         )
 
     assert _contract_key(k_args(65536)) == _contract_key(k_args(131072))
-    assert _bucket_key(k_args(65536)) != _bucket_key(k_args(131072))
+    assert _bucket_key(k_args(65536)) == _bucket_key(k_args(131072))
+    assert _bucket_key(k_args(32 * 1024)) != _bucket_key(k_args(32 * 1024 + 1))
 
 
 def test_gemm_tune_and_contract_keys_exclude_tune_mode():
@@ -257,7 +258,9 @@ def test_gemm_token_bucket_ep8_gather_rows_do_not_collide():
             {},
         )
 
-    assert key_for(258012) != key_for(512303)
+    # Both averages exceed 1024: the open tail intentionally shares a key.
+    assert key_for(258012) == key_for(512303)
+    assert key_for(8 * 1024) != key_for(8 * 1024 + 1)
 
 
 def test_gemm_token_bucket_preserves_static_n_for_varlen_k():
@@ -758,12 +761,11 @@ def test_gemm_tune_key_buckets_varlen_arguments_passed_by_keyword():
         return gemm_tune_key((a, b, out, None, None, 1.0, 1.0), kwargs, gemm_tuned.arg_names)
 
     assert key_for(258012) is not None
-    # 8 experts and 258012 routed rows is 32252 rows/expert, which lands in the
-    # 32768 bucket: every total from 131073 to 262144 shares one tune.
+    # Both routed averages land in the open >1024 tail.
     assert key_for(258012) == key_for(258013)
     assert key_for(258012) == key_for(200000)
-    # 512303 is 64038 rows/expert: the next bucket, so it tunes separately.
-    assert key_for(512303) != key_for(258012)
+    assert key_for(512303) == key_for(258012)
+    assert key_for(8 * 1024) != key_for(8 * 1024 + 1)
 
 
 def test_bench_budget_override_is_gated_on_the_varlen_key_hook(monkeypatch):

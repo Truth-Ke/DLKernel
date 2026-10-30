@@ -22,25 +22,23 @@ miss 即实测**(2026-10-21 用户决定);"一个 miss 不必然触发 sweep"的
 |---|---|---|
 | `TUNED = 0`(默认) | 用冠军 | 实测当前 W |
 | `STATIC = 1` | 用冠军 | 复用本 F 已测冠军;F 从未测则解析兜底,绝不测量 |
-| `RUNNING = 2`(显式 opt-in) | 用冠军,不消耗额度 | F 未测则实测一次;F 已测则**复用该 F 的已测冠军**(跨 token 桶迁移,autotuner `_contract_winners`) |
+| `RUNNING = 2`(显式 opt-in) | SM90 varlen 首调仍准备本 F 的全部桶 | 只允许当前桶实测,其他桶离线选配置并编译;返回前完成准备,后续直接查缓存。其他架构保留原行为 |
 
 规则(`DLKernel/autotuner.py` miss 分支):
 
 - 实测冠军跨模式共享;只有**本进程成功完成的 sweep** 消耗 RUNNING 的额度
   (磁盘命中、REQUIRE 拒绝、失败、空调用均不消耗)。
-- `DLKERNEL_REQUIRE_TUNE_CACHE=1` 对"无冠军的自动选择调用"仍报错——解析兜底
-  不满足断言。
+- `DLKERNEL_REQUIRE_TUNE_CACHE=1` 在未准备的首调缺少当前桶实测冠军时仍报错。
+  已准备的 RUNNING 桶可以直接使用;离线配置不充当 TUNED 的实测冠军。
 - `DLKERNEL_FORCE_CACHE_UPDATE` 使磁盘条目不被采用,但**不**把 STATIC/已测
   RUNNING 变成 sweep,也不重置 F 记录。
-- 2026-10-22 设计:F 已测时的新 W miss **复用该 F 的已测冠军**(显式 config 执行,
-  冠军语义:plan/recipe 可缓存;不落入本 W 的内存表,他进程发布的本 W 冠军下一
-  调用仍可升级;磁盘启用时冠军经 `contract_winners/` 文件跨进程迁移)。`-1` 兜底
-  仅剩"F 从未测过"的纯冷场景:不产生冠军、不写任何缓存、miss 不记负结果。
+- STATIC 和未覆盖的算子族保留 F 冠军复用。全桶准备覆盖 SM90 普通 varlen-M/K、
+  fused activation/dact/dgated 和 gather;不扩展到 blockscaled 或 operand transform。
 - 未接 `tune_mode` 的算子(rmsnorm 等)行为不变:miss 照旧 sweep。
 
 ## 2. 双身份:F 与 W(`DLKernel/varlen_selector.py`)
 
-- **W(winner key)**:既有 bucket 塌缩 key(`gemm_token_bucket_v5`)——识别
+- **W(winner key)**:SM90 bucket key 为 `gemm_token_bucket_v6`,其他架构保留 v5——识别
   "哪次测量"。
 - **F(固定契约,`gemm_contract_key`/`gemm_contract_v1`)**:同一遍元数据扫描,
   声明的 token 维折叠为常量标记、剔除 avg-expert 桶/selector leaf/bench 预算
@@ -50,6 +48,40 @@ miss 即实测**(2026-10-21 用户决定);"一个 miss 不必然触发 sweep"的
 - `tune_mode` 被两条 key 收集路径显式排除(`_NON_IDENTITY_NAMES`):模式是
   miss 行为,不是 workload 身份。
 - dense 无声明动态维:F = 完整默认 key。
+
+### 2.1 SM90 平均 token 桶与首调准备
+
+SM90 按 `ceil(total_tokens / experts)` 映射到七个桶:
+`≤32、≤64、≤128、≤256、≤512、≤1024、>1024`。尾桶标签为 `2048`,
+不表示 token 上限。运行时和预热枚举共用 `_AVERAGE_ROWS_BUCKETS`。
+其他架构的桶映射和 v5 缓存身份不变。SM90 v6 不复用旧的无上限桶冠军。
+
+`Autotuner` 是普通 GEMM 和 fused GEMM 共用的唯一调优生命周期。
+`GemmEpilogueTunePolicy` 仅添加 fused 的张量角色与合法性约束,不发起第二次调优。
+两者使用相同的 `gemm_heuristic.rank`、候选评测和 `.o` 编译池。
+fused 的 B 布局先转成数学 N/K 描述;候选必须经过自身的合法性过滤。
+成本公式与普通 varlen 相同,没有单独拟合 epilogue 成本。
+
+一次 RUNNING 首调按以下顺序执行:
+
+1. 检查当前桶的实测冠军。缺失且本进程尚未测过 F 时,只测当前桶。
+2. policy 枚举七个平均 token 桶,并在 selector leaf/envelope 边界处分开。
+   一个平均桶可对应多个 W,保留候选空间的区分。
+3. 对其他 W 先用已有实测冠军,否则从该算子的 prepared 合法池离线排序。
+4. 用 metadata tensor 和显式 config 捕获编译请求。复用 `precompile`,按真实
+   CompileSpec 身份去重,通过现有 CPU 编译池编译并加载。代表输入不分配 GPU 内存。
+   reduce sink 容量复用 `sink_arg_shapes`,执行时再按选定配置切片。
+5. 所有编译成功后,一次发布本进程的全桶配置。失败时不发布 ready 状态;
+   已成功实测的当前桶保留,重试不重复实测。
+
+后续同一 W 的 RUNNING 调用直接查内存配置并进入已有 kernel 缓存,不查盘、不重排、
+不实测。离线配置保存在 `_running_cache`,不写 measured-winner JSON。
+TUNED 仍可实测。进程内修改 selector/bench-budget 设置会生成新 W,重新执行离线准备,
+不重新消耗在线实测额度。
+
+准备按 F 隔离。改变 `mod_digest`、权重几何、专家数、dtype 或布局会产生新的 F。
+开始训练计时前仍需一次 forward/backward warmup,使所有实际算子契约都首次出现。
+准备依赖 `DLKERNEL_CACHE_ENABLED=1`;关闭 artifact cache 不提供全桶预热保证。
 
 ## 3. 解析兜底(`DLKernel/gemm_heuristic.py`)
 
@@ -76,6 +108,7 @@ miss 即实测**(2026-10-21 用户决定);"一个 miss 不必然触发 sweep"的
 - **dense 不由本 ranker 覆盖**:dense 的 miss 直接走既有 nvMMH/default 链
   (warn-once 照发)。
 - 结果不进任何 winner 表或 JSON。
+  RUNNING 首调会将离线配置保留在独立的进程内 prepared cache。
 
 三条链刻意不同:低层 `mod.gemm` 本身没有 config 参数,epi wrapper 的 `-1`
 委托只能在 `mod.gemm` 内部解析 config,接不上 ranker;前两条高层链持有
